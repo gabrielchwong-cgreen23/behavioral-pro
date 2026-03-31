@@ -445,6 +445,10 @@ app.get('/api/metrics/:shop_domain', async (req, res) => {
   }
 });
 
+app.get('/', (_req, res) => {
+  res.send('BehavioralPro backend is running. V3 webhook build');
+});
+
 app.get('/api/debug/:shop_domain', async (req, res) => {
   try {
     const shop_domain = normalizeShopDomain(req.params.shop_domain);
@@ -458,7 +462,8 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
       .from('events')
       .select('*')
       .eq('shop_domain', shop_domain)
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false
+ });
 
     return res.json({
       success: true,
@@ -471,6 +476,7 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
     });
   } catch (error) {
     console.log('DEBUG ROUTE ERROR:', error);
+    console.log('BOOT: running V3 build with raw webhook handler');
     return res.status(500).json({
       success: false,
       error: String(error.message || error),
