@@ -3,7 +3,7 @@ import express from 'express'
 import cors from 'cors'
 import { createClient } from '@supabase/supabase-js'
 const app = express()
-const PORT = 3001
+const PORT = process.env.PORT || 3001;
 const corsOptions = {
   origin: true,
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -79,6 +79,8 @@ app.post('/api/assign-variant', async (req, res) => {
           session_id,
           variant,
           created_at: new Date().toISOString()
+
+
         }
       ])
       .select()
@@ -714,7 +716,6 @@ app.get('/app', (req, res) => {
     : `${shop}.myshopify.com`;
   return res.redirect(`/dashboard?shop=${encodeURIComponent(shopDomain)}`);
 });
-const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log("Server running on port", PORT);
 });
