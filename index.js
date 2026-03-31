@@ -1,247 +1,488 @@
-import 'dotenv/config'
-import express from 'express'
-import cors from 'cors'
-import { createClient } from '@supabase/supabase-js'
-const app = express()
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import crypto from 'crypto';
+import { createClient } from '@supabase/supabase-js';
+
+const app = express();
 const PORT = process.env.PORT || 3001;
+
 const corsOptions = {
   origin: true,
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: false
-}
-app.use(cors(corsOptions))
-app.use(express.json())
+  credentials: false,
+};
+
+// ---------- BASIC MIDDLEWARE ----------
+app.use(cors(corsOptions));
+
+// Use JSON parser for normal API routes only.
+// Do NOT rely on this for Shopify webhooks.
+app.use('/api', express.json());
+
 app.use((req, res, next) => {
-  console.log('INCOMING:', req.method, req.url)
-  next()
-})
-app.options('/api/events', cors(corsOptions))
-app.options('/api/assign-variant', cors(corsOptions))
-app.options('/api/stores', cors(corsOptions))
-app.options('/api/metrics/:shop_domain', cors(corsOptions))
-app.options('/api/debug/:shop_domain', cors(corsOptions))
+  console.log('INCOMING:', req.method, req.url);
+  next();
+});
+
+// ---------- ENV CHECK ----------
+const {
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
+  SHOPIFY_API_SECRET,
+} = process.env;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+}
+
+if (!SHOPIFY_API_SECRET) {
+  console.warn('Missing SHOPIFY_API_SECRET. Webhook HMAC verification will fail.');
+}
+
+// ---------- SUPABASE ----------
 const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-)
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY
+);
+
+// ---------- HELPERS ----------
+function getRawBody(req) {
+  if (Buffer.isBuffer(req.body)) {
+    return req.body;
+  }
+  if (typeof req.body === 'string') {
+    return Buffer.from(req.body, 'utf8');
+  }
+  return Buffer.from('', 'utf8');
+}
+
+function verifyShopifyWebhook(req) {
+  try {
+    const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
+    if (!hmacHeader || !SHOPIFY_API_SECRET) return false;
+
+    const rawBody = getRawBody(req);
+
+    const digest = crypto
+      .createHmac('sha256', SHOPIFY_API_SECRET)
+      .update(rawBody)
+      .digest('base64');
+
+    return crypto.timingSafeEqual(
+      Buffer.from(digest, 'utf8'),
+      Buffer.from(hmacHeader, 'utf8')
+    );
+  } catch (error) {
+    console.error('Webhook verification error:', error);
+    return false;
+  }
+}
+
+function shopifyWebhookHandler(topic, processor) {
+  return async (req, res) => {
+    try {
+      const isValid = verifyShopifyWebhook(req);
+
+      if (!isValid) {
+        console.log(`Invalid webhook signature for ${topic}`);
+        return res.status(401).send('Invalid webhook signature');
+      }
+
+      let payload = {};
+      try {
+        payload = JSON.parse(getRawBody(req).toString('utf8') || '{}');
+      } catch (parseError) {
+        console.log(`Failed to parse ${topic} webhook body:`, parseError);
+        return res.status(400).send('Invalid JSON');
+      }
+
+      console.log(`${topic} webhook received:`, payload);
+
+      await processor(payload, req);
+
+      return res.status(200).send('ok');
+    } catch (error) {
+      console.error(`${topic} webhook error:`, error);
+      return res.status(500).send('server error');
+    }
+  };
+}
+
+function normalizeShopDomain(shop) {
+  if (!shop) return '';
+  return shop.includes('.myshopify.com') ? shop : `${shop}.myshopify.com`;
+}
+
+function calculateMetrics(sessions = [], events = []) {
+  const controlSessions = sessions.filter((s) => s.variant === 'control').length;
+  const variantSessions = sessions.filter((s) => s.variant === 'variant').length;
+
+  const controlPurchases = events.filter(
+    (e) => e.variant === 'control' && e.event_type === 'purchase'
+  );
+
+  const variantPurchases = events.filter(
+    (e) => e.variant === 'variant' && e.event_type === 'purchase'
+  );
+
+  const controlRevenue = controlPurchases.reduce(
+    (sum, e) => sum + Number(e.value || 0),
+    0
+  );
+
+  const variantRevenue = variantPurchases.reduce(
+    (sum, e) => sum + Number(e.value || 0),
+    0
+  );
+
+  const conversionRateControl = controlSessions
+    ? controlPurchases.length / controlSessions
+    : 0;
+
+  const conversionRateVariant = variantSessions
+    ? variantPurchases.length / variantSessions
+    : 0;
+
+  const revenuePerSessionControl = controlSessions
+    ? controlRevenue / controlSessions
+    : 0;
+
+  const revenuePerSessionVariant = variantSessions
+    ? variantRevenue / variantSessions
+    : 0;
+
+  const liftPercent = revenuePerSessionControl
+    ? ((revenuePerSessionVariant - revenuePerSessionControl) / revenuePerSessionControl) * 100
+    : 0;
+
+  return {
+    control: {
+      sessions: controlSessions,
+      purchases: controlPurchases.length,
+      revenue: controlRevenue,
+      conversion_rate: conversionRateControl,
+      revenue_per_session: revenuePerSessionControl,
+    },
+    variant: {
+      sessions: variantSessions,
+      purchases: variantPurchases.length,
+      revenue: variantRevenue,
+      conversion_rate: conversionRateVariant,
+      revenue_per_session: revenuePerSessionVariant,
+    },
+    lift_percent: liftPercent,
+  };
+}
+
+// ---------- OPTIONS ----------
+app.options('/api/events', cors(corsOptions));
+app.options('/api/assign-variant', cors(corsOptions));
+app.options('/api/stores', cors(corsOptions));
+app.options('/api/metrics/:shop_domain', cors(corsOptions));
+app.options('/api/debug/:shop_domain', cors(corsOptions));
+
+// ---------- SHOPIFY MANDATORY COMPLIANCE WEBHOOKS ----------
+// IMPORTANT: use express.raw so HMAC is computed against the exact raw payload.
+app.post(
+  '/webhooks/customers-data-request',
+  express.raw({ type: '*/*' }),
+  shopifyWebhookHandler('customers/data_request', async (payload) => {
+    // Optional: log/store request for compliance workflow
+    console.log('Processed customers/data_request for shop:', payload.shop_domain || payload.shop_id || 'unknown');
+  })
+);
+
+app.post(
+  '/webhooks/customers-redact',
+  express.raw({ type: '*/*' }),
+  shopifyWebhookHandler('customers/redact', async (payload) => {
+    // Optional: perform customer-level redaction in your own DB if needed
+    console.log('Processed customers/redact for shop:', payload.shop_domain || payload.shop_id || 'unknown');
+  })
+);
+
+app.post(
+  '/webhooks/shop-redact',
+  express.raw({ type: '*/*' }),
+  shopifyWebhookHandler('shop/redact', async (payload) => {
+    // Optional: remove shop data from your DB if required
+    console.log('Processed shop/redact for shop:', payload.shop_domain || payload.shop_id || 'unknown');
+
+    const possibleShopDomain =
+      payload.shop_domain ||
+      payload.myshopify_domain ||
+      payload.domain ||
+      null;
+
+    if (possibleShopDomain) {
+      // Example cleanup — keep or remove depending on your data retention model.
+      // Uncomment if you want to actually delete records when shop/redact arrives.
+
+      /*
+      await supabase.from('events').delete().eq('shop_domain', possibleShopDomain);
+      await supabase.from('experiment_sessions').delete().eq('shop_domain', possibleShopDomain);
+      await supabase.from('stores').delete().eq('shop_domain', possibleShopDomain);
+      */
+    }
+  })
+);
+
+// ---------- API ROUTES ----------
 app.post('/api/stores', async (req, res) => {
   try {
-    const { shop_domain, access_token = null, scope = null } = req.body || {}
+    const { shop_domain, access_token = null, scope = null } = req.body || {};
+
     if (!shop_domain) {
-      return res.status(400).json({ success: false, error: 'shop_domain is required' })
+      return res.status(400).json({
+        success: false,
+        error: 'shop_domain is required',
+      });
     }
+
     const row = {
-      shop_domain,
+      shop_domain: normalizeShopDomain(shop_domain),
       access_token,
       scope,
-      installed_at: new Date().toISOString()
-    }
+      installed_at: new Date().toISOString(),
+    };
+
     const { data, error } = await supabase
       .from('stores')
       .upsert([row], { onConflict: 'shop_domain' })
-      .select()
+      .select();
+
     if (error) {
-      console.log('STORE UPSERT ERROR:', error)
-      return res.status(500).json({ success: false, error })
+      console.log('STORE UPSERT ERROR:', error);
+      return res.status(500).json({ success: false, error });
     }
-    res.json({ success: true, data })
+
+    return res.json({ success: true, data });
   } catch (error) {
-    console.log('STORE ROUTE ERROR:', error)
-    res.status(500).json({ success: false, error: String(error.message || error) })
+    console.log('STORE ROUTE ERROR:', error);
+    return res.status(500).json({
+      success: false,
+      error: String(error.message || error),
+    });
   }
-})
+});
+
 app.post('/api/assign-variant', async (req, res) => {
   try {
-    const { shop_domain, session_id } = req.body || {}
+    const { shop_domain, session_id } = req.body || {};
+
     if (!shop_domain || !session_id) {
-      return res.status(400).json({ success: false, error: 'missing fields' })
+      return res.status(400).json({
+        success: false,
+        error: 'missing fields',
+      });
     }
+
+    const normalizedShop = normalizeShopDomain(shop_domain);
+
     const { data: existing, error: existingError } = await supabase
       .from('experiment_sessions')
       .select('*')
-      .eq('shop_domain', shop_domain)
+      .eq('shop_domain', normalizedShop)
       .eq('session_id', session_id)
-      .maybeSingle()
+      .maybeSingle();
+
     if (existingError) {
-      console.log('ASSIGN LOOKUP ERROR:', existingError)
-      return res.status(500).json({ success: false, error: existingError })
+      console.log('ASSIGN LOOKUP ERROR:', existingError);
+      return res.status(500).json({ success: false, error: existingError });
     }
+
     if (existing) {
-      return res.json({ success: true, data: existing })
+      return res.json({ success: true, data: existing });
     }
-    const variant = Math.random() < 0.5 ? 'control' : 'variant'
+
+    const variant = Math.random() < 0.5 ? 'control' : 'variant';
+
     const { data, error } = await supabase
       .from('experiment_sessions')
       .insert([
         {
-          shop_domain,
+          shop_domain: normalizedShop,
           session_id,
           variant,
-          created_at: new Date().toISOString()
-
-
-        }
+          created_at: new Date().toISOString(),
+        },
       ])
       .select()
-      .single()
+      .single();
+
     if (error) {
-      console.log('ASSIGN INSERT ERROR:', error)
-      return res.status(500).json({ success: false, error })
+      console.log('ASSIGN INSERT ERROR:', error);
+      return res.status(500).json({ success: false, error });
     }
-    res.json({ success: true, data })
+
+    return res.json({ success: true, data });
   } catch (error) {
-    console.log('ASSIGN ROUTE ERROR:', error)
-    res.status(500).json({ success: false, error: String(error.message || error) })
+    console.log('ASSIGN ROUTE ERROR:', error);
+    return res.status(500).json({
+      success: false,
+      error: String(error.message || error),
+    });
   }
-})
+});
+
 app.post('/api/events', async (req, res) => {
   try {
-    console.log('EVENT RECEIVED:', JSON.stringify(req.body, null, 2))
-    const { shop_domain, session_id, event_type, value = 0 } = req.body || {}
+    console.log('EVENT RECEIVED:', JSON.stringify(req.body, null, 2));
+
+    const {
+      shop_domain,
+      session_id,
+      event_type,
+      value = 0,
+    } = req.body || {};
+
     if (!shop_domain || !session_id || !event_type) {
-      console.log('EVENT REJECTED: missing fields')
+      console.log('EVENT REJECTED: missing fields');
       return res.status(400).json({
         success: false,
         error: 'missing fields',
-        received: req.body
-      })
+        received: req.body,
+      });
     }
+
+    const normalizedShop = normalizeShopDomain(shop_domain);
+
     const { data: session, error: sessionError } = await supabase
       .from('experiment_sessions')
       .select('*')
-      .eq('shop_domain', shop_domain)
+      .eq('shop_domain', normalizedShop)
       .eq('session_id', session_id)
-      .maybeSingle()
+      .maybeSingle();
+
     if (sessionError) {
-      console.log('SESSION LOOKUP ERROR:', sessionError)
-      return res.status(500).json({ success: false, error: sessionError })
+      console.log('SESSION LOOKUP ERROR:', sessionError);
+      return res.status(500).json({ success: false, error: sessionError });
     }
+
     if (!session) {
-      console.log('EVENT REJECTED: session not assigned')
+      console.log('EVENT REJECTED: session not assigned');
       return res.status(400).json({
         success: false,
         error: 'session not assigned',
-        shop_domain,
-        session_id
-      })
+        shop_domain: normalizedShop,
+        session_id,
+      });
     }
+
     const insertRow = {
-      shop_domain,
+      shop_domain: normalizedShop,
       session_id,
       variant: session.variant,
       event_type,
       value: Number(value || 0),
-      created_at: new Date().toISOString()
-    }
-    console.log('EVENT INSERT ROW:', JSON.stringify(insertRow, null, 2))
+      created_at: new Date().toISOString(),
+    };
+
+    console.log('EVENT INSERT ROW:', JSON.stringify(insertRow, null, 2));
+
     const { data, error } = await supabase
       .from('events')
       .insert([insertRow])
-      .select()
+      .select();
+
     if (error) {
-      console.log('EVENT INSERT ERROR:', error)
-      return res.status(500).json({ success: false, error })
+      console.log('EVENT INSERT ERROR:', error);
+      return res.status(500).json({ success: false, error });
     }
-    console.log('EVENT INSERTED OK:', JSON.stringify(data, null, 2))
-    res.json({ success: true, data })
+
+    console.log('EVENT INSERTED OK:', JSON.stringify(data, null, 2));
+    return res.json({ success: true, data });
   } catch (error) {
-    console.log('EVENT ROUTE ERROR:', error)
-    res.status(500).json({ success: false, error: String(error.message || error) })
+    console.log('EVENT ROUTE ERROR:', error);
+    return res.status(500).json({
+      success: false,
+      error: String(error.message || error),
+    });
   }
-})
+});
+
 app.get('/api/metrics/:shop_domain', async (req, res) => {
   try {
-    const { shop_domain } = req.params
+    const shop_domain = normalizeShopDomain(req.params.shop_domain);
+
     const { data: sessions, error: sessionsError } = await supabase
       .from('experiment_sessions')
       .select('*')
-      .eq('shop_domain', shop_domain)
+      .eq('shop_domain', shop_domain);
+
     if (sessionsError) {
-      console.log('METRICS SESSION ERROR:', sessionsError)
-      return res.status(500).json({ success: false, error: sessionsError })
+      console.log('METRICS SESSION ERROR:', sessionsError);
+      return res.status(500).json({ success: false, error: sessionsError });
     }
+
     const { data: events, error: eventsError } = await supabase
       .from('events')
       .select('*')
-      .eq('shop_domain', shop_domain)
+      .eq('shop_domain', shop_domain);
+
     if (eventsError) {
-      console.log('METRICS EVENTS ERROR:', eventsError)
-      return res.status(500).json({ success: false, error: eventsError })
+      console.log('METRICS EVENTS ERROR:', eventsError);
+      return res.status(500).json({ success: false, error: eventsError });
     }
-    const controlSessions = sessions.filter(s => s.variant === 'control').length
-    const variantSessions = sessions.filter(s => s.variant === 'variant').length
-    const controlPurchases = events.filter(
-      e => e.variant === 'control' && e.event_type === 'purchase'
-    )
-    const variantPurchases = events.filter(
-      e => e.variant === 'variant' && e.event_type === 'purchase'
-    )
-    const controlRevenue = controlPurchases.reduce((sum, e) => sum + Number(e.value || 0), 0)
-    const variantRevenue = variantPurchases.reduce((sum, e) => sum + Number(e.value || 0), 0)
-    const conversionRateControl = controlSessions ? controlPurchases.length / controlSessions : 0
-    const conversionRateVariant = variantSessions ? variantPurchases.length / variantSessions : 0
-    const revenuePerSessionControl = controlSessions ? controlRevenue / controlSessions : 0
-    const revenuePerSessionVariant = variantSessions ? variantRevenue / variantSessions : 0
-    const liftPercent = revenuePerSessionControl
-      ? ((revenuePerSessionVariant - revenuePerSessionControl) / revenuePerSessionControl) * 100
-      : 0
-    res.json({
+
+    const metrics = calculateMetrics(sessions || [], events || []);
+
+    return res.json({
       success: true,
       data: {
         shop_domain,
-        control: {
-          sessions: controlSessions,
-          purchases: controlPurchases.length,
-          revenue: controlRevenue,
-          conversion_rate: conversionRateControl,
-          revenue_per_session: revenuePerSessionControl
-        },
-        variant: {
-          sessions: variantSessions,
-          purchases: variantPurchases.length,
-          revenue: variantRevenue,
-          conversion_rate: conversionRateVariant,
-          revenue_per_session: revenuePerSessionVariant
-        },
-        lift_percent: liftPercent
-      }
-    })
+        ...metrics,
+      },
+    });
   } catch (error) {
-    console.log('METRICS ROUTE ERROR:', error)
-    res.status(500).json({ success: false, error: String(error.message || error) })
+    console.log('METRICS ROUTE ERROR:', error);
+    return res.status(500).json({
+      success: false,
+      error: String(error.message || error),
+    });
   }
-})
+});
+
 app.get('/api/debug/:shop_domain', async (req, res) => {
   try {
-    const { shop_domain } = req.params
+    const shop_domain = normalizeShopDomain(req.params.shop_domain);
+
     const { data: sessions, error: sessionsError } = await supabase
       .from('experiment_sessions')
       .select('*')
-      .eq('shop_domain', shop_domain)
+      .eq('shop_domain', shop_domain);
+
     const { data: events, error: eventsError } = await supabase
       .from('events')
       .select('*')
       .eq('shop_domain', shop_domain)
-      .order('created_at', { ascending: false })
-    res.json({
+      .order('created_at', { ascending: false });
+
+    return res.json({
       success: true,
       sessionsError,
       eventsError,
       sessionCount: sessions?.length || 0,
       eventCount: events?.length || 0,
-      sessions,
-      events
-    })
+      sessions: sessions || [],
+      events: events || [],
+    });
   } catch (error) {
-    console.log('DEBUG ROUTE ERROR:', error)
-    res.status(500).json({ success: false, error: String(error.message || error) })
+    console.log('DEBUG ROUTE ERROR:', error);
+    return res.status(500).json({
+      success: false,
+      error: String(error.message || error),
+    });
   }
-})
- app.get('/dashboard', (req, res) => {
+});
+
+// ---------- DASHBOARD ----------
+app.get('/dashboard', (req, res) => {
   const shopParam = req.query.shop;
   const shopDomain = shopParam
-    ? (shopParam.includes('.myshopify.com') ? shopParam : `${shopParam}.myshopify.com`)
+    ? normalizeShopDomain(shopParam)
     : 'behavior-test-store.myshopify.com';
 
   res.send(`
@@ -252,10 +493,7 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BehavioralPro Dashboard</title>
   <style>
-    * {
-      box-sizing: border-box;
-    }
-
+    * { box-sizing: border-box; }
     body {
       font-family: Arial, sans-serif;
       margin: 0;
@@ -263,24 +501,20 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
       background: #f6f7f8;
       color: #111827;
     }
-
     .container {
       max-width: 1100px;
       margin: 0 auto;
     }
-
     h1 {
       font-size: 40px;
       margin: 0 0 12px;
       font-weight: 700;
       letter-spacing: -0.02em;
     }
-
     h2 {
       font-size: 20px;
       margin: 0 0 16px;
     }
-
     .subheadline {
       font-size: 16px;
       color: #4b5563;
@@ -288,7 +522,6 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
       margin-bottom: 24px;
       max-width: 760px;
     }
-
     .card {
       background: #ffffff;
       border-radius: 16px;
@@ -296,53 +529,44 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
       margin-bottom: 20px;
       box-shadow: 0 1px 10px rgba(0, 0, 0, 0.06);
     }
-
     .muted {
       color: #6b7280;
       font-size: 14px;
       line-height: 1.6;
     }
-
     .store-line {
       font-size: 18px;
       margin-bottom: 6px;
     }
-
     .grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 20px;
       margin-bottom: 20px;
     }
-
     .stats-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 14px;
     }
-
     .stat {
       background: #f9fafb;
       border-radius: 12px;
       padding: 14px;
     }
-
     .label {
       font-size: 13px;
       color: #6b7280;
       margin-bottom: 6px;
     }
-
     .value {
       font-size: 28px;
       font-weight: 700;
       line-height: 1.1;
     }
-
     .value.small {
       font-size: 20px;
     }
-
     .pill {
       display: inline-block;
       padding: 6px 10px;
@@ -353,13 +577,11 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
       font-weight: 600;
       margin-bottom: 10px;
     }
-
     .instructions ol {
       margin: 12px 0 0 18px;
       padding: 0;
       line-height: 1.8;
     }
-
     .notice {
       border: 1px solid #dbeafe;
       background: #eff6ff;
@@ -370,20 +592,12 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
       font-size: 14px;
       line-height: 1.6;
     }
-
-    .success {
-      color: #166534;
-    }
-
-    .warning {
-      color: #92400e;
-    }
-
+    .success { color: #166534; }
+    .warning { color: #92400e; }
     .error {
       color: #b91c1c;
       font-weight: 600;
     }
-
     .toggle-row {
       display: flex;
       align-items: center;
@@ -391,7 +605,6 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
       gap: 12px;
       margin-bottom: 12px;
     }
-
     button {
       border: 0;
       border-radius: 10px;
@@ -402,11 +615,7 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
       background: #111827;
       color: white;
     }
-
-    button:hover {
-      opacity: 0.92;
-    }
-
+    button:hover { opacity: 0.92; }
     pre {
       margin: 0;
       white-space: pre-wrap;
@@ -419,30 +628,14 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
       border-radius: 12px;
       overflow: auto;
     }
-
-    .hidden {
-      display: none;
-    }
-
+    .hidden { display: none; }
     @media (max-width: 900px) {
-      .grid {
-        grid-template-columns: 1fr;
-      }
+      .grid { grid-template-columns: 1fr; }
     }
-
     @media (max-width: 640px) {
-      body {
-        padding: 18px;
-      }
-
-      h1 {
-        font-size: 30px;
-      }
-
-      .stats-grid {
-        grid-template-columns: 1fr;
-      }
-
+      body { padding: 18px; }
+      h1 { font-size: 30px; }
+      .stats-grid { grid-template-columns: 1fr; }
       .toggle-row {
         flex-direction: column;
         align-items: flex-start;
@@ -488,74 +681,32 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
       <div class="card">
         <div class="pill">Control</div>
         <div class="stats-grid">
-          <div class="stat">
-            <div class="label">Sessions</div>
-            <div class="value" id="control-sessions">—</div>
-          </div>
-          <div class="stat">
-            <div class="label">Purchases</div>
-            <div class="value" id="control-purchases">—</div>
-          </div>
-          <div class="stat">
-            <div class="label">Revenue</div>
-            <div class="value small" id="control-revenue">—</div>
-          </div>
-          <div class="stat">
-            <div class="label">Conversion Rate</div>
-            <div class="value small" id="control-conversion">—</div>
-          </div>
-          <div class="stat">
-            <div class="label">Revenue / Session</div>
-            <div class="value small" id="control-rps">—</div>
-          </div>
+          <div class="stat"><div class="label">Sessions</div><div class="value" id="control-sessions">—</div></div>
+          <div class="stat"><div class="label">Purchases</div><div class="value" id="control-purchases">—</div></div>
+          <div class="stat"><div class="label">Revenue</div><div class="value small" id="control-revenue">—</div></div>
+          <div class="stat"><div class="label">Conversion Rate</div><div class="value small" id="control-conversion">—</div></div>
+          <div class="stat"><div class="label">Revenue / Session</div><div class="value small" id="control-rps">—</div></div>
         </div>
       </div>
 
       <div class="card">
         <div class="pill">Variant</div>
         <div class="stats-grid">
-          <div class="stat">
-            <div class="label">Sessions</div>
-            <div class="value" id="variant-sessions">—</div>
-          </div>
-          <div class="stat">
-            <div class="label">Purchases</div>
-            <div class="value" id="variant-purchases">—</div>
-          </div>
-          <div class="stat">
-            <div class="label">Revenue</div>
-            <div class="value small" id="variant-revenue">—</div>
-          </div>
-          <div class="stat">
-            <div class="label">Conversion Rate</div>
-            <div class="value small" id="variant-conversion">—</div>
-          </div>
-          <div class="stat">
-            <div class="label">Revenue / Session</div>
-            <div class="value small" id="variant-rps">—</div>
-          </div>
+          <div class="stat"><div class="label">Sessions</div><div class="value" id="variant-sessions">—</div></div>
+          <div class="stat"><div class="label">Purchases</div><div class="value" id="variant-purchases">—</div></div>
+          <div class="stat"><div class="label">Revenue</div><div class="value small" id="variant-revenue">—</div></div>
+          <div class="stat"><div class="label">Conversion Rate</div><div class="value small" id="variant-conversion">—</div></div>
+          <div class="stat"><div class="label">Revenue / Session</div><div class="value small" id="variant-rps">—</div></div>
         </div>
       </div>
 
       <div class="card">
         <div class="pill">Lift</div>
         <div class="stats-grid">
-          <div class="stat">
-            <div class="label">Lift %</div>
-            <div class="value" id="lift-percent">—</div>
-          </div>
-          <div class="stat">
-            <div class="label">Current Status</div>
-            <div class="value small" id="status-text">Loading...</div>
-          </div>
-          <div class="stat">
-            <div class="label">Total Sessions</div>
-            <div class="value small" id="total-sessions">—</div>
-          </div>
-          <div class="stat">
-            <div class="label">Total Purchases</div>
-            <div class="value small" id="total-purchases">—</div>
-          </div>
+          <div class="stat"><div class="label">Lift %</div><div class="value" id="lift-percent">—</div></div>
+          <div class="stat"><div class="label">Current Status</div><div class="value small" id="status-text">Loading...</div></div>
+          <div class="stat"><div class="label">Total Sessions</div><div class="value small" id="total-sessions">—</div></div>
+          <div class="stat"><div class="label">Total Purchases</div><div class="value small" id="total-purchases">—</div></div>
         </div>
       </div>
     </div>
@@ -610,14 +761,12 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
 
     function getNoticeText(totalSessions, totalPurchases) {
       if (totalSessions === 0) {
-        return 'No data yet — turn on the app embed, save, then open your storefront in another tab to start tracking activity. Data should appear within seconds.';
+        return "No data yet — turn on the app embed, save, then open your storefront in another tab to start tracking activity. Data should appear within seconds.";
       }
-
       if (totalPurchases === 0) {
-        return 'Tracking is live. Sessions are being recorded, but no purchases have been captured yet.';
+        return "Tracking is live. Sessions are being recorded, but no purchases have been captured yet.";
       }
-
-      return 'Tracking is live and data is being collected successfully for this store.';
+      return "Tracking is live and data is being collected successfully for this store.";
     }
 
     async function loadMetrics() {
@@ -673,7 +822,7 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
 
         const metricsJson = document.getElementById("metrics-json");
         if (metricsJson) {
-          metricsJson.textContent = "Error loading dashboard data:" + "\\n\\n" + String(err);
+          metricsJson.textContent = "Error loading dashboard data:\\n\\n" + String(err);
         }
 
         const status = document.getElementById("status-text");
@@ -703,21 +852,25 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
 </html>
   `);
 });
-app.get('/', (req, res) => {
-  res.send('BehavioralPro backend is running.')
-})
-app.get('/app', (req, res) => {
-  const shop = req.query.shop;
-  if (!shop) {
-    return res.send('Missing shop parameter');
-  }
-  const shopDomain = shop.includes('.myshopify.com')
-    ? shop
-    : `${shop}.myshopify.com`;
-  return res.redirect(`/dashboard?shop=${encodeURIComponent(shopDomain)}`);
-});
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
+
+// ---------- BASIC ROUTES ----------
+app.get('/', (_req, res) => {
+  res.send('BehavioralPro backend is running.');
 });
 
+app.get('/app', (req, res) => {
+  const shop = req.query.shop;
+
+  if (!shop) {
+    return res.status(400).send('Missing shop parameter');
+  }
+
+  const shopDomain = normalizeShopDomain(shop);
+  return res.redirect(`/dashboard?shop=${encodeURIComponent(shopDomain)}`);
+});
+
+// ---------- START ----------
+app.listen(PORT, () => {
+  console.log('Server running on port', PORT);
+});
 
