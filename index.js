@@ -546,9 +546,16 @@ app.get('/api/metrics/:shop_domain', async (req, res) => {
   }
 });
 
-app.get('/', (_req, res) => {
-  res.send('BehavioralPro backend is running. V3 webhook build');
+app.get('/', (req, res) => {
+  const shop = req.query.shop;
+
+  if (shop) {
+    return res.redirect(`/app?shop=${encodeURIComponent(shop)}`);
+  }
+
+  return res.redirect('/dashboard');
 });
+
 
 app.get('/api/debug/:shop_domain', async (req, res) => {
   try {
