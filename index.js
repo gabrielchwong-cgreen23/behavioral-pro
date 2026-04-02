@@ -30,7 +30,9 @@ app.use((req, res, next) => {
 const {
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
+  SHOPIFY_API_KEY,
   SHOPIFY_API_SECRET,
+  APP_URL,
 } = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -113,6 +115,64 @@ function shopifyWebhookHandler(topic, processor) {
 function normalizeShopDomain(shop) {
   if (!shop) return '';
   return shop.includes('.myshopify.com') ? shop : `${shop}.myshopify.com`;
+}
+
+function verifyShopifyOAuthCallback(query) {
+  try {
+    const hmac = query.hmac;
+
+    if (!hmac || !SHOPIFY_API_SECRET) {
+      return false;
+    }
+
+    const message = Object.keys(query)
+      .filter((key) => key !== 'hmac' && key !== 'signature')
+      .sort()
+      .map((key) => `${key}=${Array.isArray(query[key]) ? query[key].join(',') : query[key]}`)
+      .join('&');
+
+    const digest = crypto
+      .createHmac('sha256', SHOPIFY_API_SECRET)
+      .update(message, 'utf8')
+      .digest('hex');
+
+    return crypto.timingSafeEqual(
+      Buffer.from(digest, 'utf8'),
+      Buffer.from(String(hmac), 'utf8')
+    );
+  } catch (error) {
+    console.error('OAuth callback verification error:', error);
+    return false;
+  }
+}
+
+async function exchangeShopifyAccessToken({ shop, code }) {
+  const response = await fetch(`https://${shop}/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      client_id: SHOPIFY_API_KEY,
+      client_secret: SHOPIFY_API_SECRET,
+      code,
+    }),
+  });
+
+  const json = await response.json().catch(() => ({}));
+
+  if (!response.ok || !json.access_token) {
+    throw new Error(json.error_description || json.error || 'Failed to exchange OAuth code');
+  }
+
+  return {
+    accessToken: json.access_token,
+    scope: json.scope || null,
+  };
+}
+
+function getAppBaseUrl(req) {
+  return (APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
 }
 
 function calculateMetrics(sessions = [], events = []) {
@@ -230,6 +290,47 @@ app.post(
 );
 
 // ---------- API ROUTES ----------
+app.get('/api/shopify/callback', async (req, res) => {
+  try {
+    const { shop, code } = req.query || {};
+    const normalizedShop = normalizeShopDomain(shop);
+
+    if (!normalizedShop || !code) {
+      return res.status(400).send('Missing Shopify callback parameters');
+    }
+
+    if (!verifyShopifyOAuthCallback(req.query || {})) {
+      return res.status(401).send('Invalid Shopify callback signature');
+    }
+
+    const { accessToken, scope } = await exchangeShopifyAccessToken({
+      shop: normalizedShop,
+      code: String(code),
+    });
+
+    const row = {
+      shop_domain: normalizedShop,
+      access_token: accessToken,
+      scope,
+      installed_at: new Date().toISOString(),
+    };
+
+    const { error } = await supabase
+      .from('stores')
+      .upsert([row], { onConflict: 'shop_domain' });
+
+    if (error) {
+      console.log('SHOPIFY CALLBACK STORE UPSERT ERROR:', error);
+      return res.status(500).send('Failed to persist shop install');
+    }
+
+    return res.redirect(`/app?shop=${encodeURIComponent(normalizedShop)}`);
+  } catch (error) {
+    console.log('SHOPIFY CALLBACK ERROR:', error);
+    return res.status(500).send(String(error.message || error));
+  }
+});
+
 app.post('/api/stores', async (req, res) => {
   try {
     const { shop_domain, access_token = null, scope = null } = req.body || {};
@@ -879,4 +980,3 @@ app.get('/app', (req, res) => {
 app.listen(PORT, () => {
   console.log('Server running on port', PORT);
 });
-
