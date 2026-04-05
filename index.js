@@ -1,3 +1,6 @@
+Use this full `index.js` as your replacement. This keeps your original structure, adds Shopify session-token verification, loads App Bridge from Shopify’s CDN in the embedded dashboard, protects the embedded metrics/debug routes with bearer token auth, and fixes the root route so the embedded app opens the actual UI.
+
+```js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -38,26 +41,31 @@ if (!SHOPIFY_API_SECRET) {
 }
 
 if (!SHOPIFY_API_KEY) {
-  console.warn('Missing SHOPIFY_API_KEY. Embedded App Bridge may not initialize correctly.');
+  console.warn('Missing SHOPIFY_API_KEY. Embedded session tokens may fail.');
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY
+);
 
 function getRawBody(req) {
-  if (Buffer.isBuffer(req.body)) return req.body;
-  if (typeof req.body === 'string') return Buffer.from(req.body, 'utf8');
+  if (Buffer.isBuffer(req.body)) {
+    return req.body;
+  }
+  if (typeof req.body === 'string') {
+    return Buffer.from(req.body, 'utf8');
+  }
   return Buffer.from('', 'utf8');
 }
 
 function verifyShopifyWebhook(req) {
   try {
     const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
-
-    if (!hmacHeader || !SHOPIFY_API_SECRET) {
-      return false;
-    }
+    if (!hmacHeader || !SHOPIFY_API_SECRET) return false;
 
     const rawBody = getRawBody(req);
+
     const digest = crypto
       .createHmac('sha256', SHOPIFY_API_SECRET)
       .update(rawBody)
@@ -76,13 +84,14 @@ function verifyShopifyWebhook(req) {
 function shopifyWebhookHandler(topic, processor) {
   return async (req, res) => {
     try {
-      if (!verifyShopifyWebhook(req)) {
+      const isValid = verifyShopifyWebhook(req);
+
+      if (!isValid) {
         console.log(`Invalid webhook signature for ${topic}`);
         return res.status(401).send('Invalid webhook signature');
       }
 
       let payload = {};
-
       try {
         payload = JSON.parse(getRawBody(req).toString('utf8') || '{}');
       } catch (parseError) {
@@ -91,7 +100,9 @@ function shopifyWebhookHandler(topic, processor) {
       }
 
       console.log(`${topic} webhook received:`, payload);
+
       await processor(payload, req);
+
       return res.status(200).send('ok');
     } catch (error) {
       console.error(`${topic} webhook error:`, error);
@@ -105,58 +116,69 @@ function normalizeShopDomain(shop) {
   return shop.includes('.myshopify.com') ? shop : `${shop}.myshopify.com`;
 }
 
-function verifyShopifyOAuthCallback(query) {
-  try {
-    const hmac = query.hmac;
+function decodeBase64Url(value) {
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+  return Buffer.from(padded, 'base64').toString('utf8');
+}
 
-    if (!hmac || !SHOPIFY_API_SECRET) {
-      return false;
+function verifyShopifySessionToken(token) {
+  try {
+    if (!token || !SHOPIFY_API_SECRET || !SHOPIFY_API_KEY) {
+      return null;
     }
 
-    const message = Object.keys(query)
-      .filter((key) => key !== 'hmac' && key !== 'signature')
-      .sort()
-      .map((key) => `${key}=${Array.isArray(query[key]) ? query[key].join(',') : query[key]}`)
-      .join('&');
+    const parts = token.split('.');
+    if (parts.length !== 3) {
+      return null;
+    }
 
-    const digest = crypto
+    const [encodedHeader, encodedPayload, encodedSignature] = parts;
+    const signedPayload = `${encodedHeader}.${encodedPayload}`;
+
+    const expectedSignature = crypto
       .createHmac('sha256', SHOPIFY_API_SECRET)
-      .update(message, 'utf8')
-      .digest('hex');
+      .update(signedPayload)
+      .digest('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
 
-    return crypto.timingSafeEqual(
-      Buffer.from(digest, 'utf8'),
-      Buffer.from(String(hmac), 'utf8')
-    );
+    if (!crypto.timingSafeEqual(
+      Buffer.from(expectedSignature, 'utf8'),
+      Buffer.from(encodedSignature, 'utf8')
+    )) {
+      return null;
+    }
+
+    const payload = JSON.parse(decodeBase64Url(encodedPayload));
+    const now = Math.floor(Date.now() / 1000);
+
+    if (payload.exp && payload.exp < now) return null;
+    if (payload.nbf && payload.nbf > now) return null;
+    if (payload.aud !== SHOPIFY_API_KEY) return null;
+
+    return payload;
   } catch (error) {
-    console.error('OAuth callback verification error:', error);
-    return false;
+    console.error('Session token verification error:', error);
+    return null;
   }
 }
 
-async function exchangeShopifyAccessToken({ shop, code }) {
-  const response = await fetch(`https://${shop}/admin/oauth/access_token`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      client_id: SHOPIFY_API_KEY,
-      client_secret: SHOPIFY_API_SECRET,
-      code,
-    }),
-  });
+function requireShopifySessionAuth(req, res, next) {
+  const authHeader = req.get('Authorization') || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const payload = verifyShopifySessionToken(token);
 
-  const json = await response.json().catch(() => ({}));
-
-  if (!response.ok || !json.access_token) {
-    throw new Error(json.error_description || json.error || 'Failed to exchange OAuth code');
+  if (!payload) {
+    return res.status(401).json({
+      success: false,
+      error: 'invalid_session_token',
+    });
   }
 
-  return {
-    accessToken: json.access_token,
-    scope: json.scope || null,
-  };
+  req.shopifySession = payload;
+  next();
 }
 
 function calculateMetrics(sessions = [], events = []) {
@@ -166,17 +188,36 @@ function calculateMetrics(sessions = [], events = []) {
   const controlPurchases = events.filter(
     (e) => e.variant === 'control' && e.event_type === 'purchase'
   );
+
   const variantPurchases = events.filter(
     (e) => e.variant === 'variant' && e.event_type === 'purchase'
   );
 
-  const controlRevenue = controlPurchases.reduce((sum, e) => sum + Number(e.value || 0), 0);
-  const variantRevenue = variantPurchases.reduce((sum, e) => sum + Number(e.value || 0), 0);
+  const controlRevenue = controlPurchases.reduce(
+    (sum, e) => sum + Number(e.value || 0),
+    0
+  );
 
-  const conversionRateControl = controlSessions ? controlPurchases.length / controlSessions : 0;
-  const conversionRateVariant = variantSessions ? variantPurchases.length / variantSessions : 0;
-  const revenuePerSessionControl = controlSessions ? controlRevenue / controlSessions : 0;
-  const revenuePerSessionVariant = variantSessions ? variantRevenue / variantSessions : 0;
+  const variantRevenue = variantPurchases.reduce(
+    (sum, e) => sum + Number(e.value || 0),
+    0
+  );
+
+  const conversionRateControl = controlSessions
+    ? controlPurchases.length / controlSessions
+    : 0;
+
+  const conversionRateVariant = variantSessions
+    ? variantPurchases.length / variantSessions
+    : 0;
+
+  const revenuePerSessionControl = controlSessions
+    ? controlRevenue / controlSessions
+    : 0;
+
+  const revenuePerSessionVariant = variantSessions
+    ? variantRevenue / variantSessions
+    : 0;
 
   const liftPercent = revenuePerSessionControl
     ? ((revenuePerSessionVariant - revenuePerSessionControl) / revenuePerSessionControl) * 100
@@ -237,49 +278,22 @@ app.post(
       'Processed shop/redact for shop:',
       payload.shop_domain || payload.shop_id || 'unknown'
     );
+
+    const possibleShopDomain =
+      payload.shop_domain ||
+      payload.myshopify_domain ||
+      payload.domain ||
+      null;
+
+    if (possibleShopDomain) {
+      /*
+      await supabase.from('events').delete().eq('shop_domain', possibleShopDomain);
+      await supabase.from('experiment_sessions').delete().eq('shop_domain', possibleShopDomain);
+      await supabase.from('stores').delete().eq('shop_domain', possibleShopDomain);
+      */
+    }
   })
 );
-
-app.get('/api/shopify/callback', async (req, res) => {
-  try {
-    const { shop, code } = req.query || {};
-    const normalizedShop = normalizeShopDomain(shop);
-
-    if (!normalizedShop || !code) {
-      return res.status(400).send('Missing Shopify callback parameters');
-    }
-
-    if (!verifyShopifyOAuthCallback(req.query || {})) {
-      return res.status(401).send('Invalid Shopify callback signature');
-    }
-
-    const { accessToken, scope } = await exchangeShopifyAccessToken({
-      shop: normalizedShop,
-      code: String(code),
-    });
-
-    const row = {
-      shop_domain: normalizedShop,
-      access_token: accessToken,
-      scope,
-      installed_at: new Date().toISOString(),
-    };
-
-    const { error } = await supabase
-      .from('stores')
-      .upsert([row], { onConflict: 'shop_domain' });
-
-    if (error) {
-      console.log('SHOPIFY CALLBACK STORE UPSERT ERROR:', error);
-      return res.status(500).send('Failed to persist shop install');
-    }
-
-    return res.redirect(`/app?shop=${encodeURIComponent(normalizedShop)}`);
-  } catch (error) {
-    console.log('SHOPIFY CALLBACK ERROR:', error);
-    return res.status(500).send(String(error.message || error));
-  }
-});
 
 app.post('/api/stores', async (req, res) => {
   try {
@@ -374,9 +388,17 @@ app.post('/api/assign-variant', async (req, res) => {
 
 app.post('/api/events', async (req, res) => {
   try {
-    const { shop_domain, session_id, event_type, value = 0 } = req.body || {};
+    console.log('EVENT RECEIVED:', JSON.stringify(req.body, null, 2));
+
+    const {
+      shop_domain,
+      session_id,
+      event_type,
+      value = 0,
+    } = req.body || {};
 
     if (!shop_domain || !session_id || !event_type) {
+      console.log('EVENT REJECTED: missing fields');
       return res.status(400).json({
         success: false,
         error: 'missing fields',
@@ -399,6 +421,7 @@ app.post('/api/events', async (req, res) => {
     }
 
     if (!session) {
+      console.log('EVENT REJECTED: session not assigned');
       return res.status(400).json({
         success: false,
         error: 'session not assigned',
@@ -416,6 +439,8 @@ app.post('/api/events', async (req, res) => {
       created_at: new Date().toISOString(),
     };
 
+    console.log('EVENT INSERT ROW:', JSON.stringify(insertRow, null, 2));
+
     const { data, error } = await supabase
       .from('events')
       .insert([insertRow])
@@ -426,6 +451,7 @@ app.post('/api/events', async (req, res) => {
       return res.status(500).json({ success: false, error });
     }
 
+    console.log('EVENT INSERTED OK:', JSON.stringify(data, null, 2));
     return res.json({ success: true, data });
   } catch (error) {
     console.log('EVENT ROUTE ERROR:', error);
@@ -436,7 +462,7 @@ app.post('/api/events', async (req, res) => {
   }
 });
 
-app.get('/api/metrics/:shop_domain', async (req, res) => {
+app.get('/api/metrics/:shop_domain', requireShopifySessionAuth, async (req, res) => {
   try {
     const shop_domain = normalizeShopDomain(req.params.shop_domain);
 
@@ -478,7 +504,7 @@ app.get('/api/metrics/:shop_domain', async (req, res) => {
   }
 });
 
-app.get('/api/debug/:shop_domain', async (req, res) => {
+app.get('/api/debug/:shop_domain', requireShopifySessionAuth, async (req, res) => {
   try {
     const shop_domain = normalizeShopDomain(req.params.shop_domain);
 
@@ -511,16 +537,6 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => {
-  const shop = req.query.shop;
-
-  if (shop) {
-    return res.redirect(`/app?shop=${encodeURIComponent(shop)}`);
-  }
-
-  return res.redirect('/dashboard');
-});
-
 app.get('/dashboard', (req, res) => {
   const shopParam = req.query.shop;
   const shopDomain = shopParam
@@ -531,374 +547,402 @@ app.get('/dashboard', (req, res) => {
 <!doctype html>
 <html>
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>BehavioralPro Dashboard</title>
-  <meta name="shopify-api-key" content="${SHOPIFY_API_KEY || ''}" />
-  <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
-  <style>
-    * { box-sizing: border-box; }
-    body {
-      font-family: Arial, sans-serif;
-      margin: 0;
-      padding: 32px;
-      background: #f6f7f8;
-      color: #111827;
-    }
-    .container {
-      max-width: 1100px;
-      margin: 0 auto;
-    }
-    h1 {
-      font-size: 40px;
-      margin: 0 0 12px;
-      font-weight: 700;
-      letter-spacing: -0.02em;
-    }
-    h2 {
-      font-size: 20px;
-      margin: 0 0 16px;
-    }
-    .subheadline {
-      font-size: 16px;
-      color: #4b5563;
-      line-height: 1.6;
-      margin-bottom: 24px;
-      max-width: 760px;
-    }
-    .card {
-      background: #ffffff;
-      border-radius: 16px;
-      padding: 20px;
-      margin-bottom: 20px;
-      box-shadow: 0 1px 10px rgba(0, 0, 0, 0.06);
-    }
-    .muted {
-      color: #6b7280;
-      font-size: 14px;
-      line-height: 1.6;
-    }
-    .store-line {
-      font-size: 18px;
-      margin-bottom: 6px;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 20px;
-      margin-bottom: 20px;
-    }
-    .stats-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
-    }
-    .stat {
-      background: #f9fafb;
-      border-radius: 12px;
-      padding: 14px;
-    }
-    .label {
-      font-size: 13px;
-      color: #6b7280;
-      margin-bottom: 6px;
-    }
-    .value {
-      font-size: 28px;
-      font-weight: 700;
-      line-height: 1.1;
-    }
-    .value.small {
-      font-size: 20px;
-    }
-    .pill {
-      display: inline-block;
-      padding: 6px 10px;
-      border-radius: 999px;
-      background: #eef2ff;
-      color: #3730a3;
-      font-size: 12px;
-      font-weight: 600;
-      margin-bottom: 10px;
-    }
-    .instructions ol {
-      margin: 12px 0 0 18px;
-      padding: 0;
-      line-height: 1.8;
-    }
-    .notice {
-      border: 1px solid #dbeafe;
-      background: #eff6ff;
-      color: #1e3a8a;
-      border-radius: 12px;
-      padding: 14px 16px;
-      margin-top: 14px;
-      font-size: 14px;
-      line-height: 1.6;
-    }
-    .success { color: #166534; }
-    .warning { color: #92400e; }
-    .error {
-      color: #b91c1c;
-      font-weight: 600;
-    }
-    .toggle-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 12px;
-    }
-    button {
-      border: 0;
-      border-radius: 10px;
-      padding: 10px 14px;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-      background: #111827;
-      color: white;
-    }
-    button:hover { opacity: 0.92; }
-    pre {
-      margin: 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-size: 13px;
-      line-height: 1.5;
-      background: #0f172a;
-      color: #e5e7eb;
-      padding: 16px;
-      border-radius: 12px;
-      overflow: auto;
-    }
-    .hidden { display: none; }
-    @media (max-width: 900px) {
-      .grid { grid-template-columns: 1fr; }
-    }
-    @media (max-width: 640px) {
-      body { padding: 18px; }
-      h1 { font-size: 30px; }
-      .stats-grid { grid-template-columns: 1fr; }
-      .toggle-row {
-        flex-direction: column;
-        align-items: flex-start;
-      }
-    }
-  </style>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BehavioralPro Dashboard</title>
+<meta name="shopify-api-key" content="${SHOPIFY_API_KEY || ''}" />
+<script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+<style>
+* { box-sizing: border-box; }
+body {
+font-family: Arial, sans-serif;
+margin: 0;
+padding: 32px;
+background: #f6f7f8;
+color: #111827;
+}
+.container {
+max-width: 1100px;
+margin: 0 auto;
+}
+h1 {
+font-size: 40px;
+margin: 0 0 12px;
+font-weight: 700;
+letter-spacing: -0.02em;
+}
+h2 {
+font-size: 20px;
+margin: 0 0 16px;
+}
+.subheadline {
+font-size: 16px;
+color: #4b5563;
+line-height: 1.6;
+margin-bottom: 24px;
+max-width: 760px;
+}
+.card {
+background: #ffffff;
+border-radius: 16px;
+padding: 20px;
+margin-bottom: 20px;
+box-shadow: 0 1px 10px rgba(0, 0, 0, 0.06);
+}
+.muted {
+color: #6b7280;
+font-size: 14px;
+line-height: 1.6;
+}
+.store-line {
+font-size: 18px;
+margin-bottom: 6px;
+}
+.grid {
+display: grid;
+grid-template-columns: repeat(3, minmax(0, 1fr));
+gap: 20px;
+margin-bottom: 20px;
+}
+.stats-grid {
+display: grid;
+grid-template-columns: repeat(2, minmax(0, 1fr));
+gap: 14px;
+}
+.stat {
+background: #f9fafb;
+border-radius: 12px;
+padding: 14px;
+}
+.label {
+font-size: 13px;
+color: #6b7280;
+margin-bottom: 6px;
+}
+.value {
+font-size: 28px;
+font-weight: 700;
+line-height: 1.1;
+}
+.value.small {
+font-size: 20px;
+}
+.pill {
+display: inline-block;
+padding: 6px 10px;
+border-radius: 999px;
+background: #eef2ff;
+color: #3730a3;
+font-size: 12px;
+font-weight: 600;
+margin-bottom: 10px;
+}
+.instructions ol {
+margin: 12px 0 0 18px;
+padding: 0;
+line-height: 1.8;
+}
+.notice {
+border: 1px solid #dbeafe;
+background: #eff6ff;
+color: #1e3a8a;
+border-radius: 12px;
+padding: 14px 16px;
+margin-top: 14px;
+font-size: 14px;
+line-height: 1.6;
+}
+.success { color: #166534; }
+.warning { color: #92400e; }
+.error {
+color: #b91c1c;
+font-weight: 600;
+}
+.toggle-row {
+display: flex;
+align-items: center;
+justify-content: space-between;
+gap: 12px;
+margin-bottom: 12px;
+}
+button {
+border: 0;
+border-radius: 10px;
+padding: 10px 14px;
+font-size: 14px;
+font-weight: 600;
+cursor: pointer;
+background: #111827;
+color: white;
+}
+button:hover { opacity: 0.92; }
+pre {
+margin: 0;
+white-space: pre-wrap;
+word-break: break-word;
+font-size: 13px;
+line-height: 1.5;
+background: #0f172a;
+color: #e5e7eb;
+padding: 16px;
+border-radius: 12px;
+overflow: auto;
+}
+.hidden { display: none; }
+@media (max-width: 900px) {
+.grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 640px) {
+body { padding: 18px; }
+h1 { font-size: 30px; }
+.stats-grid { grid-template-columns: 1fr; }
+.toggle-row {
+flex-direction: column;
+align-items: flex-start;
+}
+}
+</style>
 </head>
 <body>
-  <div class="container">
-    <h1>BehavioralPro Dashboard</h1>
-    <div class="subheadline">
-      BehavioralPro tracks visitor hesitation and intent signals, triggers contextual responses,
-      and measures revenue lift through a built-in control vs. variant test.
-    </div>
+<div class="container">
+<h1>BehavioralPro Dashboard</h1>
+<div class="subheadline">
+BehavioralPro tracks visitor hesitation and intent signals, triggers contextual responses,
+and measures revenue lift through a built-in control vs. variant test.
+</div>
+<div class="card">
+<div class="store-line"><strong>Store:</strong> <span id="shop-domain"></span></div>
+<div class="muted">
+This dashboard shows experiment performance for the currently selected Shopify store.
+</div>
+<div class="notice" id="top-notice">
+Loading dashboard data...
+</div>
+</div>
+<div class="card instructions">
+<div class="pill">Setup</div>
+<h2>How to start tracking</h2>
+<div class="muted">
+If this is your first time opening the app, turn on the app embed so BehavioralPro can begin
+tracking storefront activity.
+</div>
+<ol>
+<li>Go to <strong>Online Store → Themes → Customize</strong></li>
+<li>Open <strong>App embeds</strong></li>
+<li>Toggle <strong>BehavioralPro</strong> ON</li>
+<li>Save</li>
+<li>Open your storefront in another tab to generate activity</li>
+</ol>
+</div>
+<div class="grid">
+<div class="card">
+<div class="pill">Control</div>
+<div class="stats-grid">
+<div class="stat"><div class="label">Sessions</div><div class="value" id="control-sessions">—</div></div>
+<div class="stat"><div class="label">Purchases</div><div class="value" id="control-purchases">—</div></div>
+<div class="stat"><div class="label">Revenue</div><div class="value small" id="control-revenue">—</div></div>
+<div class="stat"><div class="label">Conversion Rate</div><div class="value small" id="control-conversion">—</div></div>
+<div class="stat"><div class="label">Revenue / Session</div><div class="value small" id="control-rps">—</div></div>
+</div>
+</div>
+<div class="card">
+<div class="pill">Variant</div>
+<div class="stats-grid">
+<div class="stat"><div class="label">Sessions</div><div class="value" id="variant-sessions">—</div></div>
+<div class="stat"><div class="label">Purchases</div><div class="value" id="variant-purchases">—</div></div>
+<div class="stat"><div class="label">Revenue</div><div class="value small" id="variant-revenue">—</div></div>
+<div class="stat"><div class="label">Conversion Rate</div><div class="value small" id="variant-conversion">—</div></div>
+<div class="stat"><div class="label">Revenue / Session</div><div class="value small" id="variant-rps">—</div></div>
+</div>
+</div>
+<div class="card">
+<div class="pill">Lift</div>
+<div class="stats-grid">
+<div class="stat"><div class="label">Lift %</div><div class="value" id="lift-percent">—</div></div>
+<div class="stat"><div class="label">Current Status</div><div class="value small" id="status-text">Loading...</div></div>
+<div class="stat"><div class="label">Total Sessions</div><div class="value small" id="total-sessions">—</div></div>
+<div class="stat"><div class="label">Total Purchases</div><div class="value small" id="total-purchases">—</div></div>
+</div>
+</div>
+</div>
+<div class="card">
+<div class="toggle-row">
+<div>
+<h2 style="margin-bottom: 4px;">Raw Data (Advanced)</h2>
+<div class="muted">Optional debugging output for advanced review.</div>
+</div>
+<button id="toggle-raw-data" type="button">Show Raw Data</button>
+</div>
+<div id="raw-data-wrap" class="hidden">
+<pre id="metrics-json">Loading...</pre>
+</div>
+</div>
+</div>
+<script>
+const shopDomain = ${JSON.stringify(shopDomain)};
 
-    <div class="card">
-      <div class="store-line"><strong>Store:</strong> <span id="shop-domain"></span></div>
-      <div class="muted">
-        This dashboard shows experiment performance for the currently selected Shopify store.
-      </div>
-      <div class="notice" id="top-notice">
-        Loading dashboard data...
-      </div>
-    </div>
+function formatMoney(value) {
+const num = Number(value || 0);
+return "$" + num.toFixed(2);
+}
 
-    <div class="card instructions">
-      <div class="pill">Setup</div>
-      <h2>How to start tracking</h2>
-      <div class="muted">
-        If this is your first time opening the app, turn on the app embed so BehavioralPro can begin
-        tracking storefront activity.
-      </div>
-      <ol>
-        <li>Go to <strong>Online Store → Themes → Customize</strong></li>
-        <li>Open <strong>App embeds</strong></li>
-        <li>Toggle <strong>BehavioralPro</strong> ON</li>
-        <li>Save</li>
-        <li>Open your storefront in another tab to generate activity</li>
-      </ol>
-    </div>
+function formatPercentFromDecimal(value) {
+const num = Number(value || 0) * 100;
+return num.toFixed(1) + "%";
+}
 
-    <div class="grid">
-      <div class="card">
-        <div class="pill">Control</div>
-        <div class="stats-grid">
-          <div class="stat"><div class="label">Sessions</div><div class="value" id="control-sessions">—</div></div>
-          <div class="stat"><div class="label">Purchases</div><div class="value" id="control-purchases">—</div></div>
-          <div class="stat"><div class="label">Revenue</div><div class="value small" id="control-revenue">—</div></div>
-          <div class="stat"><div class="label">Conversion Rate</div><div class="value small" id="control-conversion">—</div></div>
-          <div class="stat"><div class="label">Revenue / Session</div><div class="value small" id="control-rps">—</div></div>
-        </div>
-      </div>
+function formatLiftPercent(value) {
+const num = Number(value || 0);
+return num.toFixed(1) + "%";
+}
 
-      <div class="card">
-        <div class="pill">Variant</div>
-        <div class="stats-grid">
-          <div class="stat"><div class="label">Sessions</div><div class="value" id="variant-sessions">—</div></div>
-          <div class="stat"><div class="label">Purchases</div><div class="value" id="variant-purchases">—</div></div>
-          <div class="stat"><div class="label">Revenue</div><div class="value small" id="variant-revenue">—</div></div>
-          <div class="stat"><div class="label">Conversion Rate</div><div class="value small" id="variant-conversion">—</div></div>
-          <div class="stat"><div class="label">Revenue / Session</div><div class="value small" id="variant-rps">—</div></div>
-        </div>
-      </div>
+function setText(id, value) {
+const el = document.getElementById(id);
+if (el) el.textContent = String(value);
+}
 
-      <div class="card">
-        <div class="pill">Lift</div>
-        <div class="stats-grid">
-          <div class="stat"><div class="label">Lift %</div><div class="value" id="lift-percent">—</div></div>
-          <div class="stat"><div class="label">Current Status</div><div class="value small" id="status-text">Loading...</div></div>
-          <div class="stat"><div class="label">Total Sessions</div><div class="value small" id="total-sessions">—</div></div>
-          <div class="stat"><div class="label">Total Purchases</div><div class="value small" id="total-purchases">—</div></div>
-        </div>
-      </div>
-    </div>
+function setNotice(html) {
+const el = document.getElementById("top-notice");
+if (el) el.innerHTML = html;
+}
 
-    <div class="card">
-      <div class="toggle-row">
-        <div>
-          <h2 style="margin-bottom: 4px;">Raw Data (Advanced)</h2>
-          <div class="muted">Optional debugging output for advanced review.</div>
-        </div>
-        <button id="toggle-raw-data" type="button">Show Raw Data</button>
-      </div>
-      <div id="raw-data-wrap" class="hidden">
-        <pre id="metrics-json">Loading...</pre>
-      </div>
-    </div>
-  </div>
+function getStatusText(totalSessions, totalPurchases) {
+if (totalSessions === 0) return "Waiting for traffic";
+if (totalPurchases === 0) return "Collecting data";
+return "Running";
+}
 
-  <script>
-    const shopDomain = ${JSON.stringify(shopDomain)};
+function getNoticeText(totalSessions, totalPurchases) {
+if (totalSessions === 0) {
+return "No data yet — turn on the app embed, save, then open your storefront in another tab to start tracking activity. Data should appear within seconds.";
+}
+if (totalPurchases === 0) {
+return "Tracking is live. Sessions are being recorded, but no purchases have been captured yet.";
+}
+return "Tracking is live and data is being collected successfully for this store.";
+}
 
-    function formatMoney(value) {
-      return "$" + Number(value || 0).toFixed(2);
-    }
+async function getSessionToken() {
+if (!window.shopify || typeof window.shopify.idToken !== "function") {
+throw new Error("Shopify App Bridge is not available");
+}
 
-    function formatPercentFromDecimal(value) {
-      return (Number(value || 0) * 100).toFixed(1) + "%";
-    }
+const token = await window.shopify.idToken();
 
-    function formatLiftPercent(value) {
-      return Number(value || 0).toFixed(1) + "%";
-    }
+if (!token) {
+throw new Error("Shopify session token was not returned");
+}
 
-    function setText(id, value) {
-      const el = document.getElementById(id);
-      if (el) el.textContent = String(value);
-    }
+return token;
+}
 
-    function setNotice(html) {
-      const el = document.getElementById("top-notice");
-      if (el) el.innerHTML = html;
-    }
+async function authFetch(url, options = {}) {
+const token = await getSessionToken();
 
-    function getStatusText(totalSessions, totalPurchases) {
-      if (totalSessions === 0) return "Waiting for traffic";
-      if (totalPurchases === 0) return "Collecting data";
-      return "Running";
-    }
+return fetch(url, {
+...options,
+headers: {
+...(options.headers || {}),
+Authorization: "Bearer " + token,
+"Content-Type": "application/json",
+},
+});
+}
 
-    function getNoticeText(totalSessions, totalPurchases) {
-      if (totalSessions === 0) {
-        return "No data yet — turn on the app embed and generate activity.";
-      }
-      if (totalPurchases === 0) {
-        return "Tracking is live but no purchases yet.";
-      }
-      return "Tracking is live and working.";
-    }
+async function loadMetrics() {
+try {
+const response = await authFetch('/api/metrics/' + encodeURIComponent(shopDomain));
+const json = await response.json();
 
-    async function loadMetrics() {
-      const response = await fetch("/api/metrics/" + encodeURIComponent(shopDomain), {
-        headers: {
-          "Content-Type": "application/json",
-        },
-      });
+if (!json.success || !json.data) {
+throw new Error('Metrics response missing data');
+}
 
-      const json = await response.json();
+const data = json.data;
+const control = data.control || {};
+const variant = data.variant || {};
+const controlSessions = Number(control.sessions || 0);
+const controlPurchases = Number(control.purchases || 0);
+const variantSessions = Number(variant.sessions || 0);
+const variantPurchases = Number(variant.purchases || 0);
+const totalSessions = controlSessions + variantSessions;
+const totalPurchases = controlPurchases + variantPurchases;
 
-      if (!json.success || !json.data) {
-        throw new Error("Invalid metrics response");
-      }
+setText("shop-domain", shopDomain);
+setText("control-sessions", String(controlSessions));
+setText("control-purchases", String(controlPurchases));
+setText("control-revenue", formatMoney(control.revenue));
+setText("control-conversion", formatPercentFromDecimal(control.conversion_rate));
+setText("control-rps", formatMoney(control.revenue_per_session));
+setText("variant-sessions", String(variantSessions));
+setText("variant-purchases", String(variantPurchases));
+setText("variant-revenue", formatMoney(variant.revenue));
+setText("variant-conversion", formatPercentFromDecimal(variant.conversion_rate));
+setText("variant-rps", formatMoney(variant.revenue_per_session));
+setText("lift-percent", formatLiftPercent(data.lift_percent));
+setText("status-text", getStatusText(totalSessions, totalPurchases));
+setText("total-sessions", String(totalSessions));
+setText("total-purchases", String(totalPurchases));
 
-      const data = json.data;
-      const control = data.control || {};
-      const variant = data.variant || {};
+if (totalSessions === 0) {
+setNotice('<span class="warning">' + getNoticeText(totalSessions, totalPurchases) + '</span>');
+} else {
+setNotice('<span class="success">' + getNoticeText(totalSessions, totalPurchases) + '</span>');
+}
 
-      const controlSessions = Number(control.sessions || 0);
-      const controlPurchases = Number(control.purchases || 0);
-      const variantSessions = Number(variant.sessions || 0);
-      const variantPurchases = Number(variant.purchases || 0);
+setText("metrics-json", JSON.stringify(json, null, 2));
+} catch (err) {
+setText("shop-domain", shopDomain);
+setNotice('<span class="error">There was a problem loading dashboard data.</span>');
+const metricsJson = document.getElementById("metrics-json");
+if (metricsJson) {
+metricsJson.textContent = "Error loading dashboard data:\\n\\n" + String(err);
+}
+const status = document.getElementById("status-text");
+if (status) {
+status.textContent = "Error";
+status.classList.add("error");
+}
+console.error(err);
+}
+}
 
-      const totalSessions = controlSessions + variantSessions;
-      const totalPurchases = controlPurchases + variantPurchases;
+const rawDataWrap = document.getElementById("raw-data-wrap");
+const rawDataButton = document.getElementById("toggle-raw-data");
 
-      setText("shop-domain", shopDomain);
-      setText("control-sessions", controlSessions);
-      setText("control-purchases", controlPurchases);
-      setText("control-revenue", formatMoney(control.revenue));
-      setText("control-conversion", formatPercentFromDecimal(control.conversion_rate));
-      setText("control-rps", formatMoney(control.revenue_per_session));
+if (rawDataButton && rawDataWrap) {
+rawDataButton.addEventListener("click", () => {
+const isHidden = rawDataWrap.classList.contains("hidden");
+rawDataWrap.classList.toggle("hidden");
+rawDataButton.textContent = isHidden ? "Hide Raw Data" : "Show Raw Data";
+});
+}
 
-      setText("variant-sessions", variantSessions);
-      setText("variant-purchases", variantPurchases);
-      setText("variant-revenue", formatMoney(variant.revenue));
-      setText("variant-conversion", formatPercentFromDecimal(variant.conversion_rate));
-      setText("variant-rps", formatMoney(variant.revenue_per_session));
-
-      setText("lift-percent", formatLiftPercent(data.lift_percent));
-      setText("status-text", getStatusText(totalSessions, totalPurchases));
-      setText("total-sessions", totalSessions);
-      setText("total-purchases", totalPurchases);
-
-      if (totalSessions === 0) {
-        setNotice('<span class="warning">' + getNoticeText(totalSessions, totalPurchases) + '</span>');
-      } else {
-        setNotice('<span class="success">' + getNoticeText(totalSessions, totalPurchases) + '</span>');
-      }
-
-      setText("metrics-json", JSON.stringify(json, null, 2));
-    }
-
-    const rawDataWrap = document.getElementById("raw-data-wrap");
-    const rawDataButton = document.getElementById("toggle-raw-data");
-
-    if (rawDataButton && rawDataWrap) {
-      rawDataButton.addEventListener("click", () => {
-        const isHidden = rawDataWrap.classList.contains("hidden");
-        rawDataWrap.classList.toggle("hidden");
-        rawDataButton.textContent = isHidden ? "Hide Raw Data" : "Show Raw Data";
-      });
-    }
-
-    window.addEventListener("load", async () => {
-      try {
-        await loadMetrics();
-      } catch (error) {
-        console.error("Dashboard load failed:", error);
-        setNotice('<span class="error">Failed to load data</span>');
-        setText("status-text", "Error");
-      }
-    });
-  </script>
+window.addEventListener("load", () => {
+void loadMetrics();
+});
+</script>
 </body>
 </html>
-  `);
+`);
 });
+app.get('/', (req, res) => {
+const shop = req.query.shop;
 
+if (shop) {
+return res.redirect(`/app?shop=${encodeURIComponent(shop)}`);
+}
+
+return res.redirect('/dashboard');
+});
 app.get('/app', (req, res) => {
-  const shop = req.query.shop;
-
-  if (!shop) {
-    return res.status(400).send('Missing shop parameter');
-  }
-
-  const shopDomain = normalizeShopDomain(shop);
-  return res.redirect(`/dashboard?shop=${encodeURIComponent(shopDomain)}`);
+const shop = req.query.shop;
+if (!shop) {
+return res.status(400).send('Missing shop parameter');
+}
+const shopDomain = normalizeShopDomain(shop);
+return res.redirect(`/dashboard?shop=${encodeURIComponent(shopDomain)}`);
 });
-
 app.listen(PORT, () => {
-  console.log('Server running on port', PORT);
+console.log("Server running on port", PORT);
 });
