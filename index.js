@@ -462,15 +462,25 @@ app.get('/dashboard', (req, res) => {
   return res.send(html)
 })
 
-app.get('/', (req, res) => {
-  return res.send('BehavioralPro backend is running.')
-})
-
 app.get('/app', (req, res) => {
   const shop = req.query.shop
 
   if (!shop) {
     return res.send('Missing shop parameter')
+  }
+
+  const shopDomain = shop.includes('.myshopify.com')
+    ? shop
+    : shop + '.myshopify.com'
+
+  return res.redirect('/dashboard?shop=' + encodeURIComponent(shopDomain))
+})
+
+app.get('/', (req, res) => {
+  const shop = req.query.shop
+
+  if (!shop) {
+    return res.send('BehavioralPro backend is running.')
   }
 
   const shopDomain = shop.includes('.myshopify.com')
