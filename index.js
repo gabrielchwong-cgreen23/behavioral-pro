@@ -867,7 +867,7 @@ app.get('/dashboard', (req, res) => {
 
     const headers = {
       ...(options.headers || {}),
-      Authorization: `Bearer ${token}`,
+      Authorization: 'Bearer ' + token,
       "Content-Type": "application/json",
     };
 
