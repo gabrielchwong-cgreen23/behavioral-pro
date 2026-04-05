@@ -2,7 +2,7 @@
 
 client_id = "ee7791f70e17fcbfe03f52ade51b5d7a"
 name = "behavioral_pro"
-application_url = "https://behavioral-pro-production.up.railway.app"
+application_url = "https://behavioral-pro-production.up.railway.app/app"
 embedded = true
 
 [webhooks]
