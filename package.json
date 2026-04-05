@@ -16,5 +16,14 @@
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1"
-  }
+  },
+  "devDependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gabrielchwong-cgreen23/behavioral-pro.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gabrielchwong-cgreen23/behavioral-pro/issues"
+  },
+  "homepage": "https://github.com/gabrielchwong-cgreen23/behavioral-pro#readme"
 }
