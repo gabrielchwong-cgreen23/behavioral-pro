@@ -813,6 +813,9 @@ async function getSessionToken() {
 if (!window.shopify || typeof window.shopify.idToken !== 'function') {
 throw new Error('Shopify App Bridge is not available');
 }
+if (window.shopify.ready) {
+await window.shopify.ready;
+}
 const token = await window.shopify.idToken();
 if (!token) {
 throw new Error('Shopify session token was not returned');
@@ -884,6 +887,7 @@ console.error(err);
 }
 const rawDataWrap = document.getElementById("raw-data-wrap");
 const rawDataButton = document.getElementById("toggle-raw-data");
+setText("shop-domain", shopDomain);
 if (rawDataButton && rawDataWrap) {
 rawDataButton.addEventListener("click", () => {
 const isHidden = rawDataWrap.classList.contains("hidden");
