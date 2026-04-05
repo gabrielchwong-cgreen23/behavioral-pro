@@ -93,7 +93,6 @@ function shopifyWebhookHandler(topic, processor) {
 
       console.log(`${topic} webhook received:`, payload);
       await processor(payload, req);
-
       return res.status(200).send('ok');
     } catch (error) {
       console.error(`${topic} webhook error:`, error);
@@ -790,7 +789,14 @@ app.get('/dashboard', (req, res) => {
         throw new Error("Shopify App Bridge is not available");
       }
 
-      return window.shopify.idToken();
+      await window.shopify.ready;
+      const token = await window.shopify.idToken();
+
+      if (!token) {
+        throw new Error("Shopify session token was not returned");
+      }
+
+      return token;
     }
 
     async function authFetch(url, options = {}) {
@@ -846,56 +852,50 @@ app.get('/dashboard', (req, res) => {
     }
 
     async function loadMetrics() {
-      try {
-        const response = await authFetch("/api/metrics/" + encodeURIComponent(shopDomain));
-        const json = await response.json();
+      const response = await authFetch("/api/metrics/" + encodeURIComponent(shopDomain));
+      const json = await response.json();
 
-        if (!json.success || !json.data) {
-          throw new Error("Invalid metrics response");
-        }
-
-        const data = json.data;
-        const control = data.control || {};
-        const variant = data.variant || {};
-
-        const controlSessions = Number(control.sessions || 0);
-        const controlPurchases = Number(control.purchases || 0);
-        const variantSessions = Number(variant.sessions || 0);
-        const variantPurchases = Number(variant.purchases || 0);
-
-        const totalSessions = controlSessions + variantSessions;
-        const totalPurchases = controlPurchases + variantPurchases;
-
-        setText("shop-domain", shopDomain);
-        setText("control-sessions", controlSessions);
-        setText("control-purchases", controlPurchases);
-        setText("control-revenue", formatMoney(control.revenue));
-        setText("control-conversion", formatPercentFromDecimal(control.conversion_rate));
-        setText("control-rps", formatMoney(control.revenue_per_session));
-
-        setText("variant-sessions", variantSessions);
-        setText("variant-purchases", variantPurchases);
-        setText("variant-revenue", formatMoney(variant.revenue));
-        setText("variant-conversion", formatPercentFromDecimal(variant.conversion_rate));
-        setText("variant-rps", formatMoney(variant.revenue_per_session));
-
-        setText("lift-percent", formatLiftPercent(data.lift_percent));
-        setText("status-text", getStatusText(totalSessions, totalPurchases));
-        setText("total-sessions", totalSessions);
-        setText("total-purchases", totalPurchases);
-
-        if (totalSessions === 0) {
-          setNotice('<span class="warning">' + getNoticeText(totalSessions, totalPurchases) + '</span>');
-        } else {
-          setNotice('<span class="success">' + getNoticeText(totalSessions, totalPurchases) + '</span>');
-        }
-
-        setText("metrics-json", JSON.stringify(json, null, 2));
-      } catch (err) {
-        console.error("Failed to load dashboard:", err);
-        setNotice('<span class="error">Failed to load data</span>');
-        setText("status-text", "Error");
+      if (!json.success || !json.data) {
+        throw new Error("Invalid metrics response");
       }
+
+      const data = json.data;
+      const control = data.control || {};
+      const variant = data.variant || {};
+
+      const controlSessions = Number(control.sessions || 0);
+      const controlPurchases = Number(control.purchases || 0);
+      const variantSessions = Number(variant.sessions || 0);
+      const variantPurchases = Number(variant.purchases || 0);
+
+      const totalSessions = controlSessions + variantSessions;
+      const totalPurchases = controlPurchases + variantPurchases;
+
+      setText("shop-domain", shopDomain);
+      setText("control-sessions", controlSessions);
+      setText("control-purchases", controlPurchases);
+      setText("control-revenue", formatMoney(control.revenue));
+      setText("control-conversion", formatPercentFromDecimal(control.conversion_rate));
+      setText("control-rps", formatMoney(control.revenue_per_session));
+
+      setText("variant-sessions", variantSessions);
+      setText("variant-purchases", variantPurchases);
+      setText("variant-revenue", formatMoney(variant.revenue));
+      setText("variant-conversion", formatPercentFromDecimal(variant.conversion_rate));
+      setText("variant-rps", formatMoney(variant.revenue_per_session));
+
+      setText("lift-percent", formatLiftPercent(data.lift_percent));
+      setText("status-text", getStatusText(totalSessions, totalPurchases));
+      setText("total-sessions", totalSessions);
+      setText("total-purchases", totalPurchases);
+
+      if (totalSessions === 0) {
+        setNotice('<span class="warning">' + getNoticeText(totalSessions, totalPurchases) + '</span>');
+      } else {
+        setNotice('<span class="success">' + getNoticeText(totalSessions, totalPurchases) + '</span>');
+      }
+
+      setText("metrics-json", JSON.stringify(json, null, 2));
     }
 
     const rawDataWrap = document.getElementById("raw-data-wrap");
@@ -909,8 +909,15 @@ app.get('/dashboard', (req, res) => {
       });
     }
 
-    window.addEventListener("load", () => {
-      void loadMetrics();
+    window.addEventListener("load", async () => {
+      try {
+        await getSessionToken();
+        await loadMetrics();
+      } catch (error) {
+        console.error("Embedded auth initialization failed:", error);
+        setNotice('<span class="error">Embedded authentication failed</span>');
+        setText("status-text", "Auth error");
+      }
     });
   </script>
 </body>
