@@ -14,11 +14,7 @@ const corsOptions = {
   credentials: false,
 };
 
-// ---------- BASIC MIDDLEWARE ----------
 app.use(cors(corsOptions));
-
-// Use JSON parser for normal API routes only.
-// Do NOT rely on this for Shopify webhooks.
 app.use('/api', express.json());
 
 app.use((req, res, next) => {
@@ -26,7 +22,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- ENV CHECK ----------
 const {
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
@@ -43,30 +38,27 @@ if (!SHOPIFY_API_SECRET) {
   console.warn('Missing SHOPIFY_API_SECRET. Webhook HMAC verification will fail.');
 }
 
-// ---------- SUPABASE ----------
-const supabase = createClient(
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY
-);
+if (!SHOPIFY_API_KEY) {
+  console.warn('Missing SHOPIFY_API_KEY. Embedded App Bridge may not initialize correctly.');
+}
 
-// ---------- HELPERS ----------
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
 function getRawBody(req) {
-  if (Buffer.isBuffer(req.body)) {
-    return req.body;
-  }
-  if (typeof req.body === 'string') {
-    return Buffer.from(req.body, 'utf8');
-  }
+  if (Buffer.isBuffer(req.body)) return req.body;
+  if (typeof req.body === 'string') return Buffer.from(req.body, 'utf8');
   return Buffer.from('', 'utf8');
 }
 
 function verifyShopifyWebhook(req) {
   try {
     const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
-    if (!hmacHeader || !SHOPIFY_API_SECRET) return false;
+
+    if (!hmacHeader || !SHOPIFY_API_SECRET) {
+      return false;
+    }
 
     const rawBody = getRawBody(req);
-
     const digest = crypto
       .createHmac('sha256', SHOPIFY_API_SECRET)
       .update(rawBody)
@@ -85,14 +77,13 @@ function verifyShopifyWebhook(req) {
 function shopifyWebhookHandler(topic, processor) {
   return async (req, res) => {
     try {
-      const isValid = verifyShopifyWebhook(req);
-
-      if (!isValid) {
+      if (!verifyShopifyWebhook(req)) {
         console.log(`Invalid webhook signature for ${topic}`);
         return res.status(401).send('Invalid webhook signature');
       }
 
       let payload = {};
+
       try {
         payload = JSON.parse(getRawBody(req).toString('utf8') || '{}');
       } catch (parseError) {
@@ -101,7 +92,6 @@ function shopifyWebhookHandler(topic, processor) {
       }
 
       console.log(`${topic} webhook received:`, payload);
-
       await processor(payload, req);
 
       return res.status(200).send('ok');
@@ -171,10 +161,6 @@ async function exchangeShopifyAccessToken({ shop, code }) {
   };
 }
 
-function getAppBaseUrl(req) {
-  return (APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
-}
-
 function calculateMetrics(sessions = [], events = []) {
   const controlSessions = sessions.filter((s) => s.variant === 'control').length;
   const variantSessions = sessions.filter((s) => s.variant === 'variant').length;
@@ -187,31 +173,13 @@ function calculateMetrics(sessions = [], events = []) {
     (e) => e.variant === 'variant' && e.event_type === 'purchase'
   );
 
-  const controlRevenue = controlPurchases.reduce(
-    (sum, e) => sum + Number(e.value || 0),
-    0
-  );
+  const controlRevenue = controlPurchases.reduce((sum, e) => sum + Number(e.value || 0), 0);
+  const variantRevenue = variantPurchases.reduce((sum, e) => sum + Number(e.value || 0), 0);
 
-  const variantRevenue = variantPurchases.reduce(
-    (sum, e) => sum + Number(e.value || 0),
-    0
-  );
-
-  const conversionRateControl = controlSessions
-    ? controlPurchases.length / controlSessions
-    : 0;
-
-  const conversionRateVariant = variantSessions
-    ? variantPurchases.length / variantSessions
-    : 0;
-
-  const revenuePerSessionControl = controlSessions
-    ? controlRevenue / controlSessions
-    : 0;
-
-  const revenuePerSessionVariant = variantSessions
-    ? variantRevenue / variantSessions
-    : 0;
+  const conversionRateControl = controlSessions ? controlPurchases.length / controlSessions : 0;
+  const conversionRateVariant = variantSessions ? variantPurchases.length / variantSessions : 0;
+  const revenuePerSessionControl = controlSessions ? controlRevenue / controlSessions : 0;
+  const revenuePerSessionVariant = variantSessions ? variantRevenue / variantSessions : 0;
 
   const liftPercent = revenuePerSessionControl
     ? ((revenuePerSessionVariant - revenuePerSessionControl) / revenuePerSessionControl) * 100
@@ -236,21 +204,20 @@ function calculateMetrics(sessions = [], events = []) {
   };
 }
 
-// ---------- OPTIONS ----------
 app.options('/api/events', cors(corsOptions));
 app.options('/api/assign-variant', cors(corsOptions));
 app.options('/api/stores', cors(corsOptions));
 app.options('/api/metrics/:shop_domain', cors(corsOptions));
 app.options('/api/debug/:shop_domain', cors(corsOptions));
 
-// ---------- SHOPIFY MANDATORY COMPLIANCE WEBHOOKS ----------
-// IMPORTANT: use express.raw so HMAC is computed against the exact raw payload.
 app.post(
   '/webhooks/customers-data-request',
   express.raw({ type: '*/*' }),
   shopifyWebhookHandler('customers/data_request', async (payload) => {
-    // Optional: log/store request for compliance workflow
-    console.log('Processed customers/data_request for shop:', payload.shop_domain || payload.shop_id || 'unknown');
+    console.log(
+      'Processed customers/data_request for shop:',
+      payload.shop_domain || payload.shop_id || 'unknown'
+    );
   })
 );
 
@@ -258,8 +225,10 @@ app.post(
   '/webhooks/customers-redact',
   express.raw({ type: '*/*' }),
   shopifyWebhookHandler('customers/redact', async (payload) => {
-    // Optional: perform customer-level redaction in your own DB if needed
-    console.log('Processed customers/redact for shop:', payload.shop_domain || payload.shop_id || 'unknown');
+    console.log(
+      'Processed customers/redact for shop:',
+      payload.shop_domain || payload.shop_id || 'unknown'
+    );
   })
 );
 
@@ -267,29 +236,13 @@ app.post(
   '/webhooks/shop-redact',
   express.raw({ type: '*/*' }),
   shopifyWebhookHandler('shop/redact', async (payload) => {
-    // Optional: remove shop data from your DB if required
-    console.log('Processed shop/redact for shop:', payload.shop_domain || payload.shop_id || 'unknown');
-
-    const possibleShopDomain =
-      payload.shop_domain ||
-      payload.myshopify_domain ||
-      payload.domain ||
-      null;
-
-    if (possibleShopDomain) {
-      // Example cleanup — keep or remove depending on your data retention model.
-      // Uncomment if you want to actually delete records when shop/redact arrives.
-
-      /*
-      await supabase.from('events').delete().eq('shop_domain', possibleShopDomain);
-      await supabase.from('experiment_sessions').delete().eq('shop_domain', possibleShopDomain);
-      await supabase.from('stores').delete().eq('shop_domain', possibleShopDomain);
-      */
-    }
+    console.log(
+      'Processed shop/redact for shop:',
+      payload.shop_domain || payload.shop_id || 'unknown'
+    );
   })
 );
 
-// ---------- API ROUTES ----------
 app.get('/api/shopify/callback', async (req, res) => {
   try {
     const { shop, code } = req.query || {};
@@ -432,12 +385,7 @@ app.post('/api/events', async (req, res) => {
   try {
     console.log('EVENT RECEIVED:', JSON.stringify(req.body, null, 2));
 
-    const {
-      shop_domain,
-      session_id,
-      event_type,
-      value = 0,
-    } = req.body || {};
+    const { shop_domain, session_id, event_type, value = 0 } = req.body || {};
 
     if (!shop_domain || !session_id || !event_type) {
       console.log('EVENT REJECTED: missing fields');
@@ -481,8 +429,6 @@ app.post('/api/events', async (req, res) => {
       created_at: new Date().toISOString(),
     };
 
-    console.log('EVENT INSERT ROW:', JSON.stringify(insertRow, null, 2));
-
     const { data, error } = await supabase
       .from('events')
       .insert([insertRow])
@@ -493,7 +439,6 @@ app.post('/api/events', async (req, res) => {
       return res.status(500).json({ success: false, error });
     }
 
-    console.log('EVENT INSERTED OK:', JSON.stringify(data, null, 2));
     return res.json({ success: true, data });
   } catch (error) {
     console.log('EVENT ROUTE ERROR:', error);
@@ -546,17 +491,6 @@ app.get('/api/metrics/:shop_domain', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => {
-  const shop = req.query.shop;
-
-  if (shop) {
-    return res.redirect(`/app?shop=${encodeURIComponent(shop)}`);
-  }
-
-  return res.redirect('/dashboard');
-});
-
-
 app.get('/api/debug/:shop_domain', async (req, res) => {
   try {
     const shop_domain = normalizeShopDomain(req.params.shop_domain);
@@ -570,8 +504,7 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
       .from('events')
       .select('*')
       .eq('shop_domain', shop_domain)
-      .order('created_at', { ascending: false
- });
+      .order('created_at', { ascending: false });
 
     return res.json({
       success: true,
@@ -584,7 +517,6 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
     });
   } catch (error) {
     console.log('DEBUG ROUTE ERROR:', error);
-    console.log('BOOT: running V3 build with raw webhook handler');
     return res.status(500).json({
       success: false,
       error: String(error.message || error),
@@ -592,7 +524,16 @@ app.get('/api/debug/:shop_domain', async (req, res) => {
   }
 });
 
-// ---------- DASHBOARD ----------
+app.get('/', (req, res) => {
+  const shop = req.query.shop;
+
+  if (shop) {
+    return res.redirect(`/app?shop=${encodeURIComponent(shop)}`);
+  }
+
+  return res.redirect('/dashboard');
+});
+
 app.get('/dashboard', (req, res) => {
   const shopParam = req.query.shop;
   const shopDomain = shopParam
@@ -606,6 +547,8 @@ app.get('/dashboard', (req, res) => {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BehavioralPro Dashboard</title>
+  <meta name="shopify-api-key" content="${SHOPIFY_API_KEY || ''}" />
+  <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -839,157 +782,140 @@ app.get('/dashboard', (req, res) => {
     </div>
   </div>
 
-<meta name="shopify-api-key" content="${process.env.SHOPIFY_API_KEY}" />
-<script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+  <script>
+    const shopDomain = ${JSON.stringify(shopDomain)};
 
-<script>
-  const shopDomain = ${JSON.stringify(shopDomain)};
-  async function getSessionToken() {
-  if (!window.shopify) {
-    throw new Error("App Bridge did not load");
-  }
-  return await window.shopify.idToken();
-});
-
-  // ---------- GET SESSION TOKEN ----------
-  async function getSessionToken() {
-    try {
-      return await window.shopify.idToken();
-    } catch (e) {
-      console.error("Failed to get session token:", e);
-      throw e;
-    }
-  }
-
-  // ---------- AUTHENTICATED FETCH ----------
-  async function authFetch(url, options = {}) {
-    const token = await getSessionToken();
-
-    const headers = {
-      ...(options.headers || {}),
-      Authorization: 'Bearer ' + token,
-      "Content-Type": "application/json",
-    };
-
-    return fetch(url, {
-      ...options,
-      headers,
-    });
-  }
-
-  // ---------- FORMATTERS ----------
-  function formatMoney(value) {
-    return "$" + Number(value || 0).toFixed(2);
-  }
-
-  function formatPercentFromDecimal(value) {
-    return (Number(value || 0) * 100).toFixed(1) + "%";
-  }
-
-  function formatLiftPercent(value) {
-    return Number(value || 0).toFixed(1) + "%";
-  }
-
-  function setText(id, value) {
-    const el = document.getElementById(id);
-    if (el) el.textContent = value;
-  }
-
-  function setNotice(html) {
-    const el = document.getElementById("top-notice");
-    if (el) el.innerHTML = html;
-  }
-
-  function getStatusText(totalSessions, totalPurchases) {
-    if (totalSessions === 0) return "Waiting for traffic";
-    if (totalPurchases === 0) return "Collecting data";
-    return "Running";
-  }
-
-  function getNoticeText(totalSessions, totalPurchases) {
-    if (totalSessions === 0) {
-      return "No data yet — turn on the app embed and generate activity.";
-    }
-    if (totalPurchases === 0) {
-      return "Tracking is live but no purchases yet.";
-    }
-    return "Tracking is live and working.";
-  }
-
-  // ---------- LOAD METRICS ----------
-  async function loadMetrics() {
-    try {
-      const response = await authFetch(
-        '/api/metrics/' + encodeURIComponent(shopDomain)
-      );
-
-      const json = await response.json();
-
-      if (!json.success || !json.data) {
-        throw new Error("Invalid metrics response");
+    async function getSessionToken() {
+      if (!window.shopify || typeof window.shopify.idToken !== "function") {
+        throw new Error("Shopify App Bridge is not available");
       }
 
-      const data = json.data;
-      const control = data.control || {};
-      const variant = data.variant || {};
+      return window.shopify.idToken();
+    }
 
-      const controlSessions = Number(control.sessions || 0);
-      const controlPurchases = Number(control.purchases || 0);
-      const variantSessions = Number(variant.sessions || 0);
-      const variantPurchases = Number(variant.purchases || 0);
+    async function authFetch(url, options = {}) {
+      const token = await getSessionToken();
+      const headers = {
+        ...(options.headers || {}),
+        Authorization: "Bearer " + token,
+        "Content-Type": "application/json",
+      };
 
-      const totalSessions = controlSessions + variantSessions;
-      const totalPurchases = controlPurchases + variantPurchases;
+      return fetch(url, {
+        ...options,
+        headers,
+      });
+    }
 
-      setText("shop-domain", shopDomain);
+    function formatMoney(value) {
+      return "$" + Number(value || 0).toFixed(2);
+    }
 
-      setText("control-sessions", controlSessions);
-      setText("control-purchases", controlPurchases);
-      setText("control-revenue", formatMoney(control.revenue));
-      setText("control-conversion", 
-formatPercentFromDecimal(control.conversion_rate));
-      setText("control-rps", formatMoney(control.revenue_per_session));
+    function formatPercentFromDecimal(value) {
+      return (Number(value || 0) * 100).toFixed(1) + "%";
+    }
 
-      setText("variant-sessions", variantSessions);
-      setText("variant-purchases", variantPurchases);
-      setText("variant-revenue", formatMoney(variant.revenue));
-      setText("variant-conversion", 
-formatPercentFromDecimal(variant.conversion_rate));
-      setText("variant-rps", formatMoney(variant.revenue_per_session));
+    function formatLiftPercent(value) {
+      return Number(value || 0).toFixed(1) + "%";
+    }
 
-      setText("lift-percent", formatLiftPercent(data.lift_percent));
-      setText("status-text", getStatusText(totalSessions, 
-totalPurchases));
-      setText("total-sessions", totalSessions);
-      setText("total-purchases", totalPurchases);
+    function setText(id, value) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = String(value);
+    }
 
+    function setNotice(html) {
+      const el = document.getElementById("top-notice");
+      if (el) el.innerHTML = html;
+    }
+
+    function getStatusText(totalSessions, totalPurchases) {
+      if (totalSessions === 0) return "Waiting for traffic";
+      if (totalPurchases === 0) return "Collecting data";
+      return "Running";
+    }
+
+    function getNoticeText(totalSessions, totalPurchases) {
       if (totalSessions === 0) {
-        setNotice('<span class="warning">' + getNoticeText(totalSessions, 
-totalPurchases) + '</span>');
-      } else {
-        setNotice('<span class="success">' + getNoticeText(totalSessions, 
-totalPurchases) + '</span>');
+        return "No data yet — turn on the app embed and generate activity.";
       }
-
-      setText("metrics-json", JSON.stringify(json, null, 2));
-
-    } catch (err) {
-      console.error(err);
-      setNotice('<span class="error">Failed to load data</span>');
+      if (totalPurchases === 0) {
+        return "Tracking is live but no purchases yet.";
+      }
+      return "Tracking is live and working.";
     }
-  }
 
-  // ---------- START ----------
-  loadMetrics();
-</script>
+    async function loadMetrics() {
+      try {
+        const response = await authFetch("/api/metrics/" + encodeURIComponent(shopDomain));
+        const json = await response.json();
+
+        if (!json.success || !json.data) {
+          throw new Error("Invalid metrics response");
+        }
+
+        const data = json.data;
+        const control = data.control || {};
+        const variant = data.variant || {};
+
+        const controlSessions = Number(control.sessions || 0);
+        const controlPurchases = Number(control.purchases || 0);
+        const variantSessions = Number(variant.sessions || 0);
+        const variantPurchases = Number(variant.purchases || 0);
+
+        const totalSessions = controlSessions + variantSessions;
+        const totalPurchases = controlPurchases + variantPurchases;
+
+        setText("shop-domain", shopDomain);
+        setText("control-sessions", controlSessions);
+        setText("control-purchases", controlPurchases);
+        setText("control-revenue", formatMoney(control.revenue));
+        setText("control-conversion", formatPercentFromDecimal(control.conversion_rate));
+        setText("control-rps", formatMoney(control.revenue_per_session));
+
+        setText("variant-sessions", variantSessions);
+        setText("variant-purchases", variantPurchases);
+        setText("variant-revenue", formatMoney(variant.revenue));
+        setText("variant-conversion", formatPercentFromDecimal(variant.conversion_rate));
+        setText("variant-rps", formatMoney(variant.revenue_per_session));
+
+        setText("lift-percent", formatLiftPercent(data.lift_percent));
+        setText("status-text", getStatusText(totalSessions, totalPurchases));
+        setText("total-sessions", totalSessions);
+        setText("total-purchases", totalPurchases);
+
+        if (totalSessions === 0) {
+          setNotice('<span class="warning">' + getNoticeText(totalSessions, totalPurchases) + '</span>');
+        } else {
+          setNotice('<span class="success">' + getNoticeText(totalSessions, totalPurchases) + '</span>');
+        }
+
+        setText("metrics-json", JSON.stringify(json, null, 2));
+      } catch (err) {
+        console.error("Failed to load dashboard:", err);
+        setNotice('<span class="error">Failed to load data</span>');
+        setText("status-text", "Error");
+      }
+    }
+
+    const rawDataWrap = document.getElementById("raw-data-wrap");
+    const rawDataButton = document.getElementById("toggle-raw-data");
+
+    if (rawDataButton && rawDataWrap) {
+      rawDataButton.addEventListener("click", () => {
+        const isHidden = rawDataWrap.classList.contains("hidden");
+        rawDataWrap.classList.toggle("hidden");
+        rawDataButton.textContent = isHidden ? "Hide Raw Data" : "Show Raw Data";
+      });
+    }
+
+    window.addEventListener("load", () => {
+      void loadMetrics();
+    });
+  </script>
 </body>
 </html>
   `);
-});
-
-// ---------- BASIC ROUTES ----------
-app.get('/', (_req, res) => {
-  res.send('BehavioralPro backend is running.');
 });
 
 app.get('/app', (req, res) => {
@@ -1003,7 +929,6 @@ app.get('/app', (req, res) => {
   return res.redirect(`/dashboard?shop=${encodeURIComponent(shopDomain)}`);
 });
 
-// ---------- START ----------
 app.listen(PORT, () => {
   console.log('Server running on port', PORT);
 });
