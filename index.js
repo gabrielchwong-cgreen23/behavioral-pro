@@ -27,7 +27,6 @@ const {
   SUPABASE_SERVICE_ROLE_KEY,
   SHOPIFY_API_KEY,
   SHOPIFY_API_SECRET,
-  APP_URL,
 } = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -167,7 +166,6 @@ function calculateMetrics(sessions = [], events = []) {
   const controlPurchases = events.filter(
     (e) => e.variant === 'control' && e.event_type === 'purchase'
   );
-
   const variantPurchases = events.filter(
     (e) => e.variant === 'variant' && e.event_type === 'purchase'
   );
@@ -288,10 +286,7 @@ app.post('/api/stores', async (req, res) => {
     const { shop_domain, access_token = null, scope = null } = req.body || {};
 
     if (!shop_domain) {
-      return res.status(400).json({
-        success: false,
-        error: 'shop_domain is required',
-      });
+      return res.status(400).json({ success: false, error: 'shop_domain is required' });
     }
 
     const row = {
@@ -326,10 +321,7 @@ app.post('/api/assign-variant', async (req, res) => {
     const { shop_domain, session_id } = req.body || {};
 
     if (!shop_domain || !session_id) {
-      return res.status(400).json({
-        success: false,
-        error: 'missing fields',
-      });
+      return res.status(400).json({ success: false, error: 'missing fields' });
     }
 
     const normalizedShop = normalizeShopDomain(shop_domain);
@@ -382,12 +374,9 @@ app.post('/api/assign-variant', async (req, res) => {
 
 app.post('/api/events', async (req, res) => {
   try {
-    console.log('EVENT RECEIVED:', JSON.stringify(req.body, null, 2));
-
     const { shop_domain, session_id, event_type, value = 0 } = req.body || {};
 
     if (!shop_domain || !session_id || !event_type) {
-      console.log('EVENT REJECTED: missing fields');
       return res.status(400).json({
         success: false,
         error: 'missing fields',
@@ -410,7 +399,6 @@ app.post('/api/events', async (req, res) => {
     }
 
     if (!session) {
-      console.log('EVENT REJECTED: session not assigned');
       return res.status(400).json({
         success: false,
         error: 'session not assigned',
@@ -784,35 +772,6 @@ app.get('/dashboard', (req, res) => {
   <script>
     const shopDomain = ${JSON.stringify(shopDomain)};
 
-    async function getSessionToken() {
-      if (!window.shopify || typeof window.shopify.idToken !== "function") {
-        throw new Error("Shopify App Bridge is not available");
-      }
-
-      await window.shopify.ready;
-      const token = await window.shopify.idToken();
-
-      if (!token) {
-        throw new Error("Shopify session token was not returned");
-      }
-
-      return token;
-    }
-
-    async function authFetch(url, options = {}) {
-      const token = await getSessionToken();
-      const headers = {
-        ...(options.headers || {}),
-        Authorization: "Bearer " + token,
-        "Content-Type": "application/json",
-      };
-
-      return fetch(url, {
-        ...options,
-        headers,
-      });
-    }
-
     function formatMoney(value) {
       return "$" + Number(value || 0).toFixed(2);
     }
@@ -852,7 +811,12 @@ app.get('/dashboard', (req, res) => {
     }
 
     async function loadMetrics() {
-      const response = await authFetch("/api/metrics/" + encodeURIComponent(shopDomain));
+      const response = await fetch("/api/metrics/" + encodeURIComponent(shopDomain), {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
       const json = await response.json();
 
       if (!json.success || !json.data) {
@@ -911,12 +875,11 @@ app.get('/dashboard', (req, res) => {
 
     window.addEventListener("load", async () => {
       try {
-        await getSessionToken();
         await loadMetrics();
       } catch (error) {
-        console.error("Embedded auth initialization failed:", error);
-        setNotice('<span class="error">Embedded authentication failed</span>');
-        setText("status-text", "Auth error");
+        console.error("Dashboard load failed:", error);
+        setNotice('<span class="error">Failed to load data</span>');
+        setText("status-text", "Error");
       }
     });
   </script>
