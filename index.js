@@ -839,129 +839,149 @@ app.get('/dashboard', (req, res) => {
     </div>
   </div>
 
-  <script>
-    const shopDomain = ${JSON.stringify(shopDomain)};
+<script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
 
-    function formatMoney(value) {
-      const num = Number(value || 0);
-      return "$" + num.toFixed(2);
+<script>
+  const shopDomain = ${JSON.stringify(shopDomain)};
+  const apiKey = "${process.env.SHOPIFY_API_KEY}";
+
+  // ---------- APP BRIDGE INIT ----------
+  const app = window.shopify.createApp({
+    apiKey: apiKey,
+    host: new URLSearchParams(window.location.search).get("host"),
+  });
+
+  // ---------- GET SESSION TOKEN ----------
+  async function getSessionToken() {
+    try {
+      return await window.shopify.idToken();
+    } catch (e) {
+      console.error("Failed to get session token:", e);
+      throw e;
     }
+  }
 
-    function formatPercentFromDecimal(value) {
-      const num = Number(value || 0) * 100;
-      return num.toFixed(1) + "%";
+  // ---------- AUTHENTICATED FETCH ----------
+  async function authFetch(url, options = {}) {
+    const token = await getSessionToken();
+
+    const headers = {
+      ...(options.headers || {}),
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    };
+
+    return fetch(url, {
+      ...options,
+      headers,
+    });
+  }
+
+  // ---------- FORMATTERS ----------
+  function formatMoney(value) {
+    return "$" + Number(value || 0).toFixed(2);
+  }
+
+  function formatPercentFromDecimal(value) {
+    return (Number(value || 0) * 100).toFixed(1) + "%";
+  }
+
+  function formatLiftPercent(value) {
+    return Number(value || 0).toFixed(1) + "%";
+  }
+
+  function setText(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+  }
+
+  function setNotice(html) {
+    const el = document.getElementById("top-notice");
+    if (el) el.innerHTML = html;
+  }
+
+  function getStatusText(totalSessions, totalPurchases) {
+    if (totalSessions === 0) return "Waiting for traffic";
+    if (totalPurchases === 0) return "Collecting data";
+    return "Running";
+  }
+
+  function getNoticeText(totalSessions, totalPurchases) {
+    if (totalSessions === 0) {
+      return "No data yet — turn on the app embed and generate activity.";
     }
-
-    function formatLiftPercent(value) {
-      const num = Number(value || 0);
-      return num.toFixed(1) + "%";
+    if (totalPurchases === 0) {
+      return "Tracking is live but no purchases yet.";
     }
+    return "Tracking is live and working.";
+  }
 
-    function setText(id, value) {
-      const el = document.getElementById(id);
-      if (el) el.textContent = value;
-    }
+  // ---------- LOAD METRICS ----------
+  async function loadMetrics() {
+    try {
+      const response = await authFetch(
+        '/api/metrics/' + encodeURIComponent(shopDomain)
+      );
 
-    function setNotice(html) {
-      const el = document.getElementById("top-notice");
-      if (el) el.innerHTML = html;
-    }
+      const json = await response.json();
 
-    function getStatusText(totalSessions, totalPurchases) {
-      if (totalSessions === 0) return "Waiting for traffic";
-      if (totalPurchases === 0) return "Collecting data";
-      return "Running";
-    }
+      if (!json.success || !json.data) {
+        throw new Error("Invalid metrics response");
+      }
 
-    function getNoticeText(totalSessions, totalPurchases) {
+      const data = json.data;
+      const control = data.control || {};
+      const variant = data.variant || {};
+
+      const controlSessions = Number(control.sessions || 0);
+      const controlPurchases = Number(control.purchases || 0);
+      const variantSessions = Number(variant.sessions || 0);
+      const variantPurchases = Number(variant.purchases || 0);
+
+      const totalSessions = controlSessions + variantSessions;
+      const totalPurchases = controlPurchases + variantPurchases;
+
+      setText("shop-domain", shopDomain);
+
+      setText("control-sessions", controlSessions);
+      setText("control-purchases", controlPurchases);
+      setText("control-revenue", formatMoney(control.revenue));
+      setText("control-conversion", 
+formatPercentFromDecimal(control.conversion_rate));
+      setText("control-rps", formatMoney(control.revenue_per_session));
+
+      setText("variant-sessions", variantSessions);
+      setText("variant-purchases", variantPurchases);
+      setText("variant-revenue", formatMoney(variant.revenue));
+      setText("variant-conversion", 
+formatPercentFromDecimal(variant.conversion_rate));
+      setText("variant-rps", formatMoney(variant.revenue_per_session));
+
+      setText("lift-percent", formatLiftPercent(data.lift_percent));
+      setText("status-text", getStatusText(totalSessions, 
+totalPurchases));
+      setText("total-sessions", totalSessions);
+      setText("total-purchases", totalPurchases);
+
       if (totalSessions === 0) {
-        return "No data yet — turn on the app embed, save, then open your storefront in another tab to start tracking activity. Data should appear within seconds.";
+        setNotice('<span class="warning">' + getNoticeText(totalSessions, 
+totalPurchases) + '</span>');
+      } else {
+        setNotice('<span class="success">' + getNoticeText(totalSessions, 
+totalPurchases) + '</span>');
       }
-      if (totalPurchases === 0) {
-        return "Tracking is live. Sessions are being recorded, but no purchases have been captured yet.";
-      }
-      return "Tracking is live and data is being collected successfully for this store.";
+
+      setText("metrics-json", JSON.stringify(json, null, 2));
+
+    } catch (err) {
+      console.error(err);
+      setNotice('<span class="error">Failed to load data</span>');
     }
+  }
 
-    async function loadMetrics() {
-      try {
-        const response = await fetch('/api/metrics/' + encodeURIComponent(shopDomain));
-        const json = await response.json();
-
-        if (!json.success || !json.data) {
-          throw new Error('Metrics response missing data');
-        }
-
-        const data = json.data;
-        const control = data.control || {};
-        const variant = data.variant || {};
-
-        const controlSessions = Number(control.sessions || 0);
-        const controlPurchases = Number(control.purchases || 0);
-        const variantSessions = Number(variant.sessions || 0);
-        const variantPurchases = Number(variant.purchases || 0);
-
-        const totalSessions = controlSessions + variantSessions;
-        const totalPurchases = controlPurchases + variantPurchases;
-
-        setText("shop-domain", shopDomain);
-
-        setText("control-sessions", String(controlSessions));
-        setText("control-purchases", String(controlPurchases));
-        setText("control-revenue", formatMoney(control.revenue));
-        setText("control-conversion", formatPercentFromDecimal(control.conversion_rate));
-        setText("control-rps", formatMoney(control.revenue_per_session));
-
-        setText("variant-sessions", String(variantSessions));
-        setText("variant-purchases", String(variantPurchases));
-        setText("variant-revenue", formatMoney(variant.revenue));
-        setText("variant-conversion", formatPercentFromDecimal(variant.conversion_rate));
-        setText("variant-rps", formatMoney(variant.revenue_per_session));
-
-        setText("lift-percent", formatLiftPercent(data.lift_percent));
-        setText("status-text", getStatusText(totalSessions, totalPurchases));
-        setText("total-sessions", String(totalSessions));
-        setText("total-purchases", String(totalPurchases));
-
-        if (totalSessions === 0) {
-          setNotice('<span class="warning">' + getNoticeText(totalSessions, totalPurchases) + '</span>');
-        } else {
-          setNotice('<span class="success">' + getNoticeText(totalSessions, totalPurchases) + '</span>');
-        }
-
-        setText("metrics-json", JSON.stringify(json, null, 2));
-      } catch (err) {
-        setText("shop-domain", shopDomain);
-        setNotice('<span class="error">There was a problem loading dashboard data.</span>');
-
-        const metricsJson = document.getElementById("metrics-json");
-        if (metricsJson) {
-          metricsJson.textContent = "Error loading dashboard data:\\n\\n" + String(err);
-        }
-
-        const status = document.getElementById("status-text");
-        if (status) {
-          status.textContent = "Error";
-          status.classList.add("error");
-        }
-
-        console.error(err);
-      }
-    }
-
-    const rawDataWrap = document.getElementById("raw-data-wrap");
-    const rawDataButton = document.getElementById("toggle-raw-data");
-
-    if (rawDataButton && rawDataWrap) {
-      rawDataButton.addEventListener("click", () => {
-        const isHidden = rawDataWrap.classList.contains("hidden");
-        rawDataWrap.classList.toggle("hidden");
-        rawDataButton.textContent = isHidden ? "Hide Raw Data" : "Show Raw Data";
-      });
-    }
-
-    loadMetrics();
-  </script>
+  // ---------- START ----------
+  loadMetrics();
+</script>
 </body>
 </html>
   `);
