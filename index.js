@@ -3,551 +3,415 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import { createClient } from '@supabase/supabase-js';
-
 const app = express();
 const PORT = process.env.PORT || 3001;
-
 const corsOptions = {
-  origin: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: false,
+origin: true,
+methods: ['GET', 'POST', 'OPTIONS'],
+allowedHeaders: ['Content-Type', 'Authorization'],
+credentials: false,
 };
-
+// ---------- BASIC MIDDLEWARE ----------
 app.use(cors(corsOptions));
+// Use JSON parser for normal API routes only.
+// Do NOT rely on this for Shopify webhooks.
 app.use('/api', express.json());
-
 app.use((req, res, next) => {
-  console.log('INCOMING:', req.method, req.url);
-  next();
+console.log('INCOMING:', req.method, req.url);
+next();
 });
-
+// ---------- ENV CHECK ----------
 const {
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
-  SHOPIFY_API_KEY,
-  SHOPIFY_API_SECRET,
+SUPABASE_URL,
+SUPABASE_SERVICE_ROLE_KEY,
+SHOPIFY_API_SECRET,
 } = process.env;
-
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
 }
-
 if (!SHOPIFY_API_SECRET) {
-  console.warn('Missing SHOPIFY_API_SECRET. Webhook HMAC verification will fail.');
+console.warn('Missing SHOPIFY_API_SECRET. Webhook HMAC verification will fail.');
 }
-
-if (!SHOPIFY_API_KEY) {
-  console.warn('Missing SHOPIFY_API_KEY. Embedded session token verification will fail.');
-}
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
+// ---------- SUPABASE ----------
+const supabase = createClient(
+SUPABASE_URL,
+SUPABASE_SERVICE_ROLE_KEY
+);
+// ---------- HELPERS ----------
 function getRawBody(req) {
-  if (Buffer.isBuffer(req.body)) {
-    return req.body;
-  }
-  if (typeof req.body === 'string') {
-    return Buffer.from(req.body, 'utf8');
-  }
-  return Buffer.from('', 'utf8');
+if (Buffer.isBuffer(req.body)) {
+return req.body;
 }
-
+if (typeof req.body === 'string') {
+return Buffer.from(req.body, 'utf8');
+}
+return Buffer.from('', 'utf8');
+}
 function verifyShopifyWebhook(req) {
-  try {
-    const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
-    if (!hmacHeader || !SHOPIFY_API_SECRET) return false;
-
-    const rawBody = getRawBody(req);
-    const digest = crypto
-      .createHmac('sha256', SHOPIFY_API_SECRET)
-      .update(rawBody)
-      .digest('base64');
-
-    return crypto.timingSafeEqual(
-      Buffer.from(digest, 'utf8'),
-      Buffer.from(hmacHeader, 'utf8')
-    );
-  } catch (error) {
-    console.error('Webhook verification error:', error);
-    return false;
-  }
+try {
+const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
+if (!hmacHeader || !SHOPIFY_API_SECRET) return false;
+const rawBody = getRawBody(req);
+const digest = crypto
+.createHmac('sha256', SHOPIFY_API_SECRET)
+.update(rawBody)
+.digest('base64');
+return crypto.timingSafeEqual(
+Buffer.from(digest, 'utf8'),
+Buffer.from(hmacHeader, 'utf8')
+);
+} catch (error) {
+console.error('Webhook verification error:', error);
+return false;
 }
-
+}
 function shopifyWebhookHandler(topic, processor) {
-  return async (req, res) => {
-    try {
-      const isValid = verifyShopifyWebhook(req);
-      if (!isValid) {
-        console.log(`Invalid webhook signature for ${topic}`);
-        return res.status(401).send('Invalid webhook signature');
-      }
-
-      let payload = {};
-      try {
-        payload = JSON.parse(getRawBody(req).toString('utf8') || '{}');
-      } catch (parseError) {
-        console.log(`Failed to parse ${topic} webhook body:`, parseError);
-        return res.status(400).send('Invalid JSON');
-      }
-
-      console.log(`${topic} webhook received:`, payload);
-      await processor(payload, req);
-
-      return res.status(200).send('ok');
-    } catch (error) {
-      console.error(`${topic} webhook error:`, error);
-      return res.status(500).send('server error');
-    }
-  };
+return async (req, res) => {
+try {
+const isValid = verifyShopifyWebhook(req);
+if (!isValid) {
+console.log(`Invalid webhook signature for ${topic}`);
+return res.status(401).send('Invalid webhook signature');
 }
-
+let payload = {};
+try {
+payload = JSON.parse(getRawBody(req).toString('utf8') || '{}');
+} catch (parseError) {
+console.log(`Failed to parse ${topic} webhook body:`, parseError);
+return res.status(400).send('Invalid JSON');
+}
+console.log(`${topic} webhook received:`, payload);
+await processor(payload, req);
+return res.status(200).send('ok');
+} catch (error) {
+console.error(`${topic} webhook error:`, error);
+return res.status(500).send('server error');
+}
+};
+}
 function normalizeShopDomain(shop) {
-  if (!shop) return '';
-  return shop.includes('.myshopify.com') ? shop : `${shop}.myshopify.com`;
+if (!shop) return '';
+return shop.includes('.myshopify.com') ? shop : `${shop}.myshopify.com`;
 }
-
-function decodeBase64Url(value) {
-  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
-  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
-  return Buffer.from(padded, 'base64').toString('utf8');
-}
-
-function verifyShopifySessionToken(token) {
-  try {
-    if (!token || !SHOPIFY_API_SECRET || !SHOPIFY_API_KEY) return null;
-
-    const parts = token.split('.');
-    if (parts.length !== 3) return null;
-
-    const [encodedHeader, encodedPayload, encodedSignature] = parts;
-    const signedPayload = `${encodedHeader}.${encodedPayload}`;
-
-    const expectedSignature = crypto
-      .createHmac('sha256', SHOPIFY_API_SECRET)
-      .update(signedPayload)
-      .digest('base64')
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/, '');
-
-    const payload = JSON.parse(decodeBase64Url(encodedPayload));
-    const now = Math.floor(Date.now() / 1000);
-    const hasValidSignature =
-      expectedSignature.length === encodedSignature.length &&
-      crypto.timingSafeEqual(
-        Buffer.from(expectedSignature, 'utf8'),
-        Buffer.from(encodedSignature, 'utf8')
-      );
-
-    if (payload.exp && payload.exp < now) return null;
-    if (payload.nbf && payload.nbf > now) return null;
-    if (payload.aud !== SHOPIFY_API_KEY) return null;
-
-    if (!hasValidSignature) {
-      console.warn('Session token signature mismatch; accepting token based on payload checks.');
-    }
-
-    return payload;
-  } catch (error) {
-    console.error('Session token verification error:', error);
-    return null;
-  }
-}
-
-function requireShopifySessionAuth(req, res, next) {
-  const authHeader = req.get('Authorization') || '';
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  const payload = verifyShopifySessionToken(token);
-
-  if (!payload) {
-    return res.status(401).json({
-      success: false,
-      error: 'invalid_session_token',
-    });
-  }
-
-  req.shopifySession = payload;
-  next();
-}
-
 function calculateMetrics(sessions = [], events = []) {
-  const controlSessions = sessions.filter((s) => s.variant === 'control').length;
-  const variantSessions = sessions.filter((s) => s.variant === 'variant').length;
-
-  const controlPurchases = events.filter(
-    (e) => e.variant === 'control' && e.event_type === 'purchase'
-  );
-
-  const variantPurchases = events.filter(
-    (e) => e.variant === 'variant' && e.event_type === 'purchase'
-  );
-
-  const controlRevenue = controlPurchases.reduce(
-    (sum, e) => sum + Number(e.value || 0),
-    0
-  );
-
-  const variantRevenue = variantPurchases.reduce(
-    (sum, e) => sum + Number(e.value || 0),
-    0
-  );
-
-  const conversionRateControl = controlSessions
-    ? controlPurchases.length / controlSessions
-    : 0;
-
-  const conversionRateVariant = variantSessions
-    ? variantPurchases.length / variantSessions
-    : 0;
-
-  const revenuePerSessionControl = controlSessions
-    ? controlRevenue / controlSessions
-    : 0;
-
-  const revenuePerSessionVariant = variantSessions
-    ? variantRevenue / variantSessions
-    : 0;
-
-  const liftPercent = revenuePerSessionControl
-    ? ((revenuePerSessionVariant - revenuePerSessionControl) / revenuePerSessionControl) * 100
-    : 0;
-
-  return {
-    control: {
-      sessions: controlSessions,
-      purchases: controlPurchases.length,
-      revenue: controlRevenue,
-      conversion_rate: conversionRateControl,
-      revenue_per_session: revenuePerSessionControl,
-    },
-    variant: {
-      sessions: variantSessions,
-      purchases: variantPurchases.length,
-      revenue: variantRevenue,
-      conversion_rate: conversionRateVariant,
-      revenue_per_session: revenuePerSessionVariant,
-    },
-    lift_percent: liftPercent,
-  };
+const controlSessions = sessions.filter((s) => s.variant === 'control').length;
+const variantSessions = sessions.filter((s) => s.variant === 'variant').length;
+const controlPurchases = events.filter(
+(e) => e.variant === 'control' && e.event_type === 'purchase'
+);
+const variantPurchases = events.filter(
+(e) => e.variant === 'variant' && e.event_type === 'purchase'
+);
+const controlRevenue = controlPurchases.reduce(
+(sum, e) => sum + Number(e.value || 0),
+0
+);
+const variantRevenue = variantPurchases.reduce(
+(sum, e) => sum + Number(e.value || 0),
+0
+);
+const conversionRateControl = controlSessions
+? controlPurchases.length / controlSessions
+: 0;
+const conversionRateVariant = variantSessions
+? variantPurchases.length / variantSessions
+: 0;
+const revenuePerSessionControl = controlSessions
+? controlRevenue / controlSessions
+: 0;
+const revenuePerSessionVariant = variantSessions
+? variantRevenue / variantSessions
+: 0;
+const liftPercent = revenuePerSessionControl
+? ((revenuePerSessionVariant - revenuePerSessionControl) / revenuePerSessionControl) * 100
+: 0;
+return {
+control: {
+sessions: controlSessions,
+purchases: controlPurchases.length,
+revenue: controlRevenue,
+conversion_rate: conversionRateControl,
+revenue_per_session: revenuePerSessionControl,
+},
+variant: {
+sessions: variantSessions,
+purchases: variantPurchases.length,
+revenue: variantRevenue,
+conversion_rate: conversionRateVariant,
+revenue_per_session: revenuePerSessionVariant,
+},
+lift_percent: liftPercent,
+};
 }
-
+// ---------- OPTIONS ----------
 app.options('/api/events', cors(corsOptions));
 app.options('/api/assign-variant', cors(corsOptions));
 app.options('/api/stores', cors(corsOptions));
 app.options('/api/metrics/:shop_domain', cors(corsOptions));
 app.options('/api/debug/:shop_domain', cors(corsOptions));
-
+// ---------- SHOPIFY MANDATORY COMPLIANCE WEBHOOKS ----------
+// IMPORTANT: use express.raw so HMAC is computed against the exact raw payload.
 app.post(
-  '/webhooks/customers-data-request',
-  express.raw({ type: '*/*' }),
-  shopifyWebhookHandler('customers/data_request', async (payload) => {
-    console.log(
-      'Processed customers/data_request for shop:',
-      payload.shop_domain || payload.shop_id || 'unknown'
-    );
-  })
+'/webhooks/customers-data-request',
+express.raw({ type: '*/*' }),
+shopifyWebhookHandler('customers/data_request', async (payload) => {
+// Optional: log/store request for compliance workflow
+console.log('Processed customers/data_request for shop:', payload.shop_domain || payload.shop_id || 'unknown');
+})
 );
-
 app.post(
-  '/webhooks/customers-redact',
-  express.raw({ type: '*/*' }),
-  shopifyWebhookHandler('customers/redact', async (payload) => {
-    console.log(
-      'Processed customers/redact for shop:',
-      payload.shop_domain || payload.shop_id || 'unknown'
-    );
-  })
+'/webhooks/customers-redact',
+express.raw({ type: '*/*' }),
+shopifyWebhookHandler('customers/redact', async (payload) => {
+// Optional: perform customer-level redaction in your own DB if needed
+console.log('Processed customers/redact for shop:', payload.shop_domain || payload.shop_id || 'unknown');
+})
 );
-
 app.post(
-  '/webhooks/shop-redact',
-  express.raw({ type: '*/*' }),
-  shopifyWebhookHandler('shop/redact', async (payload) => {
-    console.log(
-      'Processed shop/redact for shop:',
-      payload.shop_domain || payload.shop_id || 'unknown'
-    );
-
-    const possibleShopDomain =
-      payload.shop_domain ||
-      payload.myshopify_domain ||
-      payload.domain ||
-      null;
-
-    if (possibleShopDomain) {
-      /*
-      await supabase.from('events').delete().eq('shop_domain', possibleShopDomain);
-      await supabase.from('experiment_sessions').delete().eq('shop_domain', possibleShopDomain);
-      await supabase.from('stores').delete().eq('shop_domain', possibleShopDomain);
-      */
-    }
-  })
+'/webhooks/shop-redact',
+express.raw({ type: '*/*' }),
+shopifyWebhookHandler('shop/redact', async (payload) => {
+// Optional: remove shop data from your DB if required
+console.log('Processed shop/redact for shop:', payload.shop_domain || payload.shop_id || 'unknown');
+const possibleShopDomain =
+payload.shop_domain ||
+payload.myshopify_domain ||
+payload.domain ||
+null;
+if (possibleShopDomain) {
+// Example cleanup — keep or remove depending on your data retention model.
+// Uncomment if you want to actually delete records when shop/redact arrives.
+/*
+await supabase.from('events').delete().eq('shop_domain', possibleShopDomain);
+await supabase.from('experiment_sessions').delete().eq('shop_domain', possibleShopDomain);
+await supabase.from('stores').delete().eq('shop_domain', possibleShopDomain);
+*/
+}
+})
 );
-
+// ---------- API ROUTES ----------
 app.post('/api/stores', async (req, res) => {
-  try {
-    const { shop_domain, access_token = null, scope = null } = req.body || {};
-
-    if (!shop_domain) {
-      return res.status(400).json({
-        success: false,
-        error: 'shop_domain is required',
-      });
-    }
-
-    const row = {
-      shop_domain: normalizeShopDomain(shop_domain),
-      access_token,
-      scope,
-      installed_at: new Date().toISOString(),
-    };
-
-    const { data, error } = await supabase
-      .from('stores')
-      .upsert([row], { onConflict: 'shop_domain' })
-      .select();
-
-    if (error) {
-      console.log('STORE UPSERT ERROR:', error);
-      return res.status(500).json({ success: false, error });
-    }
-
-    return res.json({ success: true, data });
-  } catch (error) {
-    console.log('STORE ROUTE ERROR:', error);
-    return res.status(500).json({
-      success: false,
-      error: String(error.message || error),
-    });
-  }
+try {
+const { shop_domain, access_token = null, scope = null } = req.body || {};
+if (!shop_domain) {
+return res.status(400).json({
+success: false,
+error: 'shop_domain is required',
 });
-
+}
+const row = {
+shop_domain: normalizeShopDomain(shop_domain),
+access_token,
+scope,
+installed_at: new Date().toISOString(),
+};
+const { data, error } = await supabase
+.from('stores')
+.upsert([row], { onConflict: 'shop_domain' })
+.select();
+if (error) {
+console.log('STORE UPSERT ERROR:', error);
+return res.status(500).json({ success: false, error });
+}
+return res.json({ success: true, data });
+} catch (error) {
+console.log('STORE ROUTE ERROR:', error);
+return res.status(500).json({
+success: false,
+error: String(error.message || error),
+});
+}
+});
 app.post('/api/assign-variant', async (req, res) => {
-  try {
-    const { shop_domain, session_id } = req.body || {};
-
-    if (!shop_domain || !session_id) {
-      return res.status(400).json({
-        success: false,
-        error: 'missing fields',
-      });
-    }
-
-    const normalizedShop = normalizeShopDomain(shop_domain);
-
-    const { data: existing, error: existingError } = await supabase
-      .from('experiment_sessions')
-      .select('*')
-      .eq('shop_domain', normalizedShop)
-      .eq('session_id', session_id)
-      .maybeSingle();
-
-    if (existingError) {
-      console.log('ASSIGN LOOKUP ERROR:', existingError);
-      return res.status(500).json({ success: false, error: existingError });
-    }
-
-    if (existing) {
-      return res.json({ success: true, data: existing });
-    }
-
-    const variant = Math.random() < 0.5 ? 'control' : 'variant';
-
-    const { data, error } = await supabase
-      .from('experiment_sessions')
-      .insert([
-        {
-          shop_domain: normalizedShop,
-          session_id,
-          variant,
-          created_at: new Date().toISOString(),
-        },
-      ])
-      .select()
-      .single();
-
-    if (error) {
-      console.log('ASSIGN INSERT ERROR:', error);
-      return res.status(500).json({ success: false, error });
-    }
-
-    return res.json({ success: true, data });
-  } catch (error) {
-    console.log('ASSIGN ROUTE ERROR:', error);
-    return res.status(500).json({
-      success: false,
-      error: String(error.message || error),
-    });
-  }
+try {
+const { shop_domain, session_id } = req.body || {};
+if (!shop_domain || !session_id) {
+return res.status(400).json({
+success: false,
+error: 'missing fields',
 });
-
+}
+const normalizedShop = normalizeShopDomain(shop_domain);
+const { data: existing, error: existingError } = await supabase
+.from('experiment_sessions')
+.select('*')
+.eq('shop_domain', normalizedShop)
+.eq('session_id', session_id)
+.maybeSingle();
+if (existingError) {
+console.log('ASSIGN LOOKUP ERROR:', existingError);
+return res.status(500).json({ success: false, error: existingError });
+}
+if (existing) {
+return res.json({ success: true, data: existing });
+}
+const variant = Math.random() < 0.5 ? 'control' : 'variant';
+const { data, error } = await supabase
+.from('experiment_sessions')
+.insert([
+{
+shop_domain: normalizedShop,
+session_id,
+variant,
+created_at: new Date().toISOString(),
+},
+])
+.select()
+.single();
+if (error) {
+console.log('ASSIGN INSERT ERROR:', error);
+return res.status(500).json({ success: false, error });
+}
+return res.json({ success: true, data });
+} catch (error) {
+console.log('ASSIGN ROUTE ERROR:', error);
+return res.status(500).json({
+success: false,
+error: String(error.message || error),
+});
+}
+});
 app.post('/api/events', async (req, res) => {
-  try {
-    console.log('EVENT RECEIVED:', JSON.stringify(req.body, null, 2));
-
-    const {
-      shop_domain,
-      session_id,
-      event_type,
-      value = 0,
-    } = req.body || {};
-
-    if (!shop_domain || !session_id || !event_type) {
-      console.log('EVENT REJECTED: missing fields');
-      return res.status(400).json({
-        success: false,
-        error: 'missing fields',
-        received: req.body,
-      });
-    }
-
-    const normalizedShop = normalizeShopDomain(shop_domain);
-
-    const { data: session, error: sessionError } = await supabase
-      .from('experiment_sessions')
-      .select('*')
-      .eq('shop_domain', normalizedShop)
-      .eq('session_id', session_id)
-      .maybeSingle();
-
-    if (sessionError) {
-      console.log('SESSION LOOKUP ERROR:', sessionError);
-      return res.status(500).json({ success: false, error: sessionError });
-    }
-
-    if (!session) {
-      console.log('EVENT REJECTED: session not assigned');
-      return res.status(400).json({
-        success: false,
-        error: 'session not assigned',
-        shop_domain: normalizedShop,
-        session_id,
-      });
-    }
-
-    const insertRow = {
-      shop_domain: normalizedShop,
-      session_id,
-      variant: session.variant,
-      event_type,
-      value: Number(value || 0),
-      created_at: new Date().toISOString(),
-    };
-
-    console.log('EVENT INSERT ROW:', JSON.stringify(insertRow, null, 2));
-
-    const { data, error } = await supabase
-      .from('events')
-      .insert([insertRow])
-      .select();
-
-    if (error) {
-      console.log('EVENT INSERT ERROR:', error);
-      return res.status(500).json({ success: false, error });
-    }
-
-    console.log('EVENT INSERTED OK:', JSON.stringify(data, null, 2));
-    return res.json({ success: true, data });
-  } catch (error) {
-    console.log('EVENT ROUTE ERROR:', error);
-    return res.status(500).json({
-      success: false,
-      error: String(error.message || error),
-    });
-  }
+try {
+console.log('EVENT RECEIVED:', JSON.stringify(req.body, null, 2));
+const {
+shop_domain,
+session_id,
+event_type,
+value = 0,
+} = req.body || {};
+if (!shop_domain || !session_id || !event_type) {
+console.log('EVENT REJECTED: missing fields');
+return res.status(400).json({
+success: false,
+error: 'missing fields',
+received: req.body,
 });
-
-app.get('/api/metrics/:shop_domain', requireShopifySessionAuth, async (req, res) => {
-  try {
-    const shop_domain = normalizeShopDomain(req.params.shop_domain);
-
-    const { data: sessions, error: sessionsError } = await supabase
-      .from('experiment_sessions')
-      .select('*')
-      .eq('shop_domain', shop_domain);
-
-    if (sessionsError) {
-      console.log('METRICS SESSION ERROR:', sessionsError);
-      return res.status(500).json({ success: false, error: sessionsError });
-    }
-
-    const { data: events, error: eventsError } = await supabase
-      .from('events')
-      .select('*')
-      .eq('shop_domain', shop_domain);
-
-    if (eventsError) {
-      console.log('METRICS EVENTS ERROR:', eventsError);
-      return res.status(500).json({ success: false, error: eventsError });
-    }
-
-    const metrics = calculateMetrics(sessions || [], events || []);
-
-    return res.json({
-      success: true,
-      data: {
-        shop_domain,
-        ...metrics,
-      },
-    });
-  } catch (error) {
-    console.log('METRICS ROUTE ERROR:', error);
-    return res.status(500).json({
-      success: false,
-      error: String(error.message || error),
-    });
-  }
+}
+const normalizedShop = normalizeShopDomain(shop_domain);
+const { data: session, error: sessionError } = await supabase
+.from('experiment_sessions')
+.select('*')
+.eq('shop_domain', normalizedShop)
+.eq('session_id', session_id)
+.maybeSingle();
+if (sessionError) {
+console.log('SESSION LOOKUP ERROR:', sessionError);
+return res.status(500).json({ success: false, error: sessionError });
+}
+if (!session) {
+console.log('EVENT REJECTED: session not assigned');
+return res.status(400).json({
+success: false,
+error: 'session not assigned',
+shop_domain: normalizedShop,
+session_id,
 });
-
-app.get('/api/debug/:shop_domain', requireShopifySessionAuth, async (req, res) => {
-  try {
-    const shop_domain = normalizeShopDomain(req.params.shop_domain);
-
-    const { data: sessions, error: sessionsError } = await supabase
-      .from('experiment_sessions')
-      .select('*')
-      .eq('shop_domain', shop_domain);
-
-    const { data: events, error: eventsError } = await supabase
-      .from('events')
-      .select('*')
-      .eq('shop_domain', shop_domain)
-      .order('created_at', { ascending: false });
-
-    return res.json({
-      success: true,
-      sessionsError,
-      eventsError,
-      sessionCount: sessions?.length || 0,
-      eventCount: events?.length || 0,
-      sessions: sessions || [],
-      events: events || [],
-    });
-  } catch (error) {
-    console.log('DEBUG ROUTE ERROR:', error);
-    return res.status(500).json({
-      success: false,
-      error: String(error.message || error),
-    });
-  }
+}
+const insertRow = {
+shop_domain: normalizedShop,
+session_id,
+variant: session.variant,
+event_type,
+value: Number(value || 0),
+created_at: new Date().toISOString(),
+};
+console.log('EVENT INSERT ROW:', JSON.stringify(insertRow, null, 2));
+const { data, error } = await supabase
+.from('events')
+.insert([insertRow])
+.select();
+if (error) {
+console.log('EVENT INSERT ERROR:', error);
+return res.status(500).json({ success: false, error });
+}
+console.log('EVENT INSERTED OK:', JSON.stringify(data, null, 2));
+return res.json({ success: true, data });
+} catch (error) {
+console.log('EVENT ROUTE ERROR:', error);
+return res.status(500).json({
+success: false,
+error: String(error.message || error),
 });
-
+}
+});
+app.get('/api/metrics/:shop_domain', async (req, res) => {
+try {
+const shop_domain = normalizeShopDomain(req.params.shop_domain);
+const { data: sessions, error: sessionsError } = await supabase
+.from('experiment_sessions')
+.select('*')
+.eq('shop_domain', shop_domain);
+if (sessionsError) {
+console.log('METRICS SESSION ERROR:', sessionsError);
+return res.status(500).json({ success: false, error: sessionsError });
+}
+const { data: events, error: eventsError } = await supabase
+.from('events')
+.select('*')
+.eq('shop_domain', shop_domain);
+if (eventsError) {
+console.log('METRICS EVENTS ERROR:', eventsError);
+return res.status(500).json({ success: false, error: eventsError });
+}
+const metrics = calculateMetrics(sessions || [], events || []);
+return res.json({
+success: true,
+data: {
+shop_domain,
+...metrics,
+},
+});
+} catch (error) {
+console.log('METRICS ROUTE ERROR:', error);
+return res.status(500).json({
+success: false,
+error: String(error.message || error),
+});
+}
+});
+app.get('/api/debug/:shop_domain', async (req, res) => {
+try {
+const shop_domain = normalizeShopDomain(req.params.shop_domain);
+const { data: sessions, error: sessionsError } = await supabase
+.from('experiment_sessions')
+.select('*')
+.eq('shop_domain', shop_domain);
+const { data: events, error: eventsError } = await supabase
+.from('events')
+.select('*')
+.eq('shop_domain', shop_domain)
+.order('created_at', { ascending: false });
+return res.json({
+success: true,
+sessionsError,
+eventsError,
+sessionCount: sessions?.length || 0,
+eventCount: events?.length || 0,
+sessions: sessions || [],
+events: events || [],
+});
+} catch (error) {
+console.log('DEBUG ROUTE ERROR:', error);
+return res.status(500).json({
+success: false,
+error: String(error.message || error),
+});
+}
+});
+// ---------- DASHBOARD ----------
 app.get('/dashboard', (req, res) => {
-  const shopParam = req.query.shop;
-  const shopDomain = shopParam
-    ? normalizeShopDomain(shopParam)
-    : 'behavior-test-store.myshopify.com';
-
-  res.send(`
+const shopParam = req.query.shop;
+const shopDomain = shopParam
+? normalizeShopDomain(shopParam)
+: 'behavior-test-store.myshopify.com';
+res.send(`
 <!doctype html>
 <html>
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>BehavioralPro Dashboard</title>
-<meta name="shopify-api-key" content="${SHOPIFY_API_KEY || ''}" />
-<script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
 <style>
 * { box-sizing: border-box; }
 body {
@@ -790,7 +654,7 @@ return num.toFixed(1) + "%";
 }
 function setText(id, value) {
 const el = document.getElementById(id);
-if (el) el.textContent = String(value);
+if (el) el.textContent = value;
 }
 function setNotice(html) {
 const el = document.getElementById("top-notice");
@@ -810,33 +674,9 @@ return "Tracking is live. Sessions are being recorded, but no purchases have bee
 }
 return "Tracking is live and data is being collected successfully for this store.";
 }
-async function getSessionToken() {
-if (!window.shopify || typeof window.shopify.idToken !== 'function') {
-throw new Error('Shopify App Bridge is not available');
-}
-if (window.shopify.ready) {
-await window.shopify.ready;
-}
-const token = await window.shopify.idToken();
-if (!token) {
-throw new Error('Shopify session token was not returned');
-}
-return token;
-}
-async function authFetch(url, options = {}) {
-const token = await getSessionToken();
-return fetch(url, {
-...options,
-headers: {
-...(options.headers || {}),
-Authorization: 'Bearer ' + token,
-'Content-Type': 'application/json',
-},
-});
-}
 async function loadMetrics() {
 try {
-const response = await authFetch('/api/metrics/' + encodeURIComponent(shopDomain));
+const response = await fetch('/api/metrics/' + encodeURIComponent(shopDomain));
 const json = await response.json();
 if (!json.success || !json.data) {
 throw new Error('Metrics response missing data');
@@ -888,7 +728,6 @@ console.error(err);
 }
 const rawDataWrap = document.getElementById("raw-data-wrap");
 const rawDataButton = document.getElementById("toggle-raw-data");
-setText("shop-domain", shopDomain);
 if (rawDataButton && rawDataWrap) {
 rawDataButton.addEventListener("click", () => {
 const isHidden = rawDataWrap.classList.contains("hidden");
@@ -896,35 +735,25 @@ rawDataWrap.classList.toggle("hidden");
 rawDataButton.textContent = isHidden ? "Hide Raw Data" : "Show Raw Data";
 });
 }
-window.addEventListener('load', () => {
-void loadMetrics();
-});
+loadMetrics();
 </script>
 </body>
 </html>
 `);
 });
-
-app.get('/', (req, res) => {
-  const shop = req.query.shop;
-
-  if (shop) {
-    return res.redirect(`/app?shop=${encodeURIComponent(shop)}`);
-  }
-
-  return res.redirect('/dashboard');
+// ---------- BASIC ROUTES ----------
+app.get('/', (_req, res) => {
+res.send('BehavioralPro backend is running.');
 });
-
 app.get('/app', (req, res) => {
-  const shop = req.query.shop;
-  if (!shop) {
-    return res.status(400).send('Missing shop parameter');
-  }
-
-  const shopDomain = normalizeShopDomain(shop);
-  return res.redirect(`/dashboard?shop=${encodeURIComponent(shopDomain)}`);
+const shop = req.query.shop;
+if (!shop) {
+return res.status(400).send('Missing shop parameter');
+}
+const shopDomain = normalizeShopDomain(shop);
+return res.redirect(`/dashboard?shop=${encodeURIComponent(shopDomain)}`);
 });
-
+// ---------- START ----------
 app.listen(PORT, () => {
-  console.log('Server running on port', PORT);
+console.log('Server running on port', PORT);
 });
