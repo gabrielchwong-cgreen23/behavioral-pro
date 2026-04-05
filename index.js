@@ -839,17 +839,17 @@ app.get('/dashboard', (req, res) => {
     </div>
   </div>
 
+<meta name="shopify-api-key" content="${process.env.SHOPIFY_API_KEY}" />
 <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
 
 <script>
   const shopDomain = ${JSON.stringify(shopDomain)};
-  const apiKey = "${process.env.SHOPIFY_API_KEY}";
-
-  // ---------- APP BRIDGE INIT ----------
-  const app = window.shopify.createApp({
-    apiKey: apiKey,
-    host: new URLSearchParams(window.location.search).get("host"),
-  });
+  async function getSessionToken() {
+  if (!window.shopify) {
+    throw new Error("App Bridge did not load");
+  }
+  return await window.shopify.idToken();
+});
 
   // ---------- GET SESSION TOKEN ----------
   async function getSessionToken() {
