@@ -67,14 +67,6 @@ function base64UrlDecode(input) {
   return Buffer.from(value, 'base64')
 }
 
-function base64UrlEncode(buffer) {
-  return Buffer.from(buffer)
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/g, '')
-}
-
 function getBearerToken(req) {
   const authHeader = req.headers.authorization || req.headers.Authorization
   if (!authHeader || typeof authHeader !== 'string') return null
@@ -498,7 +490,6 @@ app.get('/dashboard', (req, res) => {
   const shopDomain = normalizeShop(req.query.shop) || 'behavior-test-store.myshopify.com'
   const host = typeof req.query.host === 'string' ? req.query.host : ''
   const escapedShop = escapeHtml(shopDomain)
-  const escapedHost = escapeHtml(host)
   const escapedApiKey = escapeHtml(SHOPIFY_API_KEY || '')
 
   res.send(`<!doctype html>
@@ -678,12 +669,39 @@ app.get('/dashboard', (req, res) => {
       return num.toFixed(1) + '%';
     }
 
+    async function getSessionTokenOrThrow() {
+      if (!window.shopify || typeof window.shopify.idToken !== 'function') {
+        throw new Error('App Bridge session token API not available');
+      }
+
+      const token = await window.shopify.idToken();
+
+      if (!token) {
+        throw new Error('No session token returned');
+      }
+
+      return token;
+    }
+
+    async function authedFetch(url, options = {}) {
+      const token = await getSessionTokenOrThrow();
+
+      const headers = new Headers(options.headers || {});
+      headers.set('Authorization', 'Bearer ' + token);
+
+      return fetch(url, {
+        ...options,
+        headers,
+        credentials: 'same-origin'
+      });
+    }
+
     async function verifyEmbeddedAuth() {
       try {
-        const response = await fetch('/api/embedded-check?shop=' + encodeURIComponent(shopDomain), {
-          method: 'GET',
-          credentials: 'same-origin'
-        });
+        const response = await authedFetch(
+          '/api/embedded-check?shop=' + encodeURIComponent(shopDomain),
+          { method: 'GET' }
+        );
 
         const json = await response.json();
 
@@ -694,16 +712,23 @@ app.get('/dashboard', (req, res) => {
         setStatus('embedded-auth-status', 'Session token accepted', 'ok');
       } catch (error) {
         console.error('Embedded auth check error:', error);
-        setStatus('embedded-auth-status', 'Failed: ' + String(error.message || error), 'error');
+        setStatus(
+          'embedded-auth-status',
+          'Failed: ' + String(error.message || error),
+          'error'
+        );
       }
     }
 
     async function loadMetrics() {
       try {
-        const response = await fetch('/api/metrics/' + encodeURIComponent(shopDomain) + '?shop=' + encodeURIComponent(shopDomain), {
-          method: 'GET',
-          credentials: 'same-origin'
-        });
+        const response = await authedFetch(
+          '/api/metrics/' +
+            encodeURIComponent(shopDomain) +
+            '?shop=' +
+            encodeURIComponent(shopDomain),
+          { method: 'GET' }
+        );
 
         const json = await response.json();
 
@@ -745,14 +770,20 @@ app.get('/dashboard', (req, res) => {
 
         const metricsJson = document.getElementById('metrics-json');
         if (metricsJson) {
-          metricsJson.textContent = 'Error loading dashboard data:\\n\\n' + String(error.message || error);
+          metricsJson.textContent =
+            'Error loading dashboard data:\\n\\n' +
+            String(error.message || error);
         }
       }
     }
 
     async function boot() {
-      await verifyEmbeddedAuth();
-      await loadMetrics();
+      try {
+        await verifyEmbeddedAuth();
+        await loadMetrics();
+      } catch (error) {
+        console.error('Boot error:', error);
+      }
     }
 
     boot();
