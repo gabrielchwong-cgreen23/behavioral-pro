@@ -1,6 +1,3 @@
-Use this full `index.js` as your replacement. This keeps your original structure, adds Shopify session-token verification, loads App Bridge from Shopify’s CDN in the embedded dashboard, protects the embedded metrics/debug routes with bearer token auth, and fixes the root route so the embedded app opens the actual UI.
-
-```js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
