@@ -644,7 +644,6 @@ app.get('/dashboard', (req, res) => {
 
   <script>
     const shopDomain = ${JSON.stringify(shopDomain)};
-    const host = ${JSON.stringify(host)};
 
     function setText(id, value) {
       const el = document.getElementById(id);
@@ -669,12 +668,29 @@ app.get('/dashboard', (req, res) => {
       return num.toFixed(1) + '%';
     }
 
+    function withTimeout(promise, ms, label) {
+      return Promise.race([
+        promise,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(label + ' timed out after ' + ms + 'ms')), ms)
+        )
+      ]);
+    }
+
     async function getSessionTokenOrThrow() {
-      if (!window.shopify || typeof window.shopify.idToken !== 'function') {
-        throw new Error('App Bridge session token API not available');
+      if (!window.shopify) {
+        throw new Error('window.shopify is missing');
       }
 
-      const token = await window.shopify.idToken();
+      if (typeof window.shopify.idToken !== 'function') {
+        throw new Error('shopify.idToken is not available');
+      }
+
+      const token = await withTimeout(
+        window.shopify.idToken(),
+        8000,
+        'shopify.idToken()'
+      );
 
       if (!token) {
         throw new Error('No session token returned');
@@ -698,6 +714,8 @@ app.get('/dashboard', (req, res) => {
 
     async function verifyEmbeddedAuth() {
       try {
+        setStatus('embedded-auth-status', 'Requesting session token...');
+
         const response = await authedFetch(
           '/api/embedded-check?shop=' + encodeURIComponent(shopDomain),
           { method: 'GET' }
@@ -710,6 +728,7 @@ app.get('/dashboard', (req, res) => {
         }
 
         setStatus('embedded-auth-status', 'Session token accepted', 'ok');
+        return true;
       } catch (error) {
         console.error('Embedded auth check error:', error);
         setStatus(
@@ -717,6 +736,14 @@ app.get('/dashboard', (req, res) => {
           'Failed: ' + String(error.message || error),
           'error'
         );
+
+        const metricsJson = document.getElementById('metrics-json');
+        if (metricsJson) {
+          metricsJson.textContent =
+            'Embedded auth error:\\n\\n' + String(error.message || error);
+        }
+
+        return false;
       }
     }
 
@@ -778,11 +805,11 @@ app.get('/dashboard', (req, res) => {
     }
 
     async function boot() {
-      try {
-        await verifyEmbeddedAuth();
+      const authOk = await verifyEmbeddedAuth();
+      if (authOk) {
         await loadMetrics();
-      } catch (error) {
-        console.error('Boot error:', error);
+      } else {
+        setStatus('status-text', 'Blocked by auth', 'error');
       }
     }
 
