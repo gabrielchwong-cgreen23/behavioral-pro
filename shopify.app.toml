@@ -1,0 +1,31 @@
+client_id = "ee7791f70e17fcbfe03f52ade51b5d7a"
+name = "behavioral_pro"
+application_url = "https://behavioral-pro-production.up.railway.app"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+
+[access_scopes]
+scopes = "read_products"
+
+[auth]
+redirect_urls = [
+  "https://behavioral-pro-production.up.railway.app/api/shopify/callback"
+]
+
+[webhooks]
+api_version = "2026-01"
+
+[[webhooks.subscriptions]]
+uri = "https://behavioral-pro-production.up.railway.app/webhooks/customers-data-request"
+compliance_topics = ["customers/data_request"]
+
+[[webhooks.subscriptions]]
+uri = "https://behavioral-pro-production.up.railway.app/webhooks/customers-redact"
+compliance_topics = ["customers/redact"]
+
+[[webhooks.subscriptions]]
+uri = "https://behavioral-pro-production.up.railway.app/webhooks/shop-redact"
+compliance_topics = ["shop/redact"]
+

@@ -1,0 +1,773 @@
+{% schema %}
+{
+  "name": "Agency Revenue Lift",
+  "target": "head",
+  "settings": [
+    {
+      "type": "checkbox",
+      "id": "expt_active",
+      "label": "Run 14-Day Revenue Lift Test",
+      "default": true
+    },
+    {
+      "type": "text",
+      "id": "backend_base",
+      "label": "Backend Base URL",
+      "default": "https://behavioral-pro-production.up.railway.app"
+    },
+    {
+      "type": "checkbox",
+      "id": "debug_mode",
+      "label": "Enable Debug Logs",
+      "default": true
+    }
+  ]
+}
+{% endschema %}
+
+<script>
+(function () {
+  if (window.__behavioralProAgencyRevenueLiftLoaded) return;
+  window.__behavioralProAgencyRevenueLiftLoaded = true;
+
+  var CONFIG = {
+    active: {{ block.settings.expt_active | json }},
+    backendBase: {{ block.settings.backend_base | json }},
+    debug: {{ block.settings.debug_mode | json }},
+    shopDomain: {{ shop.domain | json }},
+    pageType: {{ request.page_type | json }},
+
+    gtmId: "GTM-3H5SLT7T",
+    ga4Id: "G-6TZYV1S6L9",
+    tidioId: "63hgfq26munthk1pfvmvz25ryddkjgsf",
+    experimentName: "agency_revenue_lift_14_day",
+
+    sessionKey: "behavioral_pro_session_id",
+    variantKey: "behavioral_pro_variant",
+    fallbackVariantKey: "behavioral_pro_fallback_variant",
+    visitorKey: "behavioral_pro_visitor_id",
+    eventDedupKey: "behavioral_pro_event_dedup",
+    purchasePrefix: "behavioral_pro_purchase_",
+    uiPrefix: "behavioral_pro_ui_",
+    pageViewKey: "behavioral_pro_page_view",
+    productPageViewKey: "behavioral_pro_product_page_view",
+    addToCartKey: "behavioral_pro_add_to_cart_click",
+    checkoutKey: "behavioral_pro_begin_checkout_click"
+  };
+
+  if (!CONFIG.active) return;
+
+  var assignmentPromise = null;
+  var assignmentReady = false;
+  var tidioRequested = false;
+  var memorySessionId = null;
+  var clickTrackingBound = false;
+
+  function log() {
+    if (!CONFIG.debug || !window.console || typeof window.console.log !== "function") return;
+    try {
+      var args = ["[BehavioralPro]"].concat([].slice.call(arguments));
+      window.console.log.apply(window.console, args);
+    } catch (e) {}
+  }
+
+  function warn() {
+    if (!window.console || typeof window.console.warn !== "function") return;
+    try {
+      var args = ["[BehavioralPro]"].concat([].slice.call(arguments));
+      window.console.warn.apply(window.console, args);
+    } catch (e) {}
+  }
+
+  function safeGetLocalStorage(key) {
+    try {
+      return window.localStorage.getItem(key);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function safeSetLocalStorage(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+    } catch (e) {}
+  }
+
+  function getSessionStorage() {
+    try {
+      window.sessionStorage.setItem("__bp_test", "1");
+      window.sessionStorage.removeItem("__bp_test");
+      return window.sessionStorage;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function safeGetSessionStorage(key) {
+    try {
+      return window.sessionStorage.getItem(key);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function safeSetSessionStorage(key, value) {
+    try {
+      window.sessionStorage.setItem(key, value);
+    } catch (e) {}
+  }
+
+  function nowIso() {
+    return new Date().toISOString();
+  }
+
+  function createId(prefix) {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return prefix + "_" + window.crypto.randomUUID();
+      }
+    } catch (e) {}
+
+    return prefix + "_" + Math.random().toString(36).slice(2) + "_" + Date.now();
+  }
+
+  function createSessionId() {
+    var randomPart = "";
+
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        randomPart = window.crypto.randomUUID().replace(/-/g, "");
+      } else if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+        var array = new Uint32Array(4);
+        window.crypto.getRandomValues(array);
+        randomPart = Array.prototype.map.call(array, function (part) {
+          return part.toString(36);
+        }).join("");
+      }
+    } catch (e) {}
+
+    if (!randomPart) {
+      randomPart = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    }
+
+    return "session_" + randomPart;
+  }
+
+  function getVisitorId() {
+    var existing = safeGetLocalStorage(CONFIG.visitorKey);
+    if (existing) return existing;
+
+    var id = createId("v");
+    safeSetLocalStorage(CONFIG.visitorKey, id);
+    return id;
+  }
+
+  function getSessionId() {
+    var sessionStorageRef = getSessionStorage();
+
+    if (sessionStorageRef) {
+      var existingSession = sessionStorageRef.getItem(CONFIG.sessionKey);
+      if (existingSession) return existingSession;
+
+      var newSessionId = createSessionId();
+      try {
+        sessionStorageRef.setItem(CONFIG.sessionKey, newSessionId);
+      } catch (e) {}
+      return newSessionId;
+    }
+
+    if (!memorySessionId) {
+      memorySessionId = createSessionId();
+    }
+
+    return memorySessionId;
+  }
+
+  function getStoredVariant() {
+    var sessionStorageRef = getSessionStorage();
+    if (!sessionStorageRef) return null;
+
+    var variant = sessionStorageRef.getItem(CONFIG.variantKey);
+    return variant === "control" || variant === "variant" ? variant : null;
+  }
+
+  function setStoredVariant(variant) {
+    if (variant !== "control" && variant !== "variant") return;
+
+    var sessionStorageRef = getSessionStorage();
+    if (!sessionStorageRef) return;
+
+    try {
+      sessionStorageRef.setItem(CONFIG.variantKey, variant);
+    } catch (e) {}
+  }
+
+  function getFallbackVariant() {
+    var sessionStorageRef = getSessionStorage();
+    if (!sessionStorageRef) return null;
+
+    var variant = sessionStorageRef.getItem(CONFIG.fallbackVariantKey);
+    return variant === "control" || variant === "variant" ? variant : null;
+  }
+
+  function setFallbackVariant(variant) {
+    if (variant !== "control" && variant !== "variant") return;
+
+    var sessionStorageRef = getSessionStorage();
+    if (!sessionStorageRef) return;
+
+    try {
+      sessionStorageRef.setItem(CONFIG.fallbackVariantKey, variant);
+    } catch (e) {}
+  }
+
+  function getOrCreateFallbackVariant() {
+    var existing = getFallbackVariant();
+    if (existing) return existing;
+
+    var variant = Math.random() < 0.5 ? "control" : "variant";
+    setFallbackVariant(variant);
+    return variant;
+  }
+
+  function getEventDedupMap() {
+    var raw = safeGetSessionStorage(CONFIG.eventDedupKey);
+    if (!raw) return {};
+
+    try {
+      var parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function setEventDedupMap(map) {
+    safeSetSessionStorage(CONFIG.eventDedupKey, JSON.stringify(map || {}));
+  }
+
+  function hasSeenEvent(signature) {
+    var map = getEventDedupMap();
+    return map[signature] === 1;
+  }
+
+  function markSeenEvent(signature) {
+    var map = getEventDedupMap();
+    map[signature] = 1;
+    setEventDedupMap(map);
+  }
+
+  function normalizeBaseUrl(url) {
+    return String(url || "").replace(/\/+$/, "");
+  }
+
+  function isUsableBackendBase(base) {
+    if (!base) return false;
+    if (base.indexOf("localhost") !== -1) return false;
+    if (base.indexOf("127.0.0.1") !== -1) return false;
+    return true;
+  }
+
+  function postJson(path, body) {
+    var base = normalizeBaseUrl(CONFIG.backendBase);
+
+    if (typeof window.fetch !== "function" || !isUsableBackendBase(base)) {
+      return Promise.reject(new Error("backend_unavailable"));
+    }
+
+    return window.fetch(base + path, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body),
+      keepalive: true,
+      credentials: "omit",
+      mode: "cors"
+    });
+  }
+
+  function ensureGTM(gtmId) {
+    if (!gtmId) return;
+    if (document.getElementById("behavioral-pro-gtm-loader")) return;
+
+    try {
+      window.dataLayer = window.dataLayer || [];
+      window.dataLayer.push({
+        "gtm.start": new Date().getTime(),
+        event: "gtm.js"
+      });
+
+      var firstScript = document.getElementsByTagName("script")[0];
+      var script = document.createElement("script");
+      script.async = true;
+      script.src = "https://www.googletagmanager.com/gtm.js?id=" + encodeURIComponent(gtmId);
+      script.id = "behavioral-pro-gtm-loader";
+
+      if (firstScript && firstScript.parentNode) {
+        firstScript.parentNode.insertBefore(script, firstScript);
+      } else if (document.head) {
+        document.head.appendChild(script);
+      }
+
+      log("GTM requested");
+    } catch (e) {
+      warn("GTM failed to initialize", e);
+    }
+  }
+
+  function ensureGA4(gaId) {
+    if (!gaId) return;
+
+    try {
+      window.dataLayer = window.dataLayer || [];
+
+      if (typeof window.gtag !== "function") {
+        window.gtag = function () {
+          window.dataLayer.push(arguments);
+        };
+      }
+
+      if (!document.getElementById("behavioral-pro-ga4-loader")) {
+        var script = document.createElement("script");
+        script.async = true;
+        script.src = "https://www.googletagmanager.com/gtag/js?id=" + encodeURIComponent(gaId);
+        script.id = "behavioral-pro-ga4-loader";
+
+        if (document.head) {
+          document.head.appendChild(script);
+        }
+      }
+
+      if (!window.__behavioralProGA4Configured) {
+        window.gtag("js", new Date());
+        window.gtag("config", gaId, {
+          send_page_view: false
+        });
+        window.__behavioralProGA4Configured = true;
+      }
+
+      log("GA4 requested/configured");
+    } catch (e) {
+      warn("GA4 failed to initialize", e);
+    }
+  }
+
+  function loadTidio() {
+    if (!CONFIG.tidioId || tidioRequested) return;
+    if (document.getElementById("behavioral-pro-tidio-loader")) return;
+
+    tidioRequested = true;
+
+    try {
+      var script = document.createElement("script");
+      script.async = true;
+      script.src = "https://code.tidio.co/" + encodeURIComponent(CONFIG.tidioId) + ".js";
+      script.id = "behavioral-pro-tidio-loader";
+      script.onload = function () { log("Tidio loaded"); };
+      script.onerror = function () { warn("Tidio failed to load"); };
+
+      if (document.body) {
+        document.body.appendChild(script);
+      } else if (document.head) {
+        document.head.appendChild(script);
+      }
+
+      log("Requested Tidio load");
+    } catch (e) {
+      warn("Error requesting Tidio", e);
+    }
+  }
+
+  function maybeLoadTidioForVariant(variant) {
+    if (variant === "variant") loadTidio();
+  }
+
+  function ensureVariant(sessionId) {
+    var existing = getStoredVariant();
+    if (existing) {
+      assignmentReady = true;
+      maybeLoadTidioForVariant(existing);
+      return Promise.resolve(existing);
+    }
+
+    if (assignmentPromise) return assignmentPromise;
+
+    assignmentPromise = postJson("/api/assign-variant", {
+      shop_domain: CONFIG.shopDomain,
+      session_id: sessionId
+    })
+      .then(function (response) {
+        if (!response.ok) throw new Error("assign_failed");
+        return response.json();
+      })
+      .then(function (json) {
+        var variant = json && json.data && json.data.variant;
+
+        if (variant !== "control" && variant !== "variant") {
+          throw new Error("invalid_variant");
+        }
+
+        setStoredVariant(variant);
+        assignmentReady = true;
+        maybeLoadTidioForVariant(variant);
+        log("Backend assigned variant:", variant);
+        return variant;
+      })
+      .catch(function (err) {
+        var fallbackVariant = getOrCreateFallbackVariant();
+        setStoredVariant(fallbackVariant);
+        assignmentReady = true;
+        maybeLoadTidioForVariant(fallbackVariant);
+        warn("Backend assignment failed, using fallback:", fallbackVariant, err);
+        return fallbackVariant;
+      });
+
+    return assignmentPromise;
+  }
+
+  function buildPayload(eventName, variant, visitorId, sessionId, extra) {
+    return {
+      event_name: eventName,
+      experiment_name: CONFIG.experimentName,
+      experiment_group: variant === "variant" ? "experiment" : "control",
+      variant: variant,
+      visitor_id: visitorId,
+      session_id: sessionId,
+      shop_domain: CONFIG.shopDomain,
+      page_location: window.location.href,
+      page_path: window.location.pathname,
+      page_type: CONFIG.pageType,
+      timestamp: nowIso(),
+      extra: extra || {}
+    };
+  }
+
+  function buildDataLayerEvent(payload) {
+    return {
+      event: payload.event_name,
+      event_name: payload.event_name,
+      experiment_name: payload.experiment_name,
+      experiment_group: payload.experiment_group,
+      variant: payload.variant,
+      visitor_id: payload.visitor_id,
+      session_id: payload.session_id,
+      shop_domain: payload.shop_domain,
+      page_location: payload.page_location,
+      page_path: payload.page_path,
+      page_type: payload.page_type,
+      timestamp: payload.timestamp,
+      extra: payload.extra
+    };
+  }
+
+  function pushDataLayer(payload) {
+    try {
+      window.dataLayer = window.dataLayer || [];
+      window.dataLayer.push(buildDataLayerEvent(payload));
+    } catch (e) {
+      warn("dataLayer push failed", e);
+    }
+  }
+
+  function trackGA4Event(payload) {
+    try {
+      if (typeof window.gtag !== "function") return;
+
+      window.gtag("event", payload.event_name, {
+        experiment_name: payload.experiment_name,
+        experiment_group: payload.experiment_group,
+        variant: payload.variant,
+        visitor_id: payload.visitor_id,
+        session_id: payload.session_id,
+        shop_domain: payload.shop_domain,
+        page_location: payload.page_location,
+        page_path: payload.page_path,
+        page_type: payload.page_type,
+        timestamp: payload.timestamp
+      });
+    } catch (e) {
+      warn("GA4 event failed", e);
+    }
+  }
+
+  function maybeTriggerBehavioralUi(eventType) {
+    if (!window.tidioChatApi) {
+      log("tidioChatApi not ready for", eventType);
+      return;
+    }
+
+    var messages = {
+      product_page_view: "Still looking? I can help find the right product.",
+      add_to_cart_click: "Great choice. Need help before checkout?",
+      begin_checkout_click: "Questions before you finish checkout?"
+    };
+
+    var message = messages[eventType];
+    if (!message) return;
+
+    var dedup = CONFIG.uiPrefix + ":" + eventType;
+    if (hasSeenEvent(dedup)) return;
+    markSeenEvent(dedup);
+
+    try {
+      if (typeof window.tidioChatApi.show === "function") {
+        window.tidioChatApi.show();
+      }
+      if (typeof window.tidioChatApi.messageFromOperator === "function") {
+        window.tidioChatApi.messageFromOperator(message);
+      }
+      log("Triggered UI for", eventType);
+    } catch (e) {
+      warn("Failed to trigger UI", e);
+    }
+  }
+
+  function trackEvent(eventName, extra) {
+    var sessionId = getSessionId();
+    var visitorId = getVisitorId();
+
+    if (!assignmentReady) {
+      log("Skipped event before assignment was ready:", eventName);
+      return;
+    }
+
+    var variant = getStoredVariant();
+    if (variant !== "control" && variant !== "variant") {
+      warn("No stored variant when trying to send event:", eventName);
+      return;
+    }
+
+    var payload = buildPayload(eventName, variant, visitorId, sessionId, extra);
+
+    pushDataLayer(payload);
+    trackGA4Event(payload);
+
+    postJson("/api/events", {
+      shop_domain: payload.shop_domain,
+      session_id: payload.session_id,
+      visitor_id: payload.visitor_id,
+      variant: payload.variant,
+      experiment_name: payload.experiment_name,
+      event_type: payload.event_name,
+      page_type: payload.page_type,
+      page_url: payload.page_location,
+      occurred_at: payload.timestamp,
+      value: extra && typeof extra.value === "number" ? extra.value : 0,
+      extra: payload.extra
+    })
+    .then(function () {
+      log("Sent event:", eventName, variant);
+    })
+    .catch(function (err) {
+      warn("Event send failed:", eventName, err);
+    });
+
+    if (variant === "variant") {
+      maybeTriggerBehavioralUi(eventName);
+    }
+  }
+
+  function isProductPage() {
+    return CONFIG.pageType === "product" || window.location.pathname.indexOf("/products/") === 0;
+  }
+
+  function isAddToCartTarget(target) {
+    if (!target || !target.closest) return false;
+
+    var form = target.closest('form[action*="/cart/add"]');
+    if (form) return true;
+
+    var el = target.closest('button, input[type="submit"], input[type="button"], a');
+    if (!el) return false;
+
+    var text = String(
+      (el.textContent || "") + " " +
+      (el.value || "") + " " +
+      (el.getAttribute("name") || "") + " " +
+      (el.getAttribute("aria-label") || "") + " " +
+      (el.id || "") + " " +
+      (typeof el.className === "string" ? el.className : "")
+    ).toLowerCase();
+
+    return (
+      text.indexOf("add to cart") !== -1 ||
+      text.indexOf("add-to-cart") !== -1 ||
+      text.indexOf("add to bag") !== -1 ||
+      text.indexOf("buy now") !== -1
+    );
+  }
+
+  function isBeginCheckoutTarget(target) {
+    if (!target || !target.closest) return false;
+
+    var form = target.closest('form[action*="/checkout"]');
+    if (form) return true;
+
+    var link = target.closest('a[href*="/checkout"], button[name="checkout"], input[name="checkout"]');
+    if (link) return true;
+
+    var el = target.closest('button, input[type="submit"], input[type="button"], a');
+    if (!el) return false;
+
+    var text = String(
+      (el.textContent || "") + " " +
+      (el.value || "") + " " +
+      (el.getAttribute("name") || "") + " " +
+      (el.getAttribute("aria-label") || "") + " " +
+      (el.id || "") + " " +
+      (typeof el.className === "string" ? el.className : "")
+    ).toLowerCase();
+
+    return (
+      text.indexOf("checkout") !== -1 ||
+      text.indexOf("check out") !== -1 ||
+      text.indexOf("secure checkout") !== -1
+    );
+  }
+
+  function bindEventTracking() {
+    if (clickTrackingBound) return;
+    clickTrackingBound = true;
+
+    document.addEventListener("submit", function (event) {
+      try {
+        var form = event.target;
+        if (!form || !form.matches) return;
+
+        if (form.matches('form[action*="/cart/add"]')) {
+          var formData = null;
+          var variantId = null;
+          var quantity = null;
+
+          try {
+            formData = new FormData(form);
+            variantId = formData.get("id");
+            quantity = formData.get("quantity");
+          } catch (e) {}
+
+          var sig = "add_to_cart_submit:" + window.location.pathname + ":" + (variantId || "");
+          if (hasSeenEvent(sig)) return;
+          markSeenEvent(sig);
+
+          trackEvent("add_to_cart", {
+            method: "form_submit",
+            form_action: form.action || null,
+            variant_id: variantId || null,
+            quantity: quantity || null
+          });
+        }
+      } catch (e) {
+        warn("Submit tracking error", e);
+      }
+    }, true);
+
+    document.addEventListener("click", function (event) {
+      try {
+        var target = event.target;
+
+        if (isAddToCartTarget(target)) {
+          var addSig = "add_to_cart_click:" + window.location.pathname;
+          if (!hasSeenEvent(addSig)) {
+            markSeenEvent(addSig);
+            trackEvent("add_to_cart_click", {});
+          }
+        }
+
+        if (isBeginCheckoutTarget(target)) {
+          var checkoutSig = "begin_checkout_click:" + window.location.pathname;
+          if (!hasSeenEvent(checkoutSig)) {
+            markSeenEvent(checkoutSig);
+            trackEvent("begin_checkout_click", {});
+          }
+        }
+      } catch (e) {
+        warn("Click tracking error", e);
+      }
+    }, true);
+  }
+
+  function trackPageEvents() {
+    var pageSig = "page_view:" + window.location.pathname;
+    if (!hasSeenEvent(pageSig)) {
+      markSeenEvent(pageSig);
+      trackEvent("page_view", {});
+    }
+
+    if (isProductPage()) {
+      var productSig = "product_page_view:" + window.location.pathname;
+      if (!hasSeenEvent(productSig)) {
+        markSeenEvent(productSig);
+        trackEvent("product_page_view", {});
+      }
+    }
+
+    if (CONFIG.pageType === "checkout" || window.location.pathname.indexOf("/checkouts/") !== -1) {
+      var checkoutSig = "checkout_page_view:" + window.location.pathname;
+      if (!hasSeenEvent(checkoutSig)) {
+        markSeenEvent(checkoutSig);
+        trackEvent("checkout_page_view", {});
+      }
+    }
+  }
+
+  function trackPurchaseIfAvailable() {
+    var checkoutData = null;
+
+    try {
+      if (window.Shopify && window.Shopify.checkout) {
+        checkoutData = window.Shopify.checkout;
+      } else if (window.Shopify && window.Shopify.Checkout) {
+        checkoutData = window.Shopify.Checkout;
+      }
+    } catch (e) {}
+
+    if (!checkoutData) return;
+
+    var orderId = checkoutData.order_id || checkoutData.orderId || checkoutData.token;
+    var isThankYouPage =
+      window.location.pathname.indexOf("/checkouts/") !== -1 ||
+      window.location.pathname.indexOf("/thank_you") !== -1 ||
+      !!checkoutData.order_id;
+
+    if (!orderId || !isThankYouPage) return;
+
+    var purchaseSig = CONFIG.purchasePrefix + ":" + orderId;
+    if (hasSeenEvent(purchaseSig)) return;
+    markSeenEvent(purchaseSig);
+
+    var rawValue = checkoutData.total_price || checkoutData.totalPrice || checkoutData.payment_due || 0;
+    var value = Number(rawValue) || 0;
+
+    trackEvent("purchase", {
+      order_id: orderId,
+      value: value
+    });
+  }
+
+  function init() {
+    log("Init start");
+    log("Backend base:", CONFIG.backendBase);
+
+    ensureGTM(CONFIG.gtmId);
+    ensureGA4(CONFIG.ga4Id);
+
+    var sessionId = getSessionId();
+
+    ensureVariant(sessionId).then(function (variant) {
+      log("Resolved variant:", variant);
+      trackEvent("experiment_assignment", {
+        assigned_at: nowIso()
+      });
+      trackPageEvents();
+      bindEventTracking();
+      trackPurchaseIfAvailable();
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init, { once: true });
+  } else {
+    setTimeout(init, 0);
+  }
+})();
