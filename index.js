@@ -3,6 +3,7 @@ import express from 'express'
 import cors from 'cors'
 import crypto from 'crypto'
 import { createClient } from '@supabase/supabase-js'
+import { getTriggerConversionRates } from './packages/analytics/src/index.js'
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -39,6 +40,7 @@ app.options('/api/stores', cors(corsOptions))
 app.options('/api/metrics/:shop_domain', cors(corsOptions))
 app.options('/api/debug/:shop_domain', cors(corsOptions))
 app.options('/api/embedded-check', cors(corsOptions))
+app.options('/api/analytics/conversion-rates/:shop_domain', cors(corsOptions))
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -355,6 +357,51 @@ app.get('/api/embedded-check', requireShopifySessionToken, async (req, res) => {
   })
 })
 
+app.get(
+  '/api/analytics/conversion-rates/:shop_domain',
+  requireShopifySessionToken,
+  async (req, res) => {
+    try {
+      const shopDomain = normalizeShop(req.params.shop_domain)
+
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      const filters = {
+        shopDomain
+      }
+
+      if (req.query.since) {
+        filters.since = req.query.since
+      }
+
+      if (req.query.until) {
+        filters.until = req.query.until
+      }
+
+      const conversionRates = await getTriggerConversionRates(filters)
+
+      return res.json({
+        success: true,
+        data: {
+          shop_domain: shopDomain,
+          conversion_rates: conversionRates
+        }
+      })
+    } catch (error) {
+      console.log('ANALYTICS CONVERSION ROUTE ERROR:', error)
+      return res.status(500).json({
+        success: false,
+        error: String(error.message || error)
+      })
+    }
+  }
+)
+
 app.get('/api/metrics/:shop_domain', requireShopifySessionToken, async (req, res) => {
   try {
     const { shop_domain } = req.params
@@ -537,6 +584,11 @@ app.get('/dashboard', (req, res) => {
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 14px;
     }
+    .analytics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+    }
     .stat { background: #f9fafb; border-radius: 12px; padding: 14px; }
     .label { font-size: 13px; color: #6b7280; margin-bottom: 6px; }
     .value { font-size: 28px; font-weight: 700; line-height: 1.1; }
@@ -552,6 +604,11 @@ app.get('/dashboard', (req, res) => {
       margin-bottom: 10px;
     }
     .instructions ol { margin: 12px 0 0 18px; padding: 0; line-height: 1.7; }
+    .analytics-empty {
+      color: #6b7280;
+      font-size: 14px;
+      line-height: 1.5;
+    }
     pre {
       margin: 0;
       white-space: pre-wrap;
@@ -640,6 +697,19 @@ app.get('/dashboard', (req, res) => {
       <h2>Debug JSON</h2>
       <pre id="metrics-json">Loading...</pre>
     </div>
+
+    <div class="card">
+      <div class="pill">Private Analytics</div>
+      <h2>Trigger Conversion Rates</h2>
+      <div class="muted" style="margin-bottom: 16px;">
+        Visible only after the embedded Shopify session token is validated for this store.
+      </div>
+      <div class="analytics-grid" id="analytics-rates-grid">
+        <div class="analytics-empty" id="analytics-empty-state">
+          Waiting for secure analytics data...
+        </div>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -666,6 +736,39 @@ app.get('/dashboard', (req, res) => {
     function formatPercent(value) {
       const num = Number(value || 0) * 100;
       return num.toFixed(1) + '%';
+    }
+
+    function renderAnalyticsRates(items) {
+      const container = document.getElementById('analytics-rates-grid');
+      if (!container) return;
+
+      if (!Array.isArray(items) || items.length === 0) {
+        container.innerHTML =
+          '<div class="analytics-empty">No trigger analytics recorded for this store yet.</div>';
+        return;
+      }
+
+      container.innerHTML = items
+        .map(item => {
+          const triggerType = String(item.triggerType || 'unknown');
+          const triggerCount = Number(item.triggerCount || 0);
+          const checkoutCount = Number(item.checkoutCount || 0);
+          const conversionRate = formatPercent(item.conversionRate || 0);
+
+          return [
+            '<div class="stat">',
+            '<div class="label">Trigger Type</div>',
+            '<div class="value small">' + triggerType + '</div>',
+            '<div class="label" style="margin-top: 14px;">Triggers Fired</div>',
+            '<div class="value small">' + String(triggerCount) + '</div>',
+            '<div class="label" style="margin-top: 14px;">Completed Checkouts</div>',
+            '<div class="value small">' + String(checkoutCount) + '</div>',
+            '<div class="label" style="margin-top: 14px;">Conversion Rate</div>',
+            '<div class="value small">' + conversionRate + '</div>',
+            '</div>'
+          ].join('');
+        })
+        .join('');
     }
 
     function withTimeout(promise, ms, label) {
@@ -804,12 +907,36 @@ app.get('/dashboard', (req, res) => {
       }
     }
 
+    async function loadAnalyticsRates() {
+      try {
+        const response = await authedFetch(
+          '/api/analytics/conversion-rates/' +
+            encodeURIComponent(shopDomain) +
+            '?shop=' +
+            encodeURIComponent(shopDomain),
+          { method: 'GET' }
+        );
+
+        const json = await response.json();
+
+        if (!response.ok || !json.success || !json.data) {
+          throw new Error(json.error || 'Analytics response missing data');
+        }
+
+        renderAnalyticsRates(json.data.conversion_rates || []);
+      } catch (error) {
+        console.error('Analytics rates error:', error);
+        renderAnalyticsRates([]);
+      }
+    }
+
     async function boot() {
       const authOk = await verifyEmbeddedAuth();
       if (authOk) {
-        await loadMetrics();
+        await Promise.all([loadMetrics(), loadAnalyticsRates()]);
       } else {
         setStatus('status-text', 'Blocked by auth', 'error');
+        renderAnalyticsRates([]);
       }
     }
 

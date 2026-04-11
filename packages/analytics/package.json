@@ -1,0 +1,11 @@
+{
+  "name": "@behavioral-pro/analytics",
+  "version": "1.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  }
+}

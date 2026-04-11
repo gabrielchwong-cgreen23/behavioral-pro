@@ -8,4 +8,4 @@ build/
 coverage/
 .tmp/
 .cache/
-*.log
+*.log.env
