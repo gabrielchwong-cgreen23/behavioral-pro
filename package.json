@@ -4,7 +4,7 @@
   "license": "UNLICENSED",
   "scripts": {
     "shopify": "shopify",
-    "build": "shopify app build",
+    "build": "echo \"no build step\"",
     "dev": "shopify app dev",
     "info": "shopify app info",
     "generate": "shopify app generate",
