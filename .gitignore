@@ -9,3 +9,5 @@ coverage/
 .tmp/
 .cache/
 *.log.env
+.env
+node_modules

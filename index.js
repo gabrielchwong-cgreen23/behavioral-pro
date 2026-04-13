@@ -4,12 +4,14 @@ import cors from 'cors'
 import crypto from 'crypto'
 import { createClient } from '@supabase/supabase-js'
 import { getTriggerConversionRates } from './packages/analytics/src/index.js'
+import { registerOwnerAnalyticsRoutes } from './packages/owner-analytics/src/index.js'
 
 const app = express()
 const PORT = process.env.PORT || 3001
 
 const SHOPIFY_API_KEY = process.env.SHOPIFY_API_KEY
 const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET
+const ANALYTICS_OWNER_TOKEN = process.env.ANALYTICS_OWNER_TOKEN
 
 if (!SHOPIFY_API_KEY) {
   console.warn('Missing SHOPIFY_API_KEY')
@@ -46,6 +48,12 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
+
+registerOwnerAnalyticsRoutes({
+  app,
+  supabase,
+  ownerToken: ANALYTICS_OWNER_TOKEN
+})
 
 function normalizeShop(shop) {
   if (!shop || typeof shop !== 'string') return null
