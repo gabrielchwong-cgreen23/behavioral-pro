@@ -5,8 +5,7 @@ import { fileURLToPath } from 'node:url'
 const packageDirectory = path.dirname(fileURLToPath(import.meta.url))
 const defaultDataDirectory = path.resolve(packageDirectory, '../data')
 
-const TRIGGERS_FILE = 'triggers.json'
-const CHECKOUTS_FILE = 'checkouts.json'
+const SESSION_CRO_FILE = 'session-cro.json'
 
 function getDataDirectory(options = {}) {
   return options.dataDirectory || process.env.ANALYTICS_DATA_DIRECTORY || defaultDataDirectory
@@ -76,83 +75,183 @@ function normalizeTimestamp(value, fallback = new Date()) {
   return date.toISOString()
 }
 
-function normalizeMetadata(value) {
-  if (value == null) return {}
+function normalizeVariant(value) {
+  if (value == null) return 'control'
+  const normalized = String(value).trim().toLowerCase()
 
-  if (typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('metadata must be an object')
+  if (normalized !== 'control' && normalized !== 'variant') {
+    throw new Error('variant must be either "control" or "variant"')
+  }
+
+  return normalized
+}
+
+function normalizeRevenue(value) {
+  if (value == null) return 0
+  const normalized = Number(value)
+
+  if (Number.isNaN(normalized)) {
+    throw new Error('revenue must be a number')
+  }
+
+  return normalized
+}
+
+function normalizeStringArray(value, fieldName) {
+  if (value == null) return []
+  if (!Array.isArray(value)) {
+    throw new Error(`${fieldName} must be an array`)
   }
 
   return value
+    .map(item => normalizeOptionalString(item))
+    .filter(Boolean)
 }
 
-function createRecordId(prefix) {
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+function getTriggerType(input) {
+  return normalizeRequiredString(
+    input?.triggerType || input?.trigger_type,
+    'triggerType'
+  )
 }
 
-function buildTriggerMatchKey(record) {
-  return record.sessionId || record.triggerId || record.id
+function getMessageName(input) {
+  return normalizeRequiredString(
+    input?.messageName || input?.message_name || input?.triggerType || input?.trigger_type,
+    'messageName'
+  )
 }
 
-function buildCheckoutMatchKey(record) {
-  return record.sessionId || record.triggerId || null
+function matchesWindow(timestamp, since, until) {
+  const date = new Date(timestamp)
+  if (since && date < since) return false
+  if (until && date > until) return false
+  return true
+}
+
+function createEmptySessionRecord(input = {}) {
+  return {
+    session_id: normalizeRequiredString(input.sessionId || input.session_id, 'sessionId'),
+    shop_domain: normalizeRequiredString(input.shopDomain || input.shop_domain, 'shopDomain'),
+    variant: normalizeVariant(input.variant),
+    triggers_fired: normalizeStringArray(input.triggers_fired, 'triggers_fired'),
+    messages_shown: normalizeStringArray(input.messages_shown, 'messages_shown'),
+    converted: Boolean(input.converted),
+    revenue: normalizeRevenue(input.revenue),
+    started_at: normalizeTimestamp(input.startedAt || input.started_at),
+    ended_at: input.endedAt || input.ended_at
+      ? normalizeTimestamp(input.endedAt || input.ended_at)
+      : null
+  }
+}
+
+async function readSessionTable(options = {}) {
+  const records = await readRecords(SESSION_CRO_FILE, options)
+  return records.map(record => ({
+    session_id: normalizeRequiredString(record.session_id, 'session_id'),
+    shop_domain: normalizeRequiredString(record.shop_domain, 'shop_domain'),
+    variant: normalizeVariant(record.variant),
+    triggers_fired: normalizeStringArray(record.triggers_fired, 'triggers_fired'),
+    messages_shown: normalizeStringArray(record.messages_shown, 'messages_shown'),
+    converted: Boolean(record.converted),
+    revenue: normalizeRevenue(record.revenue),
+    started_at: normalizeTimestamp(record.started_at),
+    ended_at: record.ended_at ? normalizeTimestamp(record.ended_at) : null
+  }))
+}
+
+async function writeSessionTable(records, options = {}) {
+  await writeRecords(SESSION_CRO_FILE, records, options)
+}
+
+async function upsertSessionRecord(input, options = {}, updateRecord) {
+  const sessionId = normalizeRequiredString(input.sessionId || input.session_id, 'sessionId')
+  const shopDomain = normalizeRequiredString(input.shopDomain || input.shop_domain, 'shopDomain')
+  const records = await readSessionTable(options)
+
+  const existingIndex = records.findIndex(record =>
+    record.session_id === sessionId && record.shop_domain === shopDomain
+  )
+
+  const existingRecord = existingIndex >= 0
+    ? records[existingIndex]
+    : createEmptySessionRecord(input)
+
+  const nextRecord = updateRecord(existingRecord)
+
+  if (existingIndex >= 0) {
+    records[existingIndex] = nextRecord
+  } else {
+    records.push(nextRecord)
+  }
+
+  await writeSessionTable(records, options)
+  return nextRecord
 }
 
 export async function trackTrigger(input, options = {}) {
-  const record = {
-    id: createRecordId('trigger'),
-    triggerType: normalizeRequiredString(input?.triggerType, 'triggerType'),
-    sessionId: normalizeOptionalString(input?.sessionId),
-    triggerId: normalizeOptionalString(input?.triggerId),
-    shopDomain: normalizeOptionalString(input?.shopDomain),
-    userId: normalizeOptionalString(input?.userId),
-    firedAt: normalizeTimestamp(input?.firedAt),
-    metadata: normalizeMetadata(input?.metadata)
-  }
+  const triggerType = getTriggerType(input)
 
-  const triggers = await readRecords(TRIGGERS_FILE, options)
-  triggers.push(record)
-  await writeRecords(TRIGGERS_FILE, triggers, options)
+  return upsertSessionRecord(input, options, record => ({
+    ...record,
+    variant: input.variant == null ? record.variant : normalizeVariant(input.variant),
+    started_at: input.startedAt || input.started_at
+      ? normalizeTimestamp(input.startedAt || input.started_at)
+      : record.started_at,
+    ended_at: input.endedAt || input.ended_at
+      ? normalizeTimestamp(input.endedAt || input.ended_at)
+      : record.ended_at,
+    triggers_fired: [...record.triggers_fired, triggerType]
+  }))
+}
 
-  return record
+export async function trackMessageShown(input, options = {}) {
+  const messageName = getMessageName(input)
+
+  return upsertSessionRecord(input, options, record => ({
+    ...record,
+    variant: input.variant == null ? record.variant : normalizeVariant(input.variant),
+    started_at: input.startedAt || input.started_at
+      ? normalizeTimestamp(input.startedAt || input.started_at)
+      : record.started_at,
+    ended_at: input.endedAt || input.ended_at
+      ? normalizeTimestamp(input.endedAt || input.ended_at)
+      : record.ended_at,
+    messages_shown: [...record.messages_shown, messageName]
+  }))
 }
 
 export async function trackCheckoutCompleted(input, options = {}) {
-  const record = {
-    id: createRecordId('checkout'),
-    triggerType: normalizeOptionalString(input?.triggerType),
-    sessionId: normalizeOptionalString(input?.sessionId),
-    triggerId: normalizeOptionalString(input?.triggerId),
-    shopDomain: normalizeOptionalString(input?.shopDomain),
-    orderId: normalizeOptionalString(input?.orderId),
-    userId: normalizeOptionalString(input?.userId),
-    checkoutValue: input?.checkoutValue == null ? null : Number(input.checkoutValue),
-    completedAt: normalizeTimestamp(input?.completedAt),
-    metadata: normalizeMetadata(input?.metadata)
-  }
-
-  if (record.checkoutValue != null && Number.isNaN(record.checkoutValue)) {
-    throw new Error('checkoutValue must be a number when provided')
-  }
-
-  if (!record.sessionId && !record.triggerId && !record.triggerType) {
-    throw new Error('checkoutCompleted requires sessionId, triggerId, or triggerType')
-  }
-
-  const checkouts = await readRecords(CHECKOUTS_FILE, options)
-  checkouts.push(record)
-  await writeRecords(CHECKOUTS_FILE, checkouts, options)
-
-  return record
+  return upsertSessionRecord(input, options, record => ({
+    ...record,
+    variant: input.variant == null ? record.variant : normalizeVariant(input.variant),
+    converted: true,
+    revenue: normalizeRevenue(
+      input.checkoutValue ??
+      input.checkout_value ??
+      input.revenue ??
+      record.revenue
+    ),
+    ended_at: normalizeTimestamp(
+      input.completedAt ||
+      input.completed_at ||
+      input.endedAt ||
+      input.ended_at
+    )
+  }))
 }
 
-export async function getTriggerConversionRates(filters = {}, options = {}) {
-  const [triggers, checkouts] = await Promise.all([
-    readRecords(TRIGGERS_FILE, options),
-    readRecords(CHECKOUTS_FILE, options)
-  ])
+export async function endSession(input, options = {}) {
+  return upsertSessionRecord(input, options, record => ({
+    ...record,
+    variant: input.variant == null ? record.variant : normalizeVariant(input.variant),
+    ended_at: normalizeTimestamp(input.endedAt || input.ended_at)
+  }))
+}
 
-  const normalizedShopDomain = normalizeOptionalString(filters.shopDomain)
+export async function getSessionCROTable(filters = {}, options = {}) {
+  const records = await readSessionTable(options)
+  const shopDomain = normalizeOptionalString(filters.shopDomain || filters.shop_domain)
   const since = filters.since ? new Date(filters.since) : null
   const until = filters.until ? new Date(filters.until) : null
 
@@ -164,100 +263,61 @@ export async function getTriggerConversionRates(filters = {}, options = {}) {
     throw new Error('Invalid until timestamp')
   }
 
-  const filteredTriggers = triggers.filter(record => {
-    if (normalizedShopDomain && record.shopDomain !== normalizedShopDomain) return false
-
-    const firedAt = new Date(record.firedAt)
-    if (since && firedAt < since) return false
-    if (until && firedAt > until) return false
-
-    return true
+  return records.filter(record => {
+    if (shopDomain && record.shop_domain !== shopDomain) return false
+    return matchesWindow(record.started_at, since, until)
   })
+}
 
-  const filteredCheckouts = checkouts.filter(record => {
-    if (normalizedShopDomain && record.shopDomain !== normalizedShopDomain) return false
-
-    const completedAt = new Date(record.completedAt)
-    if (since && completedAt < since) return false
-    if (until && completedAt > until) return false
-
-    return true
-  })
-
+export async function getTriggerConversionRates(filters = {}, options = {}) {
+  const sessions = await getSessionCROTable(filters, options)
   const ratesByTriggerType = new Map()
 
-  for (const trigger of filteredTriggers) {
-    const key = trigger.triggerType
+  for (const session of sessions) {
+    const uniqueTriggerTypes = [...new Set(session.triggers_fired)]
 
-    if (!ratesByTriggerType.has(key)) {
-      ratesByTriggerType.set(key, {
-        triggerType: key,
-        triggerCount: 0,
-        triggeredSessions: new Set(),
-        convertedSessions: new Set(),
-        checkoutCount: 0
-      })
-    }
-
-    const group = ratesByTriggerType.get(key)
-    group.triggerCount += 1
-    group.triggeredSessions.add(buildTriggerMatchKey(trigger))
-  }
-
-  for (const checkout of filteredCheckouts) {
-    const directTriggerType = checkout.triggerType
-    const checkoutMatchKey = buildCheckoutMatchKey(checkout)
-
-    if (directTriggerType && ratesByTriggerType.has(directTriggerType)) {
-      const group = ratesByTriggerType.get(directTriggerType)
-      group.checkoutCount += 1
-
-      if (checkoutMatchKey) {
-        group.convertedSessions.add(checkoutMatchKey)
+    for (const triggerType of uniqueTriggerTypes) {
+      if (!ratesByTriggerType.has(triggerType)) {
+        ratesByTriggerType.set(triggerType, {
+          triggerType,
+          triggerCount: 0,
+          triggeredSessionCount: 0,
+          checkoutCount: 0,
+          convertedSessionCount: 0,
+          revenue: 0
+        })
       }
-    }
 
-    if (!checkoutMatchKey) {
-      continue
-    }
+      const group = ratesByTriggerType.get(triggerType)
+      group.triggerCount += session.triggers_fired.filter(item => item === triggerType).length
+      group.triggeredSessionCount += 1
 
-    for (const group of ratesByTriggerType.values()) {
-      if (group.triggeredSessions.has(checkoutMatchKey)) {
-        group.convertedSessions.add(checkoutMatchKey)
-        group.checkoutCount += directTriggerType === group.triggerType ? 0 : 1
+      if (session.converted) {
+        group.checkoutCount += 1
+        group.convertedSessionCount += 1
+        group.revenue += Number(session.revenue || 0)
       }
     }
   }
 
   return Array.from(ratesByTriggerType.values())
     .sort((left, right) => left.triggerType.localeCompare(right.triggerType))
-    .map(group => {
-      const triggeredSessionCount = group.triggeredSessions.size
-      const convertedSessionCount = group.convertedSessions.size
-
-      return {
-        triggerType: group.triggerType,
-        triggerCount: group.triggerCount,
-        triggeredSessionCount,
-        checkoutCount: group.checkoutCount,
-        convertedSessionCount,
-        conversionRate: triggeredSessionCount === 0
-          ? 0
-          : convertedSessionCount / triggeredSessionCount
-      }
-    })
+    .map(group => ({
+      ...group,
+      conversionRate: group.triggeredSessionCount === 0
+        ? 0
+        : group.convertedSessionCount / group.triggeredSessionCount
+    }))
 }
 
 export async function getAnalyticsSnapshot(filters = {}, options = {}) {
-  const [triggers, checkouts, conversionRates] = await Promise.all([
-    readRecords(TRIGGERS_FILE, options),
-    readRecords(CHECKOUTS_FILE, options),
+  const [sessionTable, conversionRates] = await Promise.all([
+    getSessionCROTable(filters, options),
     getTriggerConversionRates(filters, options)
   ])
 
   return {
-    triggers,
-    checkouts,
+    sessionTable,
     conversionRates
   }
 }

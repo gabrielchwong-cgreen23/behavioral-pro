@@ -1,4 +1,7 @@
-import { getTriggerConversionRates } from '@behavioral-pro/analytics'
+import {
+  getSessionCROTable,
+  getTriggerConversionRates
+} from '@behavioral-pro/analytics'
 
 function getOwnerToken(req) {
   const headerToken = req.headers['x-analytics-token']
@@ -114,6 +117,14 @@ function buildOwnerAnalyticsPage(token) {
       font-weight: 600;
       margin-bottom: 12px;
     }
+    .link {
+      color: #93c5fd;
+      text-decoration: none;
+      font-size: 14px;
+    }
+    .link:hover {
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
@@ -128,6 +139,7 @@ function buildOwnerAnalyticsPage(token) {
         <button id="refresh-button">Refresh</button>
         <span class="muted" id="status-text">Loading stores...</span>
       </div>
+      <a class="link" id="raw-json-link" href="#">Open raw session JSON</a>
     </div>
 
     <div class="card">
@@ -181,6 +193,18 @@ function buildOwnerAnalyticsPage(token) {
       }).join('');
     }
 
+    function updateRawJsonLink() {
+      const select = document.getElementById('store-select');
+      const link = document.getElementById('raw-json-link');
+      if (!select || !link || !select.value) return;
+
+      link.href =
+        '/owner-analytics/raw/' +
+        encodeURIComponent(select.value) +
+        '?token=' +
+        encodeURIComponent(token);
+    }
+
     async function fetchJson(url) {
       const response = await fetch(url, {
         headers: {
@@ -214,6 +238,7 @@ function buildOwnerAnalyticsPage(token) {
         setStatus('No stores found', true);
       } else {
         setStatus('Ready');
+        updateRawJsonLink();
       }
 
       return stores;
@@ -231,6 +256,7 @@ function buildOwnerAnalyticsPage(token) {
         '/api/owner/analytics/conversion-rates/' + encodeURIComponent(select.value)
       );
       renderRates(data.conversion_rates || []);
+      updateRawJsonLink();
       setStatus('Ready');
     }
 
@@ -245,7 +271,10 @@ function buildOwnerAnalyticsPage(token) {
     }
 
     document.getElementById('refresh-button').addEventListener('click', loadRatesForSelectedStore);
-    document.getElementById('store-select').addEventListener('change', loadRatesForSelectedStore);
+    document.getElementById('store-select').addEventListener('change', async () => {
+      updateRawJsonLink();
+      await loadRatesForSelectedStore();
+    });
 
     boot();
   </script>
@@ -318,6 +347,74 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken }) {
           success: false,
           error: String(error.message || error)
         })
+      }
+    }
+  )
+
+  app.get(
+    '/api/owner/session-cro/:shop_domain',
+    requireOwner,
+    async (req, res) => {
+      try {
+        const shopDomain = req.params.shop_domain
+
+        if (!shopDomain) {
+          return res.status(400).json({
+            success: false,
+            error: 'shop_domain is required'
+          })
+        }
+
+        const sessionTable = await getSessionCROTable({
+          shopDomain
+        })
+
+        return res.json({
+          success: true,
+          data: {
+            shop_domain: shopDomain,
+            session_cro: sessionTable
+          }
+        })
+      } catch (error) {
+        console.log('OWNER SESSION CRO ROUTE ERROR:', error)
+        return res.status(500).json({
+          success: false,
+          error: String(error.message || error)
+        })
+      }
+    }
+  )
+
+  app.get(
+    '/owner-analytics/raw/:shop_domain',
+    requireOwner,
+    async (req, res) => {
+      try {
+        const shopDomain = req.params.shop_domain
+
+        if (!shopDomain) {
+          return res.status(400).send('shop_domain is required')
+        }
+
+        const sessionTable = await getSessionCROTable({
+          shopDomain
+        })
+
+        res.type('application/json')
+        return res.send(
+          `${JSON.stringify(
+            {
+              shop_domain: shopDomain,
+              session_cro: sessionTable
+            },
+            null,
+            2
+          )}\n`
+        )
+      } catch (error) {
+        console.log('OWNER RAW SESSION CRO PAGE ERROR:', error)
+        return res.status(500).send(String(error.message || error))
       }
     }
   )
