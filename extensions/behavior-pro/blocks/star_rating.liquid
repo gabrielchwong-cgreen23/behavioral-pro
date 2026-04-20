@@ -36,6 +36,11 @@
     debug: {{ block.settings.debug_mode | json }},
     shopDomain: {{ shop.domain | json }},
     pageType: {{ request.page_type | json }},
+    templateName: {{ template.name | json }},
+    currency: {{ shop.currency | json }},
+    productId: {{ product.id | json }},
+    productHandle: {{ product.handle | json }},
+    cartValue: {{ cart.total_price | divided_by: 100.0 | json }},
 
     gtmId: "GTM-3H5SLT7T",
     ga4Id: "G-6TZYV1S6L9",
@@ -121,6 +126,14 @@
     return new Date().toISOString();
   }
 
+  function getQueryParam(name) {
+    try {
+      return new URL(window.location.href).searchParams.get(name);
+    } catch (e) {
+      return null;
+    }
+  }
+
   function createId(prefix) {
     try {
       if (window.crypto && typeof window.crypto.randomUUID === "function") {
@@ -129,6 +142,39 @@
     } catch (e) {}
 
     return prefix + "_" + Math.random().toString(36).slice(2) + "_" + Date.now();
+  }
+
+  function getDeviceType() {
+    var width = window.innerWidth || 0;
+    if (width && width < 768) return "mobile";
+    if (width && width < 1024) return "tablet";
+    return "desktop";
+  }
+
+  function getTrafficSource() {
+    var utmSource = getQueryParam("utm_source");
+    if (utmSource) return utmSource;
+
+    try {
+      if (document.referrer) {
+        return new URL(document.referrer).hostname || "referral";
+      }
+    } catch (e) {}
+
+    return "direct";
+  }
+
+  function getBaseEventContext() {
+    return {
+      referrer: document.referrer || null,
+      traffic_source: getTrafficSource(),
+      device_type: getDeviceType(),
+      product_id: CONFIG.productId || null,
+      product_handle: CONFIG.productHandle || null,
+      cart_value: typeof CONFIG.cartValue === "number" ? CONFIG.cartValue : null,
+      template_name: CONFIG.templateName || null,
+      currency: CONFIG.currency || null
+    };
   }
 
   function createSessionId() {
@@ -427,7 +473,11 @@
   }
 
   function buildPayload(eventName, variant, visitorId, sessionId, extra) {
+    var context = getBaseEventContext();
+    var metadata = Object.assign({}, context, extra || {});
+
     return {
+      event_id: createId("evt"),
       event_name: eventName,
       experiment_name: CONFIG.experimentName,
       experiment_group: variant === "variant" ? "experiment" : "control",
@@ -439,7 +489,13 @@
       page_path: window.location.pathname,
       page_type: CONFIG.pageType,
       timestamp: nowIso(),
-      extra: extra || {}
+      referrer: context.referrer,
+      traffic_source: context.traffic_source,
+      device_type: context.device_type,
+      product_id: context.product_id,
+      product_handle: context.product_handle,
+      cart_value: context.cart_value,
+      extra: metadata
     };
   }
 
@@ -453,6 +509,7 @@
       visitor_id: payload.visitor_id,
       session_id: payload.session_id,
       shop_domain: payload.shop_domain,
+      event_id: payload.event_id,
       page_location: payload.page_location,
       page_path: payload.page_path,
       page_type: payload.page_type,
@@ -481,6 +538,7 @@
         visitor_id: payload.visitor_id,
         session_id: payload.session_id,
         shop_domain: payload.shop_domain,
+        event_id: payload.event_id,
         page_location: payload.page_location,
         page_path: payload.page_path,
         page_type: payload.page_type,
@@ -517,6 +575,13 @@
       if (typeof window.tidioChatApi.messageFromOperator === "function") {
         window.tidioChatApi.messageFromOperator(message);
       }
+      trackEvent("message_shown", {
+        dedupe_key: dedup,
+        message_name: "tidio_" + eventType,
+        trigger_type: eventType,
+        reason: "tidio_behavioral_intercept",
+        message_copy: message
+      });
       log("Triggered UI for", eventType);
     } catch (e) {
       warn("Failed to trigger UI", e);
@@ -550,9 +615,21 @@
       variant: payload.variant,
       experiment_name: payload.experiment_name,
       event_type: payload.event_name,
+      event_id: payload.event_id,
+      dedupe_key: extra && extra.dedupe_key ? extra.dedupe_key : null,
       page_type: payload.page_type,
       page_url: payload.page_location,
+      page_path: payload.page_path,
+      referrer: payload.referrer,
+      traffic_source: payload.traffic_source,
+      device_type: payload.device_type,
+      product_id: payload.product_id,
+      product_handle: payload.product_handle,
+      cart_value: payload.cart_value,
       occurred_at: payload.timestamp,
+      trigger_type: extra && extra.trigger_type ? extra.trigger_type : null,
+      message_name: extra && extra.message_name ? extra.message_name : null,
+      reason: extra && extra.reason ? extra.reason : null,
       value: extra && typeof extra.value === "number" ? extra.value : 0,
       extra: payload.extra
     })
@@ -651,6 +728,7 @@
           markSeenEvent(sig);
 
           trackEvent("add_to_cart", {
+            dedupe_key: sig,
             method: "form_submit",
             form_action: form.action || null,
             variant_id: variantId || null,
@@ -670,7 +748,9 @@
           var addSig = "add_to_cart_click:" + window.location.pathname;
           if (!hasSeenEvent(addSig)) {
             markSeenEvent(addSig);
-            trackEvent("add_to_cart_click", {});
+            trackEvent("add_to_cart_click", {
+              dedupe_key: addSig
+            });
           }
         }
 
@@ -678,7 +758,9 @@
           var checkoutSig = "begin_checkout_click:" + window.location.pathname;
           if (!hasSeenEvent(checkoutSig)) {
             markSeenEvent(checkoutSig);
-            trackEvent("begin_checkout_click", {});
+            trackEvent("begin_checkout_click", {
+              dedupe_key: checkoutSig
+            });
           }
         }
       } catch (e) {
@@ -691,14 +773,19 @@
     var pageSig = "page_view:" + window.location.pathname;
     if (!hasSeenEvent(pageSig)) {
       markSeenEvent(pageSig);
-      trackEvent("page_view", {});
+      trackEvent("page_view", {
+        dedupe_key: pageSig
+      });
     }
 
     if (isProductPage()) {
       var productSig = "product_page_view:" + window.location.pathname;
       if (!hasSeenEvent(productSig)) {
         markSeenEvent(productSig);
-        trackEvent("product_page_view", {});
+        trackEvent("product_page_view", {
+          dedupe_key: productSig,
+          trigger_type: "product_page_view"
+        });
       }
     }
 
@@ -706,7 +793,9 @@
       var checkoutSig = "checkout_page_view:" + window.location.pathname;
       if (!hasSeenEvent(checkoutSig)) {
         markSeenEvent(checkoutSig);
-        trackEvent("checkout_page_view", {});
+        trackEvent("checkout_page_view", {
+          dedupe_key: checkoutSig
+        });
       }
     }
   }
@@ -740,8 +829,22 @@
     var value = Number(rawValue) || 0;
 
     trackEvent("purchase", {
+      dedupe_key: purchaseSig,
       order_id: orderId,
       value: value
+    });
+  }
+
+  function bindSessionEndTracking() {
+    window.addEventListener("pagehide", function () {
+      try {
+        trackEvent("session_ended", {
+          dedupe_key: "session_ended:" + window.location.pathname + ":" + Date.now(),
+          reason: "pagehide"
+        });
+      } catch (e) {
+        warn("Session end tracking error", e);
+      }
     });
   }
 
@@ -761,6 +864,7 @@
       });
       trackPageEvents();
       bindEventTracking();
+      bindSessionEndTracking();
       trackPurchaseIfAvailable();
     });
   }

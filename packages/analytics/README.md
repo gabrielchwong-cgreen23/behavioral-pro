@@ -6,14 +6,23 @@ Small file-backed analytics package for session-level trigger CRO tracking.
 
 ```js
 import {
+  trackSessionStarted,
   trackTrigger,
   trackMessageShown,
+  trackCheckoutStarted,
   trackCheckoutCompleted,
+  trackBehavioralEvent,
   endSession,
+  getAnalyticsOverview,
   getSessionCROTable,
+  getRawEventLog,
   getTriggerConversionRates
 } from '@behavioral-pro/analytics'
 ```
+
+### `trackSessionStarted(input, options?)`
+
+Creates or touches a session row when the experiment/session begins.
 
 ### `trackTrigger(input, options?)`
 
@@ -91,6 +100,15 @@ Returns the session-level JSON table with this shape:
 
 Returns conversion metrics per `triggerType`.
 
+### `getRawEventLog(filters?, options?)`
+
+Returns the append-only raw event stream for debugging and attribution.
+
+### `getAnalyticsOverview(filters?, options?)`
+
+Returns summary totals, the session CRO table, the raw event log, and trigger
+conversion rates together.
+
 ```js
 const metrics = await getTriggerConversionRates({
   shopDomain: 'example.myshopify.com'
@@ -102,6 +120,7 @@ const metrics = await getTriggerConversionRates({
 By default, records are written to:
 
 - `packages/analytics/data/session-cro.json`
+- `packages/analytics/data/raw-events.json`
 
 You can override the location with either:
 
@@ -114,9 +133,13 @@ Import the package from server-side code only, then call:
 
 - `trackTrigger(...)` wherever your trigger exposure actually fires
 - `trackMessageShown(...)` when a CRO message is actually rendered to the shopper
+- `trackCheckoutStarted(...)` when a checkout flow begins
 - `trackCheckoutCompleted(...)` when purchase/checkout is completed
+- `trackBehavioralEvent(...)` when you want one generic event ingestion entrypoint
 - `endSession(...)` when the session ends without conversion
 - `getSessionCROTable(...)` when you want the raw JSON table
+- `getRawEventLog(...)` when you want the raw append-only debug stream
+- `getAnalyticsOverview(...)` when you want all analytics objects together
 - `getTriggerConversionRates(...)` when you want aggregated conversion metrics
 
 Because it is a separate workspace package with JSON storage, it stays isolated

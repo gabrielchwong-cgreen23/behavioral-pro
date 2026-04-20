@@ -3,7 +3,11 @@ import express from 'express'
 import cors from 'cors'
 import crypto from 'crypto'
 import { createClient } from '@supabase/supabase-js'
-import { getTriggerConversionRates } from './packages/analytics/src/index.js'
+import {
+  getTriggerConversionRates,
+  trackBehavioralEvent,
+  trackSessionStarted
+} from './packages/analytics/src/index.js'
 import { registerOwnerAnalyticsRoutes } from './packages/owner-analytics/src/index.js'
 
 const app = express()
@@ -58,6 +62,21 @@ registerOwnerAnalyticsRoutes({
 function normalizeShop(shop) {
   if (!shop || typeof shop !== 'string') return null
   return shop.includes('.myshopify.com') ? shop : `${shop}.myshopify.com`
+}
+
+function getDeviceTypeFromUserAgent(userAgent) {
+  const value = String(userAgent || '').toLowerCase()
+  if (!value) return null
+  if (value.includes('ipad') || value.includes('tablet')) return 'tablet'
+  if (
+    value.includes('mobi') ||
+    value.includes('iphone') ||
+    value.includes('android')
+  ) {
+    return 'mobile'
+  }
+
+  return 'desktop'
 }
 
 function escapeHtml(value) {
@@ -252,6 +271,20 @@ app.post('/api/assign-variant', async (req, res) => {
     }
 
     if (existing) {
+      try {
+        await trackSessionStarted({
+          eventType: 'experiment_assignment',
+          sessionId: existing.session_id,
+          shopDomain: existing.shop_domain,
+          variant: existing.variant,
+          occurredAt: existing.created_at,
+          dedupeKey: `experiment_assignment:${existing.shop_domain}:${existing.session_id}`,
+          reason: 'assign_variant_existing'
+        })
+      } catch (analyticsError) {
+        console.log('ANALYTICS ASSIGN EXISTING ERROR:', analyticsError)
+      }
+
       return res.json({ success: true, data: existing })
     }
 
@@ -275,6 +308,20 @@ app.post('/api/assign-variant', async (req, res) => {
       return res.status(500).json({ success: false, error })
     }
 
+    try {
+      await trackSessionStarted({
+        eventType: 'experiment_assignment',
+        sessionId: data.session_id,
+        shopDomain: data.shop_domain,
+        variant: data.variant,
+        occurredAt: data.created_at,
+        dedupeKey: `experiment_assignment:${data.shop_domain}:${data.session_id}`,
+        reason: 'assign_variant_created'
+      })
+    } catch (analyticsError) {
+      console.log('ANALYTICS ASSIGN INSERT ERROR:', analyticsError)
+    }
+
     return res.json({ success: true, data })
   } catch (error) {
     console.log('ASSIGN ROUTE ERROR:', error)
@@ -289,7 +336,16 @@ app.post('/api/events', async (req, res) => {
   try {
     console.log('EVENT RECEIVED:', JSON.stringify(req.body, null, 2))
 
-    const { shop_domain, session_id, event_type, value = 0 } = req.body || {}
+    const {
+      shop_domain,
+      session_id,
+      event_type,
+      value = 0,
+      occurred_at = new Date().toISOString(),
+      extra = {},
+      event_id = null,
+      dedupe_key = null
+    } = req.body || {}
 
     if (!shop_domain || !session_id || !event_type) {
       console.log('EVENT REJECTED: missing fields')
@@ -341,6 +397,39 @@ app.post('/api/events', async (req, res) => {
     if (error) {
       console.log('EVENT INSERT ERROR:', error)
       return res.status(500).json({ success: false, error })
+    }
+
+    try {
+      await trackBehavioralEvent({
+        eventId: event_id,
+        eventType: event_type,
+        sessionId: session_id,
+        shopDomain: shop_domain,
+        variant: session.variant,
+        occurredAt: occurred_at,
+        value,
+        visitorId: req.body?.visitor_id,
+        dedupeKey: dedupe_key,
+        pageType: req.body?.page_type,
+        pageUrl: req.body?.page_url,
+        pagePath: req.body?.page_path,
+        referrer: req.body?.referrer,
+        trafficSource: req.body?.traffic_source,
+        deviceType: req.body?.device_type || getDeviceTypeFromUserAgent(req.headers['user-agent']),
+        productId: req.body?.product_id,
+        productHandle: req.body?.product_handle,
+        cartValue: req.body?.cart_value,
+        reason: req.body?.reason,
+        triggerType: req.body?.trigger_type,
+        messageName: req.body?.message_name,
+        metadata: {
+          ...extra,
+          experiment_name: req.body?.experiment_name,
+          source: 'shopify_extension'
+        }
+      })
+    } catch (analyticsError) {
+      console.log('ANALYTICS EVENT TRACK ERROR:', analyticsError)
     }
 
     console.log('EVENT INSERTED OK:', JSON.stringify(data, null, 2))
