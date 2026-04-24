@@ -316,7 +316,13 @@ async function recordRawEventUnlocked(input, options = {}) {
   const event = buildRawEventRecord(input)
 
   const duplicate = rawEvents.find(record => {
-    if (record.event_id === event.event_id) return true
+    if (
+      record.event_id === event.event_id &&
+      record.shop_domain === event.shop_domain &&
+      record.session_id === event.session_id
+    ) {
+      return true
+    }
 
     return Boolean(
       record.dedupe_key &&
