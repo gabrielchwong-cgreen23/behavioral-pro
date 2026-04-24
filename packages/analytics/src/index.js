@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 
 const packageDirectory = path.dirname(fileURLToPath(import.meta.url))
 const defaultDataDirectory = path.resolve(packageDirectory, '../data')
+const dataOperationQueues = new Map()
 
 const SESSION_CRO_FILE = 'session-cro.json'
 const RAW_EVENTS_FILE = 'raw-events.json'
@@ -14,6 +15,27 @@ function getDataDirectory(options = {}) {
 
 function getFilePath(filename, options = {}) {
   return path.join(getDataDirectory(options), filename)
+}
+
+async function withDataLock(options = {}, operation) {
+  const queueKey = getDataDirectory(options)
+  const previous = dataOperationQueues.get(queueKey) || Promise.resolve()
+  let result
+
+  const current = previous
+    .catch(() => {})
+    .then(async () => {
+      result = await operation()
+    })
+
+  dataOperationQueues.set(queueKey, current)
+  await current
+
+  if (dataOperationQueues.get(queueKey) === current) {
+    dataOperationQueues.delete(queueKey)
+  }
+
+  return result
 }
 
 async function ensureJsonFile(filePath) {
@@ -289,7 +311,7 @@ async function upsertSessionRecord(input, options = {}, updateRecord) {
   return nextRecord
 }
 
-export async function recordRawEvent(input, options = {}) {
+async function recordRawEventUnlocked(input, options = {}) {
   const rawEvents = await readRawEventLog(options)
   const event = buildRawEventRecord(input)
 
@@ -322,154 +344,230 @@ export async function recordRawEvent(input, options = {}) {
   }
 }
 
+export async function recordRawEvent(input, options = {}) {
+  return withDataLock(options, async () => recordRawEventUnlocked(input, options))
+}
+
 export async function trackSessionStarted(input, options = {}) {
-  const { event } = await recordRawEvent({
-    ...input,
-    eventType: input.eventType || input.event_type || 'session_started'
-  }, options)
+  return withDataLock(options, async () => {
+    const { event, duplicate } = await recordRawEventUnlocked({
+      ...input,
+      eventType: input.eventType || input.event_type || 'session_started'
+    }, options)
 
-  const session = await upsertSessionRecord({
-    sessionId: event.session_id,
-    shopDomain: event.shop_domain,
-    variant: event.variant,
-    startedAt: event.occurred_at
-  }, options, record => ({
-    ...record,
-    variant: event.variant || record.variant,
-    started_at: record.started_at || event.occurred_at
-  }))
+    const session = await upsertSessionRecord({
+      sessionId: event.session_id,
+      shopDomain: event.shop_domain,
+      variant: event.variant,
+      startedAt: event.occurred_at
+    }, options, record => ({
+      ...record,
+      variant: event.variant || record.variant,
+      started_at: record.started_at || event.occurred_at
+    }))
 
-  return {
-    session,
-    event
-  }
+    return {
+      session,
+      event,
+      duplicate: Boolean(duplicate)
+    }
+  })
 }
 
 export async function trackTrigger(input, options = {}) {
-  const triggerType = getTriggerType(input)
-  const { event } = await recordRawEvent({
-    ...input,
-    eventType: input.eventType || input.event_type || 'trigger_fired',
-    metadata: {
-      ...normalizeObject(input.metadata || input.extra, 'metadata'),
-      trigger_type: triggerType
+  return withDataLock(options, async () => {
+    const triggerType = getTriggerType(input)
+    const { event, duplicate } = await recordRawEventUnlocked({
+      ...input,
+      eventType: input.eventType || input.event_type || 'trigger_fired',
+      metadata: {
+        ...normalizeObject(input.metadata || input.extra, 'metadata'),
+        trigger_type: triggerType
+      }
+    }, options)
+
+    if (duplicate) {
+      const sessionTable = await readSessionTable(options)
+      const session = sessionTable.find(record =>
+        record.session_id === event.session_id && record.shop_domain === event.shop_domain
+      ) || createEmptySessionRecord({
+        sessionId: event.session_id,
+        shopDomain: event.shop_domain,
+        variant: event.variant,
+        startedAt: event.occurred_at
+      })
+
+      return {
+        session,
+        event,
+        duplicate: true
+      }
     }
-  }, options)
 
-  const session = await upsertSessionRecord({
-    sessionId: event.session_id,
-    shopDomain: event.shop_domain,
-    variant: event.variant,
-    startedAt: event.occurred_at
-  }, options, record => ({
-    ...record,
-    variant: event.variant || record.variant,
-    triggers_fired: [...record.triggers_fired, triggerType]
-  }))
+    const session = await upsertSessionRecord({
+      sessionId: event.session_id,
+      shopDomain: event.shop_domain,
+      variant: event.variant,
+      startedAt: event.occurred_at
+    }, options, record => ({
+      ...record,
+      variant: event.variant || record.variant,
+      triggers_fired: [...record.triggers_fired, triggerType]
+    }))
 
-  return {
-    session,
-    event
-  }
+    return {
+      session,
+      event,
+      duplicate: false
+    }
+  })
 }
 
 export async function trackMessageShown(input, options = {}) {
-  const messageName = getMessageName(input)
-  const { event } = await recordRawEvent({
-    ...input,
-    eventType: input.eventType || input.event_type || 'message_shown',
-    metadata: {
-      ...normalizeObject(input.metadata || input.extra, 'metadata'),
-      message_name: messageName
+  return withDataLock(options, async () => {
+    const messageName = getMessageName(input)
+    const { event, duplicate } = await recordRawEventUnlocked({
+      ...input,
+      eventType: input.eventType || input.event_type || 'message_shown',
+      metadata: {
+        ...normalizeObject(input.metadata || input.extra, 'metadata'),
+        message_name: messageName
+      }
+    }, options)
+
+    if (duplicate) {
+      const sessionTable = await readSessionTable(options)
+      const session = sessionTable.find(record =>
+        record.session_id === event.session_id && record.shop_domain === event.shop_domain
+      ) || createEmptySessionRecord({
+        sessionId: event.session_id,
+        shopDomain: event.shop_domain,
+        variant: event.variant,
+        startedAt: event.occurred_at
+      })
+
+      return {
+        session,
+        event,
+        duplicate: true
+      }
     }
-  }, options)
 
-  const session = await upsertSessionRecord({
-    sessionId: event.session_id,
-    shopDomain: event.shop_domain,
-    variant: event.variant,
-    startedAt: event.occurred_at
-  }, options, record => ({
-    ...record,
-    variant: event.variant || record.variant,
-    messages_shown: [...record.messages_shown, messageName]
-  }))
+    const session = await upsertSessionRecord({
+      sessionId: event.session_id,
+      shopDomain: event.shop_domain,
+      variant: event.variant,
+      startedAt: event.occurred_at
+    }, options, record => ({
+      ...record,
+      variant: event.variant || record.variant,
+      messages_shown: [...record.messages_shown, messageName]
+    }))
 
-  return {
-    session,
-    event
-  }
+    return {
+      session,
+      event,
+      duplicate: false
+    }
+  })
 }
 
 export async function trackCheckoutStarted(input, options = {}) {
-  const { event } = await recordRawEvent({
-    ...input,
-    eventType: input.eventType || input.event_type || 'checkout_started'
-  }, options)
+  return withDataLock(options, async () => {
+    const { event, duplicate } = await recordRawEventUnlocked({
+      ...input,
+      eventType: input.eventType || input.event_type || 'checkout_started'
+    }, options)
 
-  const session = await upsertSessionRecord({
-    sessionId: event.session_id,
-    shopDomain: event.shop_domain,
-    variant: event.variant,
-    startedAt: event.occurred_at
-  }, options, record => ({
-    ...record,
-    variant: event.variant || record.variant
-  }))
+    const session = await upsertSessionRecord({
+      sessionId: event.session_id,
+      shopDomain: event.shop_domain,
+      variant: event.variant,
+      startedAt: event.occurred_at
+    }, options, record => ({
+      ...record,
+      variant: event.variant || record.variant
+    }))
 
-  return {
-    session,
-    event
-  }
+    return {
+      session,
+      event,
+      duplicate
+    }
+  })
 }
 
 export async function trackCheckoutCompleted(input, options = {}) {
-  const { event } = await recordRawEvent({
-    ...input,
-    eventType: input.eventType || input.event_type || 'checkout_completed',
-    value: input.checkoutValue ?? input.checkout_value ?? input.revenue ?? input.value ?? 0
-  }, options)
+  return withDataLock(options, async () => {
+    const { event, duplicate } = await recordRawEventUnlocked({
+      ...input,
+      eventType: input.eventType || input.event_type || 'checkout_completed',
+      value: input.checkoutValue ?? input.checkout_value ?? input.revenue ?? input.value ?? 0
+    }, options)
 
-  const session = await upsertSessionRecord({
-    sessionId: event.session_id,
-    shopDomain: event.shop_domain,
-    variant: event.variant,
-    startedAt: event.occurred_at
-  }, options, record => ({
-    ...record,
-    variant: event.variant || record.variant,
-    converted: true,
-    revenue: normalizeRevenue(event.value),
-    ended_at: event.occurred_at
-  }))
+    if (duplicate) {
+      const sessionTable = await readSessionTable(options)
+      const session = sessionTable.find(record =>
+        record.session_id === event.session_id && record.shop_domain === event.shop_domain
+      ) || createEmptySessionRecord({
+        sessionId: event.session_id,
+        shopDomain: event.shop_domain,
+        variant: event.variant,
+        startedAt: event.occurred_at
+      })
 
-  return {
-    session,
-    event
-  }
+      return {
+        session,
+        event,
+        duplicate: true
+      }
+    }
+
+    const session = await upsertSessionRecord({
+      sessionId: event.session_id,
+      shopDomain: event.shop_domain,
+      variant: event.variant,
+      startedAt: event.occurred_at
+    }, options, record => ({
+      ...record,
+      variant: event.variant || record.variant,
+      converted: true,
+      revenue: normalizeRevenue(event.value),
+      ended_at: event.occurred_at
+    }))
+
+    return {
+      session,
+      event,
+      duplicate: false
+    }
+  })
 }
 
 export async function endSession(input, options = {}) {
-  const { event } = await recordRawEvent({
-    ...input,
-    eventType: input.eventType || input.event_type || 'session_ended'
-  }, options)
+  return withDataLock(options, async () => {
+    const { event, duplicate } = await recordRawEventUnlocked({
+      ...input,
+      eventType: input.eventType || input.event_type || 'session_ended'
+    }, options)
 
-  const session = await upsertSessionRecord({
-    sessionId: event.session_id,
-    shopDomain: event.shop_domain,
-    variant: event.variant,
-    startedAt: event.occurred_at
-  }, options, record => ({
-    ...record,
-    variant: event.variant || record.variant,
-    ended_at: event.occurred_at
-  }))
+    const session = await upsertSessionRecord({
+      sessionId: event.session_id,
+      shopDomain: event.shop_domain,
+      variant: event.variant,
+      startedAt: event.occurred_at
+    }, options, record => ({
+      ...record,
+      variant: event.variant || record.variant,
+      ended_at: event.occurred_at
+    }))
 
-  return {
-    session,
-    event
-  }
+    return {
+      session,
+      event,
+      duplicate
+    }
+  })
 }
 
 export async function trackBehavioralEvent(input, options = {}) {
@@ -507,21 +605,24 @@ export async function trackBehavioralEvent(input, options = {}) {
     }, options)
   }
 
-  const { event } = await recordRawEvent(input, options)
-  const session = await upsertSessionRecord({
-    sessionId: event.session_id,
-    shopDomain: event.shop_domain,
-    variant: event.variant,
-    startedAt: event.occurred_at
-  }, options, record => ({
-    ...record,
-    variant: event.variant || record.variant
-  }))
+  return withDataLock(options, async () => {
+    const { event, duplicate } = await recordRawEventUnlocked(input, options)
+    const session = await upsertSessionRecord({
+      sessionId: event.session_id,
+      shopDomain: event.shop_domain,
+      variant: event.variant,
+      startedAt: event.occurred_at
+    }, options, record => ({
+      ...record,
+      variant: event.variant || record.variant
+    }))
 
-  return {
-    session,
-    event
-  }
+    return {
+      session,
+      event,
+      duplicate
+    }
+  })
 }
 
 export async function getSessionCROTable(filters = {}, options = {}) {
