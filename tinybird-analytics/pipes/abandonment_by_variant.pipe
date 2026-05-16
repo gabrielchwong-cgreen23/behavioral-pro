@@ -1,0 +1,12 @@
+NODE endpoint
+SQL >
+    SELECT
+        JSONExtractString(data, 'variant') AS variant,
+        count() AS sessions,
+        sum(JSONExtractInt(data, 'abandoned')) AS abandoned_sessions,
+        round(sum(JSONExtractInt(data, 'abandoned')) / count() * 100, 2) AS abandonment_rate_percent
+    FROM storefront_events_example
+    GROUP BY variant
+    ORDER BY variant
+
+TYPE ENDPOINT

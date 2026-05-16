@@ -1,0 +1,6 @@
+
+tb_env/
+.env
+.tinyb
+.env.local
+__pycache__/
