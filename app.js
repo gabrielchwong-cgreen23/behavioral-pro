@@ -637,6 +637,56 @@ function buildDashboardPage({ shopDomain, apiKey }) {
       }
     }
 
+function renderAbandonmentByVariant(rows) {
+  const existing = document.getElementById('abandonment-by-variant-card')
+  const card = existing || document.createElement('section')
+
+  card.id = 'abandonment-by-variant-card'
+  card.style.border = '1px solid #e5e7eb'
+  card.style.borderRadius = '12px'
+  card.style.padding = '16px'
+  card.style.margin = '16px 0'
+  card.style.background = '#ffffff'
+
+  const data = Array.isArray(rows) ? rows : []
+  const variantA = data.find((row) => row.variant === 'A') || {}
+  const variantB = data.find((row) => row.variant === 'B') || {}
+
+  const rateA = Number(variantA.abandonment_rate_percent || 0)
+  const rateB = Number(variantB.abandonment_rate_percent || 0)
+  const relativeReduction = rateA > 0 ? ((rateA - rateB) / rateA) * 100 : 0
+
+  card.innerHTML =
+    '<h3 style="margin:0 0 8px;font-size:16px;">Abandonment by Variant</h3>' +
+    '<p style="margin:0 0 12px;color:#6b7280;font-size:13px;">Tinybird real-time A/B abandonment analytics</p>' +
+    '<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;">' +
+      '<div>' +
+        '<div style="font-size:12px;color:#6b7280;">Variant A</div>' +
+        '<div style="font-size:22px;font-weight:700;">' + rateA.toFixed(2) + '%</div>' +
+        '<div style="font-size:12px;color:#6b7280;">' + (variantA.sessions || 0) + ' sessions</div>' +
+      '</div>' +
+      '<div>' +
+        '<div style="font-size:12px;color:#6b7280;">Variant B</div>' +
+        '<div style="font-size:22px;font-weight:700;">' + rateB.toFixed(2) + '%</div>' +
+        '<div style="font-size:12px;color:#6b7280;">' + (variantB.sessions || 0) + ' sessions</div>' +
+      '</div>' +
+      '<div>' +
+        '<div style="font-size:12px;color:#6b7280;">Relative Reduction</div>' +
+        '<div style="font-size:22px;font-weight:700;">' + relativeReduction.toFixed(1) + '%</div>' +
+        '<div style="font-size:12px;color:#6b7280;">B vs A</div>' +
+      '</div>' +
+    '</div>'
+
+  if (!existing) {
+    const metricsJson = document.getElementById('metrics-json')
+    if (metricsJson && metricsJson.parentNode) {
+      metricsJson.parentNode.insertBefore(card, metricsJson)
+    } else {
+      document.body.appendChild(card)
+    }
+  }
+}
+
     async function loadAnalyticsRates() {
       try {
         const response = await authedFetch(
@@ -663,12 +713,31 @@ function buildDashboardPage({ shopDomain, apiKey }) {
     async function boot() {
       const authOk = await verifyEmbeddedAuth();
       if (authOk) {
-        await Promise.all([loadMetrics(), loadAnalyticsRates()]);
+        await Promise.all([loadMetrics(), loadAnalyticsRates(), loadAbandonmentByVariant()]);
       } else {
         setStatus('status-text', 'Blocked by auth', 'error');
         renderAnalyticsRates([]);
       }
     }
+
+async function loadAbandonmentByVariant() {
+  try {
+    const response = await authedFetch('/api/analytics/abandonment-by-variant', {
+      method: 'GET'
+    })
+
+    const json = await response.json()
+
+    if (!response.ok || !json.success || !json.data) {
+      throw new Error(json.error || 'Abandonment response missing data')
+    }
+
+    renderAbandonmentByVariant(json.data || [])
+  } catch (error) {
+    console.error('Abandonment analytics error:', error)
+    renderAbandonmentByVariant([])
+  }
+}
 
     boot();
   </script>
