@@ -500,7 +500,7 @@ function buildOwnerAnalyticsPage(token) {
 </html>`
 }
 
-export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken }) {
+export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken, analyticsOptions = {} }) {
   const requireOwner = requireOwnerToken(ownerToken)
 
   app.get('/owner-analytics', requireOwner, (req, res) => {
@@ -545,7 +545,7 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken }) {
         })
       }
 
-      const overview = await getAnalyticsOverview({ shopDomain })
+      const overview = await getAnalyticsOverview({ shopDomain }, analyticsOptions)
 
       return res.json({
         success: true,
@@ -575,7 +575,7 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken }) {
         })
       }
 
-      const conversionRates = await getTriggerConversionRates({ shopDomain })
+      const conversionRates = await getTriggerConversionRates({ shopDomain }, analyticsOptions)
 
       return res.json({
         success: true,
@@ -604,7 +604,7 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken }) {
         })
       }
 
-      const sessionTable = await getSessionCROTable({ shopDomain })
+      const sessionTable = await getSessionCROTable({ shopDomain }, analyticsOptions)
 
       return res.json({
         success: true,
@@ -633,7 +633,7 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken }) {
         })
       }
 
-      const rawEvents = await getRawEventLog({ shopDomain })
+      const rawEvents = await getRawEventLog({ shopDomain }, analyticsOptions)
 
       return res.json({
         success: true,
@@ -659,7 +659,7 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken }) {
         return res.status(400).send('shop_domain is required')
       }
 
-      const sessionTable = await getSessionCROTable({ shopDomain })
+      const sessionTable = await getSessionCROTable({ shopDomain }, analyticsOptions)
 
       res.type('application/json')
       return res.send(

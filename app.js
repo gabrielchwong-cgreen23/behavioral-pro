@@ -10,12 +10,21 @@ import {
   trackBehavioralEvent,
   trackSessionStarted
 } from './packages/analytics/src/index.js'
+import {
+  buildAssignmentEvent,
+  buildPhase1EventRecord,
+  createPhase1EventId,
+  getLegacyEventMirror,
+  PHASE1_EVENT_NAME_SET
+} from './packages/analytics/src/event-spine.js'
 import { registerOwnerAnalyticsRoutes } from './packages/owner-analytics/src/index.js'
 
 const DEFAULT_PORT = 3001
 const SIGNATURE_HEADER = 'x-behavioralpro-signature'
 const TIMESTAMP_HEADER = 'x-behavioralpro-timestamp'
 const SIGNATURE_TTL_MS = 5 * 60 * 1000
+const EVENT_DEDUPE_TTL_MS = 15 * 60 * 1000
+const recentEventIds = new Map()
 
 function createSupabaseClient(env) {
   if (!env?.SUPABASE_URL) {
@@ -242,6 +251,220 @@ function sendInvalidSessionResponse(res, message) {
       success: false,
       error: message
     })
+}
+
+function getRequestOrigin(req) {
+  const origin = req.get('origin')
+  if (origin) return origin
+
+  const protocol = req.get('x-forwarded-proto') || req.protocol || 'https'
+  const host = req.get('x-forwarded-host') || req.get('host')
+
+  if (!host) {
+    return null
+  }
+
+  return `${protocol}://${host}`
+}
+
+function getRequestPageUrl(req) {
+  const explicit = req.body?.page_url || req.body?.page_location
+  if (explicit) return explicit
+
+  const origin = getRequestOrigin(req)
+  if (!origin) return null
+
+  try {
+    return new URL(req.originalUrl || req.url || '/', origin).toString()
+  } catch {
+    return origin
+  }
+}
+
+function cleanupRecentEventIds() {
+  const cutoff = Date.now() - EVENT_DEDUPE_TTL_MS
+  for (const [eventId, timestamp] of recentEventIds.entries()) {
+    if (timestamp < cutoff) {
+      recentEventIds.delete(eventId)
+    }
+  }
+}
+
+function markOrDetectDuplicateEventId(eventId) {
+  cleanupRecentEventIds()
+
+  if (recentEventIds.has(eventId)) {
+    return true
+  }
+
+  recentEventIds.set(eventId, Date.now())
+  return false
+}
+
+function getTinybirdEventsApiUrl(env = process.env) {
+  if (env.TINYBIRD_EVENTS_API_URL) {
+    return env.TINYBIRD_EVENTS_API_URL
+  }
+
+  const host = String(env.TINYBIRD_HOST || 'https://api.europe-west2.gcp.tinybird.co').replace(/\/+$/, '')
+  const datasource = env.TINYBIRD_RAW_EVENTS_DATASOURCE || 'raw_events'
+  const branch = env.TINYBIRD_BRANCH ? `&branch=${encodeURIComponent(env.TINYBIRD_BRANCH)}` : ''
+  return `${host}/v0/events?name=${encodeURIComponent(datasource)}${branch}`
+}
+
+async function forwardEventToTinybird({
+  eventRecord,
+  env = process.env,
+  fetchImpl = globalThis.fetch
+}) {
+  if (typeof fetchImpl !== 'function') {
+    throw new Error('Global fetch is unavailable for Tinybird forwarding')
+  }
+
+  const tinybirdToken = env.TINYBIRD_TOKEN
+  if (!tinybirdToken) {
+    throw new Error('Missing TINYBIRD_TOKEN')
+  }
+
+  const response = await fetchImpl(getTinybirdEventsApiUrl(env), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${tinybirdToken}`,
+      'Content-Type': 'application/x-ndjson'
+    },
+    body: `${JSON.stringify({
+      ...eventRecord,
+      metadata: JSON.stringify(eventRecord.metadata || {})
+    })}\n`
+  })
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '')
+    throw new Error(`Tinybird ingest failed with status ${response.status}: ${text}`)
+  }
+
+  const text = await response.text().catch(() => '')
+  return {
+    ok: true,
+    status: response.status,
+    body: text
+  }
+}
+
+async function mirrorPhase1EventToLegacyAnalytics({
+  analyticsOptions,
+  eventRecord,
+  legacyAssignmentMirrorEnabled,
+  supabaseRawEventMirrorEnabled
+}) {
+  const legacy = getLegacyEventMirror(eventRecord)
+  if (!legacy) {
+    return { mirrored: false, reason: 'unmapped' }
+  }
+
+  if (legacy.kind === 'assignment') {
+    if (!legacyAssignmentMirrorEnabled) {
+      return { mirrored: false, reason: 'assignment_mirror_disabled' }
+    }
+
+    await trackSessionStarted({
+      eventId: eventRecord.event_id,
+      eventType: legacy.eventType,
+      sessionId: eventRecord.session_id,
+      shopDomain: eventRecord.shop_domain,
+      variant: eventRecord.experiment_variant,
+      occurredAt: eventRecord.client_timestamp
+    }, analyticsOptions)
+
+    return { mirrored: true, eventType: legacy.eventType }
+  }
+
+  if (!supabaseRawEventMirrorEnabled) {
+    return { mirrored: false, reason: 'raw_event_mirror_disabled' }
+  }
+
+  await trackBehavioralEvent({
+    eventId: eventRecord.event_id,
+    eventType: legacy.eventType,
+    sessionId: eventRecord.session_id,
+    shopDomain: eventRecord.shop_domain,
+    variant: eventRecord.experiment_variant,
+    occurredAt: eventRecord.client_timestamp,
+    visitorId: eventRecord.visitor_id,
+    pageUrl: eventRecord.page_url,
+    referrer: eventRecord.referrer,
+    productId: eventRecord.metadata?.product_id,
+    productHandle: eventRecord.metadata?.product_handle,
+    cartValue: eventRecord.metadata?.cart_value,
+    value: eventRecord.metadata?.value ?? 0,
+    reason: eventRecord.metadata?.reason,
+    triggerType: legacy.triggerType,
+    messageName: legacy.messageName,
+    metadata: {
+      ...eventRecord.metadata,
+      source: 'phase1_event_spine'
+    }
+  }, analyticsOptions)
+
+  return { mirrored: true, eventType: legacy.eventType }
+}
+
+export async function ingestPhase1Event({
+  env = process.env,
+  analyticsOptions,
+  eventRecord,
+  legacyAssignmentMirrorEnabled = true,
+  supabaseRawEventMirrorEnabled = false,
+  authMode = null,
+  fetchImpl = globalThis.fetch
+}) {
+  const duplicate = markOrDetectDuplicateEventId(eventRecord.event_id)
+
+  if (duplicate) {
+    console.log('PHASE1 EVENT DUPLICATE:', JSON.stringify({
+      event_id: eventRecord.event_id,
+      event_name: eventRecord.event_name,
+      shop_domain: eventRecord.shop_domain,
+      session_id: eventRecord.session_id
+    }))
+
+    return {
+      duplicate: true,
+      record: eventRecord,
+      tinybird: { forwarded: false, reason: 'duplicate' },
+      legacyMirror: { mirrored: false, reason: 'duplicate' }
+    }
+  }
+
+  const tinybird = await forwardEventToTinybird({
+    eventRecord,
+    env,
+    fetchImpl
+  })
+
+  const legacyMirror = await mirrorPhase1EventToLegacyAnalytics({
+    analyticsOptions,
+    eventRecord,
+    legacyAssignmentMirrorEnabled,
+    supabaseRawEventMirrorEnabled
+  })
+
+  console.log('PHASE1 EVENT FORWARDED:', JSON.stringify({
+    event_id: eventRecord.event_id,
+    event_name: eventRecord.event_name,
+    shop_domain: eventRecord.shop_domain,
+    session_id: eventRecord.session_id,
+    auth_mode: authMode,
+    tinybird_status: tinybird.status,
+    legacy_mirrored: legacyMirror.mirrored
+  }))
+
+  return {
+    duplicate: false,
+    record: eventRecord,
+    tinybird,
+    legacyMirror
+  }
 }
 
 export function buildMetricsPayload(shopDomain, overview) {
@@ -756,6 +979,8 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
   const supabase = providedSupabase || createSupabaseClient(env)
   const analyticsOptions = { supabase }
   const ingestSigningSecret = env.INGEST_SIGNING_SECRET || env.SHOPIFY_API_SECRET
+  const legacyAssignmentMirrorEnabled = env.BEHAVIORALPRO_ENABLE_LEGACY_ASSIGNMENT_MIRROR !== 'false'
+  const supabaseRawEventMirrorEnabled = env.BEHAVIORALPRO_ENABLE_SUPABASE_RAW_EVENT_MIRROR === 'true'
 
   if (!env.SHOPIFY_API_KEY) {
     console.warn('Missing SHOPIFY_API_KEY')
@@ -976,13 +1201,27 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
       }
 
       if (existing?.[0]) {
-        await trackSessionStarted({
-          eventType: 'experiment_assignment',
-          sessionId: existing[0].session_id,
-          shopDomain: existing[0].shop_domain,
-          variant: existing[0].variant,
-          occurredAt: existing[0].created_at
-        }, analyticsOptions)
+        await ingestPhase1Event({
+          env,
+          analyticsOptions,
+          legacyAssignmentMirrorEnabled,
+          supabaseRawEventMirrorEnabled,
+          authMode: req.ingestAuth?.mode,
+          eventRecord: buildAssignmentEvent({
+            shopDomain: existing[0].shop_domain,
+            sessionId: existing[0].session_id,
+            visitorId: req.body?.visitor_id || `visitor_for_${existing[0].session_id}`,
+            experimentVariant: existing[0].variant,
+            pageUrl: getRequestPageUrl(req) || `https://${existing[0].shop_domain}/`,
+            referrer: req.body?.referrer || null,
+            eventId: `assign_${existing[0].shop_domain}_${existing[0].session_id}`,
+            clientTimestamp: existing[0].created_at,
+            metadata: {
+              experiment_name: req.body?.experiment_name || 'agency_revenue_lift_14_day',
+              source: 'assign_variant_route'
+            }
+          })
+        })
 
         return res.json({ success: true, data: existing[0] })
       }
@@ -995,6 +1234,28 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
         variant,
         occurredAt: new Date().toISOString()
       }, analyticsOptions)
+
+      await ingestPhase1Event({
+        env,
+        analyticsOptions,
+        legacyAssignmentMirrorEnabled,
+        supabaseRawEventMirrorEnabled,
+        authMode: req.ingestAuth?.mode,
+        eventRecord: buildAssignmentEvent({
+          shopDomain: shop_domain,
+          sessionId: session_id,
+          visitorId: req.body?.visitor_id || `visitor_for_${session_id}`,
+          experimentVariant: tracked.session.variant,
+          pageUrl: getRequestPageUrl(req) || `https://${shop_domain}/`,
+          referrer: req.body?.referrer || null,
+          eventId: `assign_${shop_domain}_${session_id}`,
+          clientTimestamp: tracked.session.started_at,
+          metadata: {
+            experiment_name: req.body?.experiment_name || 'agency_revenue_lift_14_day',
+            source: 'assign_variant_route'
+          }
+        })
+      })
 
       return res.json({
         success: true,
@@ -1016,25 +1277,33 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
 
   app.post('/api/events', requireEventIngestAuth, async (req, res) => {
     try {
-      console.log('EVENT RECEIVED:', JSON.stringify(req.body, null, 2))
+      const rawEventName = req.body?.event_name ?? req.body?.event_type ?? req.body?.eventType
+      console.log('EVENT RECEIVED:', JSON.stringify({
+        shop_domain: req.body?.shop_domain,
+        session_id: req.body?.session_id,
+        event_name: rawEventName,
+        event_id: req.body?.event_id
+      }))
 
       const shop_domain = normalizeShop(req.body?.shop_domain)
-      const {
-        session_id,
-        event_type,
-        value = 0,
-        occurred_at = new Date().toISOString(),
-        extra = {},
-        event_id = null,
-        dedupe_key = null
-      } = req.body || {}
+      const session_id = req.body?.session_id
 
-      if (!shop_domain || !session_id || !event_type) {
-        console.log('EVENT REJECTED: missing fields')
+      if (!shop_domain || !session_id || !rawEventName) {
+        console.log('EVENT REJECTED: missing fields', JSON.stringify(req.body))
         return res.status(400).json({
           success: false,
-          error: 'missing fields',
+          error: 'shop_domain, session_id, and event_name are required',
           received: req.body
+        })
+      }
+
+      const event_name = String(rawEventName).trim()
+      if (!PHASE1_EVENT_NAME_SET.has(event_name)) {
+        console.log('EVENT REJECTED: invalid event name', event_name)
+        return res.status(400).json({
+          success: false,
+          error: 'invalid event_name',
+          allowed_event_names: [...PHASE1_EVENT_NAME_SET]
         })
       }
 
@@ -1059,42 +1328,76 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
         })
       }
 
-      const tracked = await trackBehavioralEvent({
-        eventId: event_id,
-        eventType: event_type,
-        sessionId: session_id,
-        shopDomain: shop_domain,
-        variant: sessionRows[0].variant,
-        occurredAt: occurred_at,
-        value,
-        visitorId: req.body?.visitor_id,
-        dedupeKey: dedupe_key,
-        pageType: req.body?.page_type,
-        pageUrl: req.body?.page_url,
-        pagePath: req.body?.page_path,
-        referrer: req.body?.referrer,
-        trafficSource: req.body?.traffic_source,
-        deviceType: req.body?.device_type || getDeviceTypeFromUserAgent(req.headers['user-agent']),
-        productId: req.body?.product_id,
-        productHandle: req.body?.product_handle,
-        cartValue: req.body?.cart_value,
-        reason: req.body?.reason,
-        triggerType: req.body?.trigger_type,
-        messageName: req.body?.message_name,
-        metadata: {
-          ...extra,
-          experiment_name: req.body?.experiment_name,
-          source: 'shopify_extension'
-        }
-      }, analyticsOptions)
+      const providedMetadata = (
+        req.body?.metadata && typeof req.body.metadata === 'object' && !Array.isArray(req.body.metadata)
+      )
+        ? req.body.metadata
+        : (
+            req.body?.extra && typeof req.body.extra === 'object' && !Array.isArray(req.body.extra)
+          )
+            ? req.body.extra
+            : {}
+
+      let phase1Event
+      try {
+        phase1Event = buildPhase1EventRecord({
+          event_name,
+          shop_domain,
+          session_id,
+          visitor_id: req.body?.visitor_id,
+          experiment_variant: req.body?.experiment_variant || sessionRows[0].variant,
+          page_url: req.body?.page_url || getRequestPageUrl(req) || `https://${shop_domain}/`,
+          referrer: req.body?.referrer || req.get('referer') || null,
+          client_timestamp: req.body?.client_timestamp || req.body?.occurred_at || new Date().toISOString(),
+          event_id: req.body?.event_id || createPhase1EventId('evt'),
+          metadata: {
+            ...providedMetadata,
+            source: providedMetadata.source || 'shopify_storefront',
+            user_agent: req.headers['user-agent'] || null,
+            device_type: providedMetadata.device_type ||
+              req.body?.device_type ||
+              getDeviceTypeFromUserAgent(req.headers['user-agent']),
+            experiment_name: providedMetadata.experiment_name ||
+              req.body?.experiment_name ||
+              'agency_revenue_lift_14_day',
+            product_id: providedMetadata.product_id || req.body?.product_id || null,
+            product_handle: providedMetadata.product_handle || req.body?.product_handle || null,
+            cart_value: providedMetadata.cart_value || req.body?.cart_value || null,
+            value: providedMetadata.value ?? req.body?.value ?? 0,
+            trigger_type: providedMetadata.trigger_type || req.body?.trigger_type || null,
+            message_name: providedMetadata.message_name || req.body?.message_name || null,
+            reason: providedMetadata.reason || req.body?.reason || null
+          }
+        })
+      } catch (validationError) {
+        console.log('EVENT REJECTED: malformed payload', validationError.message)
+        return res.status(400).json({
+          success: false,
+          error: String(validationError.message || validationError),
+          received: req.body
+        })
+      }
+
+      const tracked = await ingestPhase1Event({
+        env,
+        analyticsOptions,
+        legacyAssignmentMirrorEnabled,
+        supabaseRawEventMirrorEnabled,
+        authMode: req.ingestAuth?.mode,
+        eventRecord: phase1Event
+      })
 
       return res.json({
         success: true,
         data: {
           shop_domain,
           session_id,
-          event_type,
-          duplicate: Boolean(tracked.duplicate)
+          event_name,
+          event_id: phase1Event.event_id,
+          duplicate: Boolean(tracked.duplicate),
+          server_timestamp: phase1Event.server_timestamp,
+          tinybird_forwarded: Boolean(tracked.tinybird?.ok),
+          legacy_mirrored: Boolean(tracked.legacyMirror?.mirrored)
         }
       })
     } catch (error) {

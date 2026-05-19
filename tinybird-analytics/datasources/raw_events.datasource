@@ -1,0 +1,15 @@
+SCHEMA >
+    `event_id` String `json:$.event_id`,
+    `event_name` LowCardinality(String) `json:$.event_name`,
+    `shop_domain` LowCardinality(String) `json:$.shop_domain`,
+    `session_id` String `json:$.session_id`,
+    `visitor_id` String `json:$.visitor_id`,
+    `experiment_variant` LowCardinality(String) `json:$.experiment_variant`,
+    `page_url` String `json:$.page_url`,
+    `referrer` String `json:$.referrer`,
+    `client_timestamp` DateTime64(3) `json:$.client_timestamp`,
+    `server_timestamp` DateTime64(3) `json:$.server_timestamp`,
+    `metadata` String `json:$.metadata`
+
+ENGINE "MergeTree"
+ENGINE_SORTING_KEY "shop_domain, session_id, client_timestamp, event_id"

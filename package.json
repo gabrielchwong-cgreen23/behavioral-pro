@@ -12,7 +12,9 @@
     "generate": "shopify app generate",
     "deploy": "shopify app deploy",
     "test": "node --test tests/**/*.test.js",
-    "stress:test": "node --test tests/stress.test.js"
+    "stress:test": "node --test tests/stress.test.js",
+    "test:phase1-events": "node --test tests/events-phase1.test.js",
+    "simulate:phase1-session": "node scripts/simulate-phase1-session.js"
  
   },
   "dependencies": {

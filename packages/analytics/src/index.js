@@ -5,9 +5,27 @@ import { fileURLToPath } from 'node:url'
 const packageDirectory = path.dirname(fileURLToPath(import.meta.url))
 const defaultDataDirectory = path.resolve(packageDirectory, '../data')
 const dataOperationQueues = new Map()
+const recentIngestKeys = new Map()
 
 const SESSION_CRO_FILE = 'session-cro.json'
 const RAW_EVENTS_FILE = 'raw-events.json'
+const REPEATABLE_TRIGGER_TYPES = new Set([
+  'trigger_fired',
+  'product_page_view',
+  'add_to_cart_click',
+  'begin_checkout_click'
+])
+const SINGLE_EVENT_TYPES = new Set([
+  'purchase',
+  'checkout_completed',
+  'checkout_started',
+  'session_ended'
+])
+const DEDUPE_TTL_MS = 15 * 60 * 1000
+
+function isSupabaseBacked(options = {}) {
+  return Boolean(options.supabase)
+}
 
 function getDataDirectory(options = {}) {
   return options.dataDirectory || process.env.ANALYTICS_DATA_DIRECTORY || defaultDataDirectory
@@ -268,6 +286,366 @@ function buildRawEventRecord(input = {}) {
   })
 }
 
+function parseStoredEventType(storedEventType) {
+  const normalized = normalizeRequiredString(storedEventType, 'event_type')
+
+  if (normalized.startsWith('trigger:')) {
+    return {
+      eventType: 'trigger_fired',
+      triggerType: normalized.slice('trigger:'.length)
+    }
+  }
+
+  if (normalized.startsWith('message_shown:')) {
+    return {
+      eventType: 'message_shown',
+      messageName: normalized.slice('message_shown:'.length)
+    }
+  }
+
+  return {
+    eventType: normalized
+  }
+}
+
+function getStoredEventType(input = {}) {
+  const eventType = normalizeRequiredString(input.eventType || input.event_type, 'eventType')
+
+  if (eventType === 'trigger_fired') {
+    return `trigger:${getTriggerType(input)}`
+  }
+
+  if (eventType === 'message_shown') {
+    return `message_shown:${getMessageName(input)}`
+  }
+
+  return eventType
+}
+
+function mapSupabaseEventToRawRecord(event) {
+  const parsed = parseStoredEventType(event.event_type)
+
+  return normalizeRawEventRecord({
+    event_id: event.id ? `supabase_event_${event.id}` : createId('supabase_event'),
+    session_id: event.session_id,
+    shop_domain: event.shop_domain,
+    variant: event.variant || 'control',
+    event_type: parsed.eventType,
+    occurred_at: event.created_at,
+    value: event.value,
+    metadata: {
+      trigger_type: parsed.triggerType || null,
+      message_name: parsed.messageName || null,
+      storage: 'supabase'
+    }
+  })
+}
+
+function mapSessionToAssignmentEvent(session) {
+  return normalizeRawEventRecord({
+    event_id: session.id ? `supabase_assignment_${session.id}` : createId('supabase_assignment'),
+    session_id: session.session_id,
+    shop_domain: session.shop_domain,
+    variant: session.variant || 'control',
+    event_type: 'experiment_assignment',
+    occurred_at: session.created_at,
+    value: 0,
+    metadata: {
+      storage: 'supabase'
+    }
+  })
+}
+
+function cleanupRecentIngestKeys() {
+  const cutoff = Date.now() - DEDUPE_TTL_MS
+
+  for (const [key, timestamp] of recentIngestKeys.entries()) {
+    if (timestamp < cutoff) {
+      recentIngestKeys.delete(key)
+    }
+  }
+}
+
+function shouldSkipRecentDuplicate(input) {
+  const dedupeKey = normalizeOptionalString(input.dedupeKey || input.dedupe_key)
+
+  if (!dedupeKey) {
+    return false
+  }
+
+  cleanupRecentIngestKeys()
+
+  const cacheKey = [
+    getShopDomain(input),
+    getSessionId(input),
+    normalizeRequiredString(input.eventType || input.event_type, 'eventType'),
+    dedupeKey
+  ].join('::')
+
+  if (recentIngestKeys.has(cacheKey)) {
+    return true
+  }
+
+  recentIngestKeys.set(cacheKey, Date.now())
+  return false
+}
+
+function buildSessionTableFromSharedRows(sessionRows, rawEvents) {
+  const sessionMap = new Map()
+
+  function getKey(shopDomain, sessionId) {
+    return `${shopDomain}::${sessionId}`
+  }
+
+  for (const session of sessionRows) {
+    const startedAt = normalizeTimestamp(session.created_at)
+    sessionMap.set(
+      getKey(session.shop_domain, session.session_id),
+      normalizeSessionRecord({
+        session_id: session.session_id,
+        shop_domain: session.shop_domain,
+        variant: session.variant || 'control',
+        triggers_fired: [],
+        messages_shown: [],
+        converted: false,
+        revenue: 0,
+        started_at: startedAt,
+        ended_at: null
+      })
+    )
+  }
+
+  const orderedEvents = [...rawEvents].sort((left, right) => {
+    const leftTimestamp = normalizeTimestamp(left.occurred_at || left.created_at)
+    const rightTimestamp = normalizeTimestamp(right.occurred_at || right.created_at)
+    return leftTimestamp.localeCompare(rightTimestamp)
+  })
+
+  for (const event of orderedEvents) {
+    const key = getKey(event.shop_domain, event.session_id)
+    const existing = sessionMap.get(key) || createEmptySessionRecord({
+      sessionId: event.session_id,
+      shopDomain: event.shop_domain,
+      variant: event.variant,
+      startedAt: event.occurred_at
+    })
+    const parsed = parseStoredEventType(event.event_type)
+    const next = { ...existing }
+
+    if (!next.started_at || event.occurred_at < next.started_at) {
+      next.started_at = normalizeTimestamp(event.occurred_at || event.created_at)
+    }
+
+    if (parsed.eventType === 'trigger_fired') {
+      next.triggers_fired = [...next.triggers_fired, parsed.triggerType || 'trigger_fired']
+    } else if (REPEATABLE_TRIGGER_TYPES.has(parsed.eventType)) {
+      next.triggers_fired = [...next.triggers_fired, parsed.eventType]
+    } else if (parsed.eventType === 'message_shown') {
+      next.messages_shown = [...next.messages_shown, parsed.messageName || 'message_shown']
+    } else if (parsed.eventType === 'purchase' || parsed.eventType === 'checkout_completed') {
+      next.converted = true
+      next.revenue = Math.max(normalizeRevenue(next.revenue), normalizeRevenue(event.value))
+      next.ended_at = normalizeTimestamp(event.occurred_at || event.created_at)
+    } else if (parsed.eventType === 'session_ended') {
+      next.ended_at = normalizeTimestamp(event.occurred_at || event.created_at)
+    }
+
+    sessionMap.set(key, normalizeSessionRecord(next))
+  }
+
+  return Array.from(sessionMap.values()).sort((left, right) => left.started_at.localeCompare(right.started_at))
+}
+
+async function querySupabaseRows(table, filters = {}, options = {}) {
+  const supabase = options.supabase
+  let query = supabase.from(table).select('*')
+
+  if (filters.shopDomain) {
+    query = query.eq('shop_domain', filters.shopDomain)
+  }
+
+  if (filters.sessionId) {
+    query = query.eq('session_id', filters.sessionId)
+  }
+
+  const { data, error } = await query
+
+  if (error) {
+    throw new Error(`${table} query failed: ${error.message || error}`)
+  }
+
+  const rows = data || []
+  const since = filters.since ? new Date(filters.since) : null
+  const until = filters.until ? new Date(filters.until) : null
+
+  if (since && Number.isNaN(since.getTime())) {
+    throw new Error('Invalid since timestamp')
+  }
+
+  if (until && Number.isNaN(until.getTime())) {
+    throw new Error('Invalid until timestamp')
+  }
+
+  const timestampField = table === 'experiment_sessions' ? 'created_at' : 'created_at'
+
+  return rows.filter(row => matchesWindow(row[timestampField], since, until))
+}
+
+async function getSupabaseSessions(filters = {}, options = {}) {
+  return querySupabaseRows('experiment_sessions', {
+    shopDomain: normalizeOptionalString(filters.shopDomain || filters.shop_domain),
+    sessionId: normalizeOptionalString(filters.sessionId || filters.session_id),
+    since: filters.since,
+    until: filters.until
+  }, options)
+}
+
+async function getSupabaseEvents(filters = {}, options = {}) {
+  return querySupabaseRows('events', {
+    shopDomain: normalizeOptionalString(filters.shopDomain || filters.shop_domain),
+    sessionId: normalizeOptionalString(filters.sessionId || filters.session_id),
+    since: filters.since,
+    until: filters.until
+  }, options)
+}
+
+async function findSupabaseSession(input, options = {}) {
+  const supabase = options.supabase
+  const sessionId = getSessionId(input)
+  const shopDomain = getShopDomain(input)
+  const { data, error } = await supabase
+    .from('experiment_sessions')
+    .select('*')
+    .eq('shop_domain', shopDomain)
+    .eq('session_id', sessionId)
+
+  if (error) {
+    throw new Error(`experiment_sessions lookup failed: ${error.message || error}`)
+  }
+
+  return data?.[0] || null
+}
+
+async function ensureSupabaseSession(input, options = {}) {
+  const existing = await findSupabaseSession(input, options)
+
+  if (existing) {
+    return {
+      session: existing,
+      duplicate: true
+    }
+  }
+
+  const supabase = options.supabase
+  const createdAt = normalizeTimestamp(input.occurredAt || input.occurred_at)
+  const row = {
+    shop_domain: getShopDomain(input),
+    session_id: getSessionId(input),
+    variant: normalizeVariant(input.variant),
+    created_at: createdAt
+  }
+
+  const { data, error } = await supabase
+    .from('experiment_sessions')
+    .insert([row])
+    .select()
+
+  if (error) {
+    throw new Error(`experiment_sessions insert failed: ${error.message || error}`)
+  }
+
+  return {
+    session: data?.[0] || row,
+    duplicate: false
+  }
+}
+
+async function findDuplicateSupabaseEvent(input, options = {}) {
+  const supabase = options.supabase
+  const sessionId = getSessionId(input)
+  const shopDomain = getShopDomain(input)
+  const storedEventType = getStoredEventType(input)
+  const parsed = parseStoredEventType(storedEventType)
+
+  if (shouldSkipRecentDuplicate(input)) {
+    return {
+      duplicate: true,
+      row: null
+    }
+  }
+
+  if (!SINGLE_EVENT_TYPES.has(parsed.eventType)) {
+    return {
+      duplicate: false,
+      row: null
+    }
+  }
+
+  const { data, error } = await supabase
+    .from('events')
+    .select('*')
+    .eq('shop_domain', shopDomain)
+    .eq('session_id', sessionId)
+    .eq('event_type', storedEventType)
+
+  if (error) {
+    throw new Error(`events duplicate lookup failed: ${error.message || error}`)
+  }
+
+  return {
+    duplicate: Boolean(data?.length),
+    row: data?.[0] || null
+  }
+}
+
+async function insertSupabaseEvent(input, options = {}) {
+  const supabase = options.supabase
+  const session = await findSupabaseSession(input, options)
+
+  if (!session) {
+    throw new Error('session not assigned')
+  }
+
+  const duplicate = await findDuplicateSupabaseEvent(input, options)
+
+  if (duplicate.duplicate) {
+    return {
+      session,
+      event: duplicate.row ? mapSupabaseEventToRawRecord(duplicate.row) : buildRawEventRecord(input),
+      duplicate: true
+    }
+  }
+
+  const row = {
+    shop_domain: getShopDomain(input),
+    session_id: getSessionId(input),
+    variant: session.variant,
+    event_type: getStoredEventType({
+      ...input,
+      variant: session.variant
+    }),
+    value: normalizeRevenue(
+      input.checkoutValue ?? input.checkout_value ?? input.revenue ?? input.value ?? 0
+    ),
+    created_at: normalizeTimestamp(input.occurredAt || input.occurred_at)
+  }
+
+  const { data, error } = await supabase
+    .from('events')
+    .insert([row])
+    .select()
+
+  if (error) {
+    throw new Error(`events insert failed: ${error.message || error}`)
+  }
+
+  return {
+    session,
+    event: mapSupabaseEventToRawRecord(data?.[0] || row),
+    duplicate: false
+  }
+}
+
 async function readSessionTable(options = {}) {
   const records = await readRecords(SESSION_CRO_FILE, options)
   return records.map(normalizeSessionRecord)
@@ -351,10 +729,37 @@ async function recordRawEventUnlocked(input, options = {}) {
 }
 
 export async function recordRawEvent(input, options = {}) {
+  if (isSupabaseBacked(options)) {
+    return insertSupabaseEvent(input, options)
+  }
+
   return withDataLock(options, async () => recordRawEventUnlocked(input, options))
 }
 
 export async function trackSessionStarted(input, options = {}) {
+  if (isSupabaseBacked(options)) {
+    const ensured = await ensureSupabaseSession({
+      ...input,
+      eventType: input.eventType || input.event_type || 'experiment_assignment'
+    }, options)
+
+    return {
+      session: normalizeSessionRecord({
+        session_id: ensured.session.session_id,
+        shop_domain: ensured.session.shop_domain,
+        variant: ensured.session.variant || 'control',
+        triggers_fired: [],
+        messages_shown: [],
+        converted: false,
+        revenue: 0,
+        started_at: ensured.session.created_at,
+        ended_at: null
+      }),
+      event: mapSessionToAssignmentEvent(ensured.session),
+      duplicate: ensured.duplicate
+    }
+  }
+
   return withDataLock(options, async () => {
     const { event, duplicate } = await recordRawEventUnlocked({
       ...input,
@@ -381,6 +786,13 @@ export async function trackSessionStarted(input, options = {}) {
 }
 
 export async function trackTrigger(input, options = {}) {
+  if (isSupabaseBacked(options)) {
+    return insertSupabaseEvent({
+      ...input,
+      eventType: input.eventType || input.event_type || 'trigger_fired'
+    }, options)
+  }
+
   return withDataLock(options, async () => {
     const triggerType = getTriggerType(input)
     const { event, duplicate } = await recordRawEventUnlocked({
@@ -430,6 +842,13 @@ export async function trackTrigger(input, options = {}) {
 }
 
 export async function trackMessageShown(input, options = {}) {
+  if (isSupabaseBacked(options)) {
+    return insertSupabaseEvent({
+      ...input,
+      eventType: input.eventType || input.event_type || 'message_shown'
+    }, options)
+  }
+
   return withDataLock(options, async () => {
     const messageName = getMessageName(input)
     const { event, duplicate } = await recordRawEventUnlocked({
@@ -479,6 +898,13 @@ export async function trackMessageShown(input, options = {}) {
 }
 
 export async function trackCheckoutStarted(input, options = {}) {
+  if (isSupabaseBacked(options)) {
+    return insertSupabaseEvent({
+      ...input,
+      eventType: input.eventType || input.event_type || 'checkout_started'
+    }, options)
+  }
+
   return withDataLock(options, async () => {
     const { event, duplicate } = await recordRawEventUnlocked({
       ...input,
@@ -504,6 +930,13 @@ export async function trackCheckoutStarted(input, options = {}) {
 }
 
 export async function trackCheckoutCompleted(input, options = {}) {
+  if (isSupabaseBacked(options)) {
+    return insertSupabaseEvent({
+      ...input,
+      eventType: input.eventType || input.event_type || 'checkout_completed'
+    }, options)
+  }
+
   return withDataLock(options, async () => {
     const { event, duplicate } = await recordRawEventUnlocked({
       ...input,
@@ -551,6 +984,13 @@ export async function trackCheckoutCompleted(input, options = {}) {
 }
 
 export async function endSession(input, options = {}) {
+  if (isSupabaseBacked(options)) {
+    return insertSupabaseEvent({
+      ...input,
+      eventType: input.eventType || input.event_type || 'session_ended'
+    }, options)
+  }
+
   return withDataLock(options, async () => {
     const { event, duplicate } = await recordRawEventUnlocked({
       ...input,
@@ -599,16 +1039,15 @@ export async function trackBehavioralEvent(input, options = {}) {
     return endSession(input, options)
   }
 
-  if (
-    eventType === 'trigger_fired' ||
-    eventType === 'product_page_view' ||
-    eventType === 'add_to_cart_click' ||
-    eventType === 'begin_checkout_click'
-  ) {
+  if (REPEATABLE_TRIGGER_TYPES.has(eventType)) {
     return trackTrigger({
       ...input,
       triggerType: input.triggerType || input.trigger_type || eventType
     }, options)
+  }
+
+  if (isSupabaseBacked(options)) {
+    return insertSupabaseEvent(input, options)
   }
 
   return withDataLock(options, async () => {
@@ -632,6 +1071,15 @@ export async function trackBehavioralEvent(input, options = {}) {
 }
 
 export async function getSessionCROTable(filters = {}, options = {}) {
+  if (isSupabaseBacked(options)) {
+    const [sessions, events] = await Promise.all([
+      getSupabaseSessions(filters, options),
+      getSupabaseEvents(filters, options)
+    ])
+
+    return buildSessionTableFromSharedRows(sessions, events)
+  }
+
   const records = await readSessionTable(options)
   const shopDomain = normalizeOptionalString(filters.shopDomain || filters.shop_domain)
   const since = filters.since ? new Date(filters.since) : null
@@ -652,6 +1100,18 @@ export async function getSessionCROTable(filters = {}, options = {}) {
 }
 
 export async function getRawEventLog(filters = {}, options = {}) {
+  if (isSupabaseBacked(options)) {
+    const [sessionRows, eventRows] = await Promise.all([
+      getSupabaseSessions(filters, options),
+      getSupabaseEvents(filters, options)
+    ])
+
+    return [
+      ...sessionRows.map(mapSessionToAssignmentEvent),
+      ...eventRows.map(mapSupabaseEventToRawRecord)
+    ].sort((left, right) => right.occurred_at.localeCompare(left.occurred_at))
+  }
+
   const records = await readRawEventLog(options)
   const shopDomain = normalizeOptionalString(filters.shopDomain || filters.shop_domain)
   const sessionId = normalizeOptionalString(filters.sessionId || filters.session_id)
