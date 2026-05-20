@@ -1,6 +1,10 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+export {
+  getDefaultStateInferenceDecision,
+  inferShopperStateDecision
+} from './state-inference.js'
 
 const packageDirectory = path.dirname(fileURLToPath(import.meta.url))
 const defaultDataDirectory = path.resolve(packageDirectory, '../data')
