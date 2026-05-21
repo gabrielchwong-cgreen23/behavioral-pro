@@ -356,6 +356,105 @@ export async function fetchCurrentSessionFeatures({
   env = process.env,
   fetchImpl = globalThis.fetch
 }) {
+  const sql = `
+    WITH raw_base AS (
+      SELECT
+        nullIf(store_id, '') AS store_id,
+        nullIf(shop_domain, '') AS shop_domain,
+        nullIf(session_id, '') AS session_id,
+        nullIf(visitor_id, '') AS visitor_id,
+        nullIf(experiment_variant, '') AS experiment_variant,
+        page_url,
+        referrer,
+        event_id,
+        event_name,
+        coalesce(server_timestamp, client_timestamp) AS event_ts
+      FROM raw_events
+      WHERE shop_domain = ${toTinybirdSqlString(shopDomain)}
+        AND session_id = ${toTinybirdSqlString(sessionId)}
+        AND coalesce(server_timestamp, client_timestamp) IS NOT NULL
+    ),
+    deduped_events AS (
+      SELECT
+        argMax(store_id, tuple(notEmpty(ifNull(store_id, '')), event_ts)) AS store_id,
+        argMax(shop_domain, tuple(notEmpty(ifNull(shop_domain, '')), event_ts)) AS shop_domain,
+        argMax(session_id, tuple(notEmpty(ifNull(session_id, '')), event_ts)) AS session_id,
+        argMax(visitor_id, tuple(notEmpty(ifNull(visitor_id, '')), event_ts)) AS visitor_id,
+        argMax(experiment_variant, tuple(notEmpty(ifNull(experiment_variant, '')), event_ts)) AS experiment_variant,
+        argMax(page_url, tuple(notEmpty(ifNull(page_url, '')), event_ts)) AS page_url,
+        argMax(referrer, tuple(notEmpty(ifNull(referrer, '')), event_ts)) AS referrer,
+        event_id,
+        argMax(event_name, event_ts) AS event_name,
+        max(event_ts) AS event_ts
+      FROM raw_base
+      WHERE notEmpty(ifNull(event_id, ''))
+      GROUP BY event_id
+
+      UNION ALL
+
+      SELECT
+        store_id,
+        shop_domain,
+        session_id,
+        visitor_id,
+        experiment_variant,
+        page_url,
+        referrer,
+        event_id,
+        event_name,
+        event_ts
+      FROM raw_base
+      WHERE empty(ifNull(event_id, ''))
+    )
+    SELECT
+      ifNull(argMax(store_id, tuple(notEmpty(ifNull(store_id, '')), event_ts)), '') AS store_id,
+      shop_domain,
+      session_id,
+      argMax(visitor_id, tuple(notEmpty(ifNull(visitor_id, '')), event_ts)) AS visitor_id,
+      argMax(experiment_variant, tuple(notEmpty(ifNull(experiment_variant, '')), event_ts)) AS experiment_variant,
+      min(event_ts) AS first_seen_at,
+      max(event_ts) AS last_seen_at,
+      countIf(event_name = 'page_view') AS page_views,
+      countIf(event_name = 'product_view') AS product_views,
+      countIf(event_name = 'add_to_cart') AS add_to_cart_count,
+      countIf(event_name = 'begin_checkout') AS begin_checkout_count,
+      countIf(event_name = 'purchase') AS purchase_count,
+      countIf(event_name = 'rage_click') AS rage_click_count,
+      countIf(event_name = 'cta_idle_15s') AS cta_idle_15s_count,
+      countIf(event_name = 'policy_page_view') AS policy_page_view_count,
+      countIf(event_name = 'intervention_triggered') AS intervention_triggered_count,
+      minIf(event_ts, event_name = 'intervention_triggered') AS first_intervention_triggered_at,
+      toUInt8(countIf(event_name = 'begin_checkout') > 0) AS reached_checkout,
+      toUInt8(countIf(event_name = 'purchase') > 0) AS purchased,
+      toUInt8(
+        countIf(event_name = 'add_to_cart') > 0
+        AND countIf(event_name = 'begin_checkout') = 0
+        AND countIf(event_name = 'purchase') = 0
+      ) AS provisional_abandoned_cart,
+      toUInt8(
+        countIf(event_name = 'begin_checkout') > 0
+        AND countIf(event_name = 'purchase') = 0
+      ) AS provisional_abandoned_checkout
+    FROM deduped_events
+    GROUP BY shop_domain, session_id
+    FORMAT JSON
+  `
+
+  try {
+    const result = await queryTinybirdSql({
+      sql,
+      env,
+      fetchImpl,
+      logLabel: 'CURRENT SESSION FEATURES SQL'
+    })
+
+    if (Array.isArray(result.data) && result.data[0]) {
+      return result.data[0]
+    }
+  } catch (error) {
+    console.log('CURRENT SESSION FEATURES SQL FALLBACK:', error.message || error)
+  }
+
   const rows = await fetchTinybirdPipeJson({
     pipeName: 'v1_session_features_by_session',
     params: {
