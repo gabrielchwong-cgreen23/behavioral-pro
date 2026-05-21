@@ -27,14 +27,7 @@ function failClosedResponse(strategy: string, status = 200): NextResponse {
   })
 }
 
-async function lookupStoreRecord(shopDomain: string) {
-  const url = process.env.SUPABASE_URL
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY
-
-  if (!url || !key) return null
-
-  const { createClient } = await import('@supabase/supabase-js')
-  const supabase = createClient(url, key)
+async function lookupStoreRecord(supabase: any, shopDomain: string) {
   const { data } = await supabase
     .from('stores')
     .select('*')
@@ -42,6 +35,16 @@ async function lookupStoreRecord(shopDomain: string) {
     .maybeSingle()
 
   return data || null
+}
+
+async function createSupabaseAdminClient() {
+  const url = process.env.SUPABASE_URL
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY
+
+  if (!url || !key) return null
+
+  const { createClient } = await import('@supabase/supabase-js')
+  return createClient(url, key)
 }
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
@@ -62,12 +65,16 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   } = parsedQuery.data
 
   try {
-    const storeRecord = await lookupStoreRecord(shopDomain).catch(() => null)
+    const supabase = await createSupabaseAdminClient()
+    const storeRecord = supabase
+      ? await lookupStoreRecord(supabase, shopDomain).catch(() => null)
+      : null
     const { result } = await getInterventionDecision({
       shopDomain,
       sessionId,
       requestedStoreId,
       storeRecord,
+      supabase,
       env: process.env
     })
 

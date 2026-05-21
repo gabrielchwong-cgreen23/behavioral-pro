@@ -30,6 +30,7 @@ export const INTERVENTION_COHORT_BENCHMARKS = {
 
 const STORE_BLEND_FLOOR = 100
 const STORE_BLEND_FULL = 1000
+const LIVE_SESSION_STATE_VERSION = 1
 const INTERVENTION_MESSAGE_IDS = {
   none: 'tidio_no_intervention',
   checkout_recovery: 'tidio_checkout_recovery_v1',
@@ -173,6 +174,271 @@ function buildDecisionResult({
   }
 }
 
+export function buildLiveSessionStateKey({ shopDomain = '', sessionId = '' } = {}) {
+  const normalizedShopDomain = String(shopDomain || '').trim()
+  const normalizedSessionId = String(sessionId || '').trim()
+  return `${normalizedShopDomain}::${normalizedSessionId}`
+}
+
+export function createLiveSessionStateStore({
+  ttlMs = 30 * 60 * 1000,
+  now = () => Date.now()
+} = {}) {
+  const store = new Map()
+
+  function prune() {
+    const cutoff = now() - ttlMs
+    for (const [key, value] of store.entries()) {
+      if (toNumber(value?.updated_at_ms, 0) < cutoff) {
+        store.delete(key)
+      }
+    }
+  }
+
+  return {
+    get(params = {}) {
+      prune()
+      return store.get(buildLiveSessionStateKey(params)) || null
+    },
+    set(params = {}, value) {
+      prune()
+      store.set(buildLiveSessionStateKey(params), value)
+      return value
+    },
+    delete(params = {}) {
+      return store.delete(buildLiveSessionStateKey(params))
+    },
+    size() {
+      prune()
+      return store.size
+    }
+  }
+}
+
+function normalizeLiveSessionState(state = {}) {
+  return {
+    version: LIVE_SESSION_STATE_VERSION,
+    store_id: String(state.store_id || '').trim(),
+    shop_domain: String(state.shop_domain || '').trim(),
+    session_id: String(state.session_id || '').trim(),
+    visitor_id: String(state.visitor_id || '').trim(),
+    experiment_variant: String(state.experiment_variant || '').trim(),
+    page_url: state.page_url || null,
+    referrer: state.referrer || null,
+    first_seen_at: state.first_seen_at || null,
+    last_seen_at: state.last_seen_at || null,
+    page_views: toNumber(state.page_views, 0),
+    product_views: toNumber(state.product_views, 0),
+    add_to_cart_count: toNumber(state.add_to_cart_count, 0),
+    begin_checkout_count: toNumber(state.begin_checkout_count, 0),
+    purchase_count: toNumber(state.purchase_count, 0),
+    rage_click_count: toNumber(state.rage_click_count, 0),
+    cta_idle_15s_count: toNumber(state.cta_idle_15s_count, 0),
+    policy_page_view_count: toNumber(state.policy_page_view_count, 0),
+    intervention_triggered_count: toNumber(state.intervention_triggered_count, 0),
+    first_intervention_triggered_at: state.first_intervention_triggered_at || null,
+    reached_checkout: toBooleanFlag(state.reached_checkout),
+    purchased: toBooleanFlag(state.purchased),
+    provisional_abandoned_cart: toBooleanFlag(state.provisional_abandoned_cart),
+    provisional_abandoned_checkout: toBooleanFlag(state.provisional_abandoned_checkout),
+    updated_at_ms: toNumber(state.updated_at_ms, Date.now())
+  }
+}
+
+export function seedLiveSessionState({
+  existingState = null,
+  shopDomain = '',
+  sessionId = '',
+  storeId = '',
+  visitorId = '',
+  experimentVariant = '',
+  pageUrl = null,
+  referrer = null,
+  seenAt = null
+} = {}) {
+  const timestamp = seenAt || new Date().toISOString()
+  const next = normalizeLiveSessionState(existingState || {})
+  next.store_id = String(storeId || next.store_id || '').trim()
+  next.shop_domain = String(shopDomain || next.shop_domain || '').trim()
+  next.session_id = String(sessionId || next.session_id || '').trim()
+  next.visitor_id = String(visitorId || next.visitor_id || '').trim()
+  next.experiment_variant = String(experimentVariant || next.experiment_variant || '').trim()
+  next.page_url = pageUrl || next.page_url || null
+  next.referrer = referrer || next.referrer || null
+  next.first_seen_at = next.first_seen_at || timestamp
+  next.last_seen_at = timestamp
+  next.updated_at_ms = Date.now()
+  return next
+}
+
+export function applyEventToLiveSessionState(existingState = null, eventRecord = {}) {
+  const eventName = String(eventRecord.event_name || '').trim()
+  const eventTimestamp = eventRecord.server_timestamp || eventRecord.client_timestamp || new Date().toISOString()
+  const next = seedLiveSessionState({
+    existingState,
+    shopDomain: eventRecord.shop_domain,
+    sessionId: eventRecord.session_id,
+    storeId: eventRecord.store_id,
+    visitorId: eventRecord.visitor_id,
+    experimentVariant: eventRecord.experiment_variant,
+    pageUrl: eventRecord.page_url,
+    referrer: eventRecord.referrer,
+    seenAt: eventTimestamp
+  })
+
+  const increment = (field) => {
+    next[field] = toNumber(next[field], 0) + 1
+  }
+
+  switch (eventName) {
+    case 'page_view':
+      increment('page_views')
+      break
+    case 'product_view':
+      increment('product_views')
+      break
+    case 'add_to_cart':
+      increment('add_to_cart_count')
+      break
+    case 'begin_checkout':
+      increment('begin_checkout_count')
+      next.reached_checkout = true
+      break
+    case 'purchase':
+      increment('purchase_count')
+      next.purchased = true
+      break
+    case 'rage_click':
+      increment('rage_click_count')
+      break
+    case 'cta_idle_15s':
+      increment('cta_idle_15s_count')
+      break
+    case 'policy_page_view':
+      increment('policy_page_view_count')
+      break
+    case 'intervention_triggered':
+      increment('intervention_triggered_count')
+      next.first_intervention_triggered_at = next.first_intervention_triggered_at || eventTimestamp
+      break
+    default:
+      break
+  }
+
+  next.provisional_abandoned_cart =
+    next.add_to_cart_count > 0 &&
+    next.begin_checkout_count === 0 &&
+    next.purchase_count === 0
+  next.provisional_abandoned_checkout =
+    next.begin_checkout_count > 0 &&
+    next.purchase_count === 0
+  next.reached_checkout = next.begin_checkout_count > 0
+  next.purchased = next.purchase_count > 0
+  next.updated_at_ms = Date.now()
+
+  return next
+}
+
+export function buildSessionFeaturesFromLiveState(liveSessionState = null) {
+  if (!liveSessionState) return null
+  const normalized = normalizeLiveSessionState(liveSessionState)
+  if (!normalized.shop_domain || !normalized.session_id) {
+    return null
+  }
+
+  return {
+    store_id: normalized.store_id,
+    shop_domain: normalized.shop_domain,
+    session_id: normalized.session_id,
+    visitor_id: normalized.visitor_id,
+    experiment_variant: normalized.experiment_variant,
+    page_url: normalized.page_url,
+    referrer: normalized.referrer,
+    first_seen_at: normalized.first_seen_at,
+    last_seen_at: normalized.last_seen_at,
+    page_views: normalized.page_views,
+    product_views: normalized.product_views,
+    add_to_cart_count: normalized.add_to_cart_count,
+    begin_checkout_count: normalized.begin_checkout_count,
+    purchase_count: normalized.purchase_count,
+    rage_click_count: normalized.rage_click_count,
+    cta_idle_15s_count: normalized.cta_idle_15s_count,
+    policy_page_view_count: normalized.policy_page_view_count,
+    intervention_triggered_count: normalized.intervention_triggered_count,
+    first_intervention_triggered_at: normalized.first_intervention_triggered_at,
+    reached_checkout: normalized.reached_checkout ? 1 : 0,
+    purchased: normalized.purchased ? 1 : 0,
+    provisional_abandoned_cart: normalized.provisional_abandoned_cart ? 1 : 0,
+    provisional_abandoned_checkout: normalized.provisional_abandoned_checkout ? 1 : 0
+  }
+}
+
+export function buildSessionFeaturesFromSessionStateRow(sessionStateRow = null) {
+  if (!sessionStateRow) return null
+
+  const counters =
+    sessionStateRow.counters && typeof sessionStateRow.counters === 'object'
+      ? sessionStateRow.counters
+      : {}
+
+  const normalized = normalizeLiveSessionState({
+    store_id: sessionStateRow.store_id,
+    shop_domain: sessionStateRow.shop_domain,
+    session_id: sessionStateRow.session_id,
+    visitor_id: sessionStateRow.visitor_id,
+    experiment_variant: sessionStateRow.experiment_variant,
+    page_url: sessionStateRow.page_url,
+    referrer: sessionStateRow.referrer,
+    first_seen_at: sessionStateRow.first_seen_at,
+    last_seen_at: sessionStateRow.last_seen_at,
+    page_views: counters.page_views,
+    product_views: counters.product_views,
+    add_to_cart_count: counters.add_to_cart_count,
+    begin_checkout_count: counters.begin_checkout_count,
+    purchase_count: counters.purchase_count,
+    rage_click_count: counters.rage_click_count,
+    cta_idle_15s_count: counters.cta_idle_15s_count,
+    policy_page_view_count: counters.policy_page_view_count,
+    intervention_triggered_count: counters.intervention_triggered_count,
+    first_intervention_triggered_at:
+      sessionStateRow.first_intervention_triggered_at || counters.first_intervention_triggered_at,
+    reached_checkout: toNumber(counters.begin_checkout_count, 0) > 0,
+    purchased: toNumber(counters.purchase_count, 0) > 0,
+    provisional_abandoned_cart:
+      toNumber(counters.add_to_cart_count, 0) > 0 &&
+      toNumber(counters.begin_checkout_count, 0) === 0 &&
+      toNumber(counters.purchase_count, 0) === 0,
+    provisional_abandoned_checkout:
+      toNumber(counters.begin_checkout_count, 0) > 0 &&
+      toNumber(counters.purchase_count, 0) === 0
+  })
+
+  return buildSessionFeaturesFromLiveState(normalized)
+}
+
+export async function fetchHotSessionState({
+  supabase,
+  shopDomain,
+  sessionId
+}) {
+  if (!supabase) {
+    return null
+  }
+
+  const { data, error } = await supabase
+    .from('session_state')
+    .select('*')
+    .eq('shop_domain', shopDomain)
+    .eq('session_id', sessionId)
+    .maybeSingle()
+
+  if (error) {
+    throw new Error(error.message || 'Failed to read session_state')
+  }
+
+  return data || null
+}
+
 function buildCohortMap({ env = process.env, storeConfig, resolvedStoreId, shopDomain }) {
   let envCohorts = {}
 
@@ -196,15 +462,38 @@ export async function getInterventionDecision({
   sessionId,
   requestedStoreId = '',
   storeRecord = null,
+  supabase = null,
+  liveSessionState = null,
   env = process.env,
   fetchImpl = globalThis.fetch
 }) {
-  const session = await fetchCurrentSessionFeatures({
-    shopDomain,
-    sessionId,
-    env,
-    fetchImpl
-  })
+  let session = null
+
+  if (supabase) {
+    try {
+      const hotSessionState = await fetchHotSessionState({
+        supabase,
+        shopDomain,
+        sessionId
+      })
+      session = buildSessionFeaturesFromSessionStateRow(hotSessionState)
+    } catch (error) {
+      console.log('HOT SESSION STATE FALLBACK:', error.message || error)
+    }
+  }
+
+  if (!session) {
+    session = buildSessionFeaturesFromLiveState(liveSessionState)
+  }
+
+  if (!session) {
+    session = await fetchCurrentSessionFeatures({
+      shopDomain,
+      sessionId,
+      env,
+      fetchImpl
+    })
+  }
 
   const storeConfig = getInterventionStoreConfigFromRecord(storeRecord)
 

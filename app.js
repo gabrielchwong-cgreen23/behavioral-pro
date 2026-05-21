@@ -351,6 +351,64 @@ async function lookupStoreRecord(supabase, shopDomain) {
   return data || null
 }
 
+function buildSessionStateCounterDeltas(eventName) {
+  switch (String(eventName || '').trim()) {
+    case 'page_view':
+      return { page_views: 1 }
+    case 'product_view':
+      return { product_views: 1 }
+    case 'add_to_cart':
+      return { add_to_cart_count: 1 }
+    case 'begin_checkout':
+      return { begin_checkout_count: 1 }
+    case 'purchase':
+      return { purchase_count: 1 }
+    case 'rage_click':
+      return { rage_click_count: 1 }
+    case 'cta_idle_15s':
+      return { cta_idle_15s_count: 1 }
+    case 'policy_page_view':
+      return { policy_page_view_count: 1 }
+    case 'intervention_triggered':
+      return { intervention_triggered_count: 1 }
+    default:
+      return {}
+  }
+}
+
+async function upsertSessionStateCounters(
+  supabase,
+  {
+    shopDomain,
+    sessionId,
+    storeId = '',
+    visitorId = '',
+    experimentVariant = '',
+    pageUrl = null,
+    referrer = null,
+    seenAt = new Date().toISOString(),
+    counterDeltas = {}
+  } = {}
+) {
+  const { data, error } = await supabase.rpc('upsert_session_state_counters', {
+    p_shop_domain: shopDomain,
+    p_session_id: sessionId,
+    p_store_id: storeId || null,
+    p_visitor_id: visitorId || null,
+    p_experiment_variant: experimentVariant || null,
+    p_page_url: pageUrl || null,
+    p_referrer: referrer || null,
+    p_seen_at: seenAt,
+    p_counter_deltas: counterDeltas
+  })
+
+  if (error) {
+    throw new Error(`session_state upsert failed: ${error.message || error}`)
+  }
+
+  return data || null
+}
+
 function normalizeStoreId(value) {
   if (value == null) return null
   const normalized = String(value).trim()
@@ -2060,6 +2118,20 @@ export function createApp({
             }
           })
         })
+        await upsertSessionStateCounters(supabase, {
+          shopDomain: existingRows[0].shop_domain,
+          sessionId: existingRows[0].session_id,
+          storeId: assignmentStoreId,
+          visitorId: req.body?.visitor_id || `visitor_for_${existingRows[0].session_id}`,
+          experimentVariant: existingRows[0].variant,
+          pageUrl: getRequestPageUrl(req) || `https://${existingRows[0].shop_domain}/`,
+          referrer: req.body?.referrer || null,
+          seenAt: existingRows[0].created_at,
+          counterDeltas: {}
+        }).catch((error) => {
+          console.log('SESSION STATE ASSIGN UPSERT ERROR:', error)
+          return null
+        })
 
         return res.json({
           success: true,
@@ -2100,7 +2172,21 @@ export function createApp({
             experiment_name: req.body?.experiment_name || 'agency_revenue_lift_14_day',
             source: 'assign_variant_route'
           }
+          })
         })
+      await upsertSessionStateCounters(supabase, {
+        shopDomain: shop_domain,
+        sessionId: session_id,
+        storeId: assignmentStoreId,
+        visitorId: req.body?.visitor_id || `visitor_for_${session_id}`,
+        experimentVariant: tracked.session.variant,
+        pageUrl: getRequestPageUrl(req) || `https://${shop_domain}/`,
+        referrer: req.body?.referrer || null,
+        seenAt: tracked.session.started_at,
+        counterDeltas: {}
+      }).catch((error) => {
+        console.log('SESSION STATE ASSIGN UPSERT ERROR:', error)
+        return null
       })
 
       return res.json({
@@ -2275,6 +2361,20 @@ export function createApp({
         env,
         fetchImpl
       })
+      await upsertSessionStateCounters(supabase, {
+        shopDomain: shop_domain,
+        sessionId: session_id,
+        storeId: resolvedStoreId || '',
+        visitorId: anonymous_id,
+        experimentVariant: req.body?.experiment_variant || sessionRows[0].variant,
+        pageUrl: page_url,
+        referrer: validatedReferrer || req.get('referer') || null,
+        seenAt: server_timestamp,
+        counterDeltas: buildSessionStateCounterDeltas(event_name)
+      }).catch((error) => {
+        console.log('SESSION STATE EVENT UPSERT ERROR:', error)
+        return null
+      })
 
       ;(async () => {
         try {
@@ -2384,6 +2484,7 @@ export function createApp({
         sessionId,
         requestedStoreId: requestedStoreId || '',
         storeRecord,
+        supabase,
         env,
         fetchImpl
       })

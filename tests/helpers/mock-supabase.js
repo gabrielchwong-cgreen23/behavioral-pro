@@ -126,12 +126,14 @@ class MockSupabaseStore {
     this.tables = {
       stores: clone(seed.stores || []),
       experiment_sessions: clone(seed.experiment_sessions || []),
-      events: clone(seed.events || [])
+      events: clone(seed.events || []),
+      session_state: clone(seed.session_state || [])
     }
     this.nextIds = {
       stores: this.getNextId('stores'),
       experiment_sessions: this.getNextId('experiment_sessions'),
-      events: this.getNextId('events')
+      events: this.getNextId('events'),
+      session_state: this.getNextId('session_state')
     }
   }
 
@@ -167,6 +169,85 @@ class MockSupabaseStore {
     this.tables[table][index] = next
     return next
   }
+
+  rpc(functionName, args = {}) {
+    if (functionName !== 'upsert_session_state_counters') {
+      return {
+        data: null,
+        error: { message: `Unknown rpc: ${functionName}` }
+      }
+    }
+
+    const {
+      p_shop_domain,
+      p_session_id,
+      p_store_id,
+      p_visitor_id,
+      p_experiment_variant,
+      p_page_url,
+      p_referrer,
+      p_seen_at,
+      p_counter_deltas
+    } = args
+
+    const shopDomain = p_shop_domain
+    const sessionId = p_session_id
+    const seenAt = p_seen_at || new Date().toISOString()
+    const counters = p_counter_deltas && typeof p_counter_deltas === 'object'
+      ? clone(p_counter_deltas)
+      : {}
+
+    const index = this.tables.session_state.findIndex(row =>
+      row.shop_domain === shopDomain && row.session_id === sessionId
+    )
+
+    if (index === -1) {
+      const inserted = this.insert('session_state', {
+        shop_domain: shopDomain,
+        session_id: sessionId,
+        store_id: p_store_id || null,
+        visitor_id: p_visitor_id || null,
+        experiment_variant: p_experiment_variant || null,
+        page_url: p_page_url || null,
+        referrer: p_referrer || null,
+        counters,
+        first_seen_at: seenAt,
+        last_seen_at: seenAt,
+        first_intervention_triggered_at:
+          Number(counters.intervention_triggered_count || 0) > 0 ? seenAt : null,
+        updated_at: seenAt
+      })
+      return { data: clone(inserted), error: null }
+    }
+
+    const existing = this.tables.session_state[index]
+    const mergedCounters = {
+      ...(existing.counters || {})
+    }
+
+    for (const [key, value] of Object.entries(counters)) {
+      mergedCounters[key] = Number(mergedCounters[key] || 0) + Number(value || 0)
+    }
+
+    const next = {
+      ...existing,
+      store_id: p_store_id || existing.store_id || null,
+      visitor_id: p_visitor_id || existing.visitor_id || null,
+      experiment_variant: p_experiment_variant || existing.experiment_variant || null,
+      page_url: p_page_url || existing.page_url || null,
+      referrer: p_referrer || existing.referrer || null,
+      counters: mergedCounters,
+      first_seen_at: existing.first_seen_at || seenAt,
+      last_seen_at: seenAt,
+      first_intervention_triggered_at:
+        existing.first_intervention_triggered_at ||
+        (Number(counters.intervention_triggered_count || 0) > 0 ? seenAt : null),
+      updated_at: seenAt
+    }
+
+    this.tables.session_state[index] = next
+    return { data: clone(next), error: null }
+  }
 }
 
 export function createMockSupabase(seed = {}) {
@@ -176,6 +257,9 @@ export function createMockSupabase(seed = {}) {
     _store: store,
     from(table) {
       return new QueryBuilder(store, table)
+    },
+    async rpc(functionName, args) {
+      return store.rpc(functionName, args)
     }
   }
 }
