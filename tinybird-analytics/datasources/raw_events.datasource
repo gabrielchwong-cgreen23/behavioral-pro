@@ -1,4 +1,7 @@
+TOKEN raw_events_append APPEND
+
 SCHEMA >
+    `store_id` String `json:$.store_id`,
     `event_id` String `json:$.event_id`,
     `event_name` LowCardinality(String) `json:$.event_name`,
     `shop_domain` LowCardinality(String) `json:$.shop_domain`,
@@ -12,4 +15,19 @@ SCHEMA >
     `metadata` String `json:$.metadata`
 
 ENGINE "MergeTree"
-ENGINE_SORTING_KEY "shop_domain, session_id, client_timestamp, event_id"
+ENGINE_SORTING_KEY "store_id, shop_domain, session_id, client_timestamp, event_id"
+
+FORWARD_QUERY >
+    SELECT
+        defaultValueOfTypeName('String') AS store_id,
+        event_id,
+        event_name,
+        shop_domain,
+        session_id,
+        visitor_id,
+        experiment_variant,
+        page_url,
+        referrer,
+        client_timestamp,
+        server_timestamp,
+        metadata
