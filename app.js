@@ -2276,17 +2276,19 @@ export function createApp({
         fetchImpl
       })
 
-      supabase
-        .from('stores')
-        .upsert([{
-          shop_domain,
-          last_event_at: server_timestamp
-        }], { onConflict: 'shop_domain' })
-        .select()
-        .catch((error) => {
+      ;(async () => {
+        try {
+          await supabase
+            .from('stores')
+            .upsert([{
+              shop_domain,
+              last_event_at: server_timestamp
+            }], { onConflict: 'shop_domain' })
+            .select()
+        } catch (error) {
           console.log('STORE LAST EVENT UPDATE ERROR:', error)
-          return null
-        })
+        }
+      })()
 
       return res.status(202).json({
         success: true,
@@ -2408,17 +2410,19 @@ export function createApp({
         intervention_type: result.intervention_type
       }))
 
-      supabase
-        .from('stores')
-        .upsert([{
-          shop_domain: shopDomain,
-          last_decision_at: new Date().toISOString()
-        }], { onConflict: 'shop_domain' })
-        .select()
-        .catch((error) => {
+      ;(async () => {
+        try {
+          await supabase
+            .from('stores')
+            .upsert([{
+              shop_domain: shopDomain,
+              last_decision_at: new Date().toISOString()
+            }], { onConflict: 'shop_domain' })
+            .select()
+        } catch (error) {
           console.log('STORE LAST DECISION UPDATE ERROR:', error)
-          return null
-        })
+        }
+      })()
 
       return res
         .set('Cache-Control', 'no-store')
