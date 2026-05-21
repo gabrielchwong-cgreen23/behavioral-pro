@@ -14,7 +14,10 @@
     "test": "node --test tests/**/*.test.js",
     "stress:test": "node --test tests/stress.test.js",
     "test:phase1-events": "node --test tests/events-phase1.test.js",
-    "simulate:phase1-session": "node scripts/simulate-phase1-session.js"
+    "simulate:phase1-session": "node scripts/simulate-phase1-session.js",
+    "check:session-features": "node scripts/check-session-features.js",
+    "validate:session-features": "node scripts/validate-session-features.js",
+    "validate:live-intervention": "node scripts/validate-live-intervention.js"
  
   },
   "dependencies": {
@@ -22,7 +25,8 @@
     "axios": "^1.16.1",
     "cors": "^2.8.6",
     "dotenv": "^17.4.1",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "zod": "^3.24.1"
   },
   "trustedDependencies": [
     "@shopify/plugin-cloudflare"

@@ -20,6 +20,7 @@ export const PHASE1_EVENT_NAMES = [
   'review_section_dwell_10s',
   'cta_idle_15s',
   'rage_click',
+  'shadow_intervention_logged',
   'intervention_triggered',
   'intervention_type'
 ]
@@ -96,6 +97,7 @@ export function normalizePhase1EventPayload(input = {}) {
   }
 
   return {
+    store_id: normalizeOptionalString(input.store_id),
     event_name: eventName,
     shop_domain: normalizeRequiredString(input.shop_domain, 'shop_domain'),
     session_id: normalizeRequiredString(input.session_id, 'session_id'),
@@ -130,6 +132,7 @@ export function buildPhase1EventRecord(input = {}, options = {}) {
 }
 
 export function buildAssignmentEvent({
+  storeId = null,
   shopDomain,
   sessionId,
   visitorId,
@@ -141,6 +144,7 @@ export function buildAssignmentEvent({
   metadata = {}
 }) {
   return buildPhase1EventRecord({
+    store_id: storeId,
     event_name: 'experiment_assignment',
     shop_domain: shopDomain,
     session_id: sessionId,

@@ -11,12 +11,34 @@ import {
   trackSessionStarted
 } from './packages/analytics/src/index.js'
 import {
-  buildAssignmentEvent,
   buildPhase1EventRecord,
+  buildAssignmentEvent,
   createPhase1EventId,
-  getLegacyEventMirror,
-  PHASE1_EVENT_NAME_SET
+  getLegacyEventMirror
 } from './packages/analytics/src/event-spine.js'
+import {
+  getTinybirdEventsApiUrl,
+  getTinybirdIngestToken,
+  queryTinybirdSql,
+  toTinybirdSqlString
+} from './packages/analytics/src/tinybird.js'
+import {
+  buildRateLimitKey,
+  createInMemoryRateLimiter,
+  getClientIp,
+  isBotLikeRequest,
+  originMatchesPageUrl,
+  validateInterventionDecisionQuery,
+  validatePublicEventPayload
+} from './packages/analytics/src/request-security.js'
+import {
+  getInterventionDecision,
+  getInterventionMessageId,
+  getInterventionStoreConfigFromRecord
+} from './packages/analytics/src/intervention-decision.js'
+import {
+  buildSessionFeaturesBaseCte
+} from './packages/analytics/src/session-features-sql.js'
 import { registerOwnerAnalyticsRoutes } from './packages/owner-analytics/src/index.js'
 
 const DEFAULT_PORT = 3001
@@ -25,6 +47,14 @@ const TIMESTAMP_HEADER = 'x-behavioralpro-timestamp'
 const SIGNATURE_TTL_MS = 5 * 60 * 1000
 const EVENT_DEDUPE_TTL_MS = 15 * 60 * 1000
 const recentEventIds = new Map()
+const eventIngestLimiter = createInMemoryRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 120
+})
+const interventionDecisionLimiter = createInMemoryRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 60
+})
 
 function createSupabaseClient(env) {
   if (!env?.SUPABASE_URL) {
@@ -41,6 +71,10 @@ function createSupabaseClient(env) {
 export function normalizeShop(shop) {
   if (!shop || typeof shop !== 'string') return null
   return shop.includes('.myshopify.com') ? shop : `${shop}.myshopify.com`
+}
+
+export function getShopDomainFromRequestBody(body = {}) {
+  return normalizeShop(body?.shop_domain || body?.properties?.shop_domain)
 }
 
 function escapeHtml(value) {
@@ -301,15 +335,296 @@ function markOrDetectDuplicateEventId(eventId) {
   return false
 }
 
-function getTinybirdEventsApiUrl(env = process.env) {
-  if (env.TINYBIRD_EVENTS_API_URL) {
-    return env.TINYBIRD_EVENTS_API_URL
+async function lookupStoreRecord(supabase, shopDomain) {
+  if (!shopDomain) return null
+
+  const { data, error } = await supabase
+    .from('stores')
+    .select('*')
+    .eq('shop_domain', shopDomain)
+    .maybeSingle()
+
+  if (error) {
+    throw new Error(`Store lookup failed: ${error.message || error}`)
   }
 
-  const host = String(env.TINYBIRD_HOST || 'https://api.europe-west2.gcp.tinybird.co').replace(/\/+$/, '')
-  const datasource = env.TINYBIRD_RAW_EVENTS_DATASOURCE || 'raw_events'
-  const branch = env.TINYBIRD_BRANCH ? `&branch=${encodeURIComponent(env.TINYBIRD_BRANCH)}` : ''
-  return `${host}/v0/events?name=${encodeURIComponent(datasource)}${branch}`
+  return data || null
+}
+
+function normalizeStoreId(value) {
+  if (value == null) return null
+  const normalized = String(value).trim()
+  return normalized || null
+}
+
+const DEFAULT_STORE_CONFIG = {
+  interventions_enabled: true,
+  is_active: true,
+  tidio_enabled: true,
+  shadow_mode: false,
+  tidio_project_id: '63hgfq26munthk1pfvmvz25ryddkjgsf',
+  aov_cohort: 'mid_tier',
+  cooldown_seconds: 300,
+  intervention_threshold: null,
+  allowed_intervention_types: [
+    'friction_assistance',
+    'cart_recovery',
+    'checkout_recovery',
+    'trust_reassurance',
+    'fast_conversion_nudge',
+    'reassurance_assist',
+    'high_touch_consultation'
+  ]
+}
+
+function normalizeBooleanFlag(value, fallback = false) {
+  if (value == null) return fallback
+  if (typeof value === 'boolean') return value
+  const normalized = String(value).trim().toLowerCase()
+  if (normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on') return true
+  if (normalized === 'false' || normalized === '0' || normalized === 'no' || normalized === 'off') return false
+  return fallback
+}
+
+function normalizePositiveInteger(value, fallback, {
+  min = 0,
+  max = Number.MAX_SAFE_INTEGER
+} = {}) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return fallback
+  const rounded = Math.round(numeric)
+  return Math.min(max, Math.max(min, rounded))
+}
+
+function normalizeAllowedInterventionTypes(value, fallback = DEFAULT_STORE_CONFIG.allowed_intervention_types) {
+  if (!Array.isArray(value)) return [...fallback]
+  const unique = new Set()
+  for (const item of value) {
+    const normalized = String(item || '').trim()
+    if (normalized) unique.add(normalized)
+  }
+  return unique.size ? Array.from(unique) : [...fallback]
+}
+
+function normalizeStoreConfig(input = {}) {
+  const base = {
+    ...DEFAULT_STORE_CONFIG,
+    ...(input && typeof input === 'object' ? input : {})
+  }
+
+  const cohort = ['impulse', 'mid_tier', 'luxury'].includes(String(base.aov_cohort || ''))
+    ? String(base.aov_cohort)
+    : DEFAULT_STORE_CONFIG.aov_cohort
+
+  return {
+    interventions_enabled: normalizeBooleanFlag(base.interventions_enabled, DEFAULT_STORE_CONFIG.interventions_enabled),
+    is_active: normalizeBooleanFlag(
+      base.is_active ?? base.interventions_enabled,
+      DEFAULT_STORE_CONFIG.is_active
+    ),
+    tidio_enabled: normalizeBooleanFlag(base.tidio_enabled, DEFAULT_STORE_CONFIG.tidio_enabled),
+    shadow_mode: normalizeBooleanFlag(base.shadow_mode, DEFAULT_STORE_CONFIG.shadow_mode),
+    tidio_project_id: String(base.tidio_project_id || DEFAULT_STORE_CONFIG.tidio_project_id).trim() || DEFAULT_STORE_CONFIG.tidio_project_id,
+    aov_cohort: cohort,
+    cooldown_seconds: normalizePositiveInteger(base.cooldown_seconds, DEFAULT_STORE_CONFIG.cooldown_seconds, { min: 30, max: 3600 }),
+    intervention_threshold: Number.isFinite(Number(base.intervention_threshold))
+      ? Number(base.intervention_threshold)
+      : null,
+    allowed_intervention_types: normalizeAllowedInterventionTypes(base.allowed_intervention_types)
+  }
+}
+
+function mergeStoreConfig(existingConfig, patchConfig) {
+  return normalizeStoreConfig({
+    ...normalizeStoreConfig(existingConfig),
+    ...(patchConfig && typeof patchConfig === 'object' ? patchConfig : {})
+  })
+}
+
+function getStoreConfigFromRecord(storeRecord) {
+  return getInterventionStoreConfigFromRecord(storeRecord)
+}
+
+function sanitizeStoreConfigForMerchant(config) {
+  return normalizeStoreConfig(config)
+}
+
+function sanitizeStoreConfigForStorefront(config) {
+  const normalized = normalizeStoreConfig(config)
+  return {
+    interventions_enabled: normalized.interventions_enabled,
+    tidio_enabled: normalized.tidio_enabled,
+    tidio_project_id: normalized.tidio_project_id,
+    shadow_mode: normalized.shadow_mode,
+    cooldown_seconds: normalized.cooldown_seconds,
+    allowed_intervention_types: normalized.allowed_intervention_types
+  }
+}
+
+function buildSetupStatus({
+  shopDomain,
+  storeRecord,
+  overview,
+  sessionCount,
+  rawEventCount
+}) {
+  const totals = overview?.totals || {}
+  const sessions = Number((sessionCount ?? totals.sessions) || 0)
+  const events = Number((rawEventCount ?? totals.rawEventCount) || 0)
+  const purchases = Number(totals.convertedSessions || 0)
+  const triggerCount = Number(totals.triggerCount || 0)
+  const messageCount = Number(totals.messageCount || 0)
+
+  let stage = 'install'
+  if (sessions > 0) stage = 'collecting'
+  if (events > 5 && triggerCount > 0) stage = 'decisioning'
+  if (messageCount > 0) stage = 'intervening'
+  if (purchases > 0) stage = 'measuring'
+
+  return {
+    shop_domain: shopDomain,
+    stage,
+    checklist: {
+      store_registered: Boolean(storeRecord),
+      embed_receiving_sessions: sessions > 0,
+      events_flowing: events > 0,
+      interventions_recorded: messageCount > 0,
+      revenue_attributed: purchases > 0
+    },
+    diagnostics: {
+      installed_at: storeRecord?.installed_at || null,
+      last_event_at: storeRecord?.last_event_at || null,
+      last_decision_at: storeRecord?.last_decision_at || null,
+      sessions,
+      raw_events: events,
+      purchases,
+      triggers_fired: triggerCount,
+      interventions_shown: messageCount
+    }
+  }
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`
+  }
+
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => (
+      `${JSON.stringify(key)}:${stableStringify(value[key])}`
+    )).join(',')}}`
+  }
+
+  return JSON.stringify(value)
+}
+
+function buildBehavioralEventId({
+  anonymousId,
+  sessionId,
+  eventName,
+  timestamp,
+  properties
+}) {
+  const digest = crypto
+    .createHash('sha256')
+    .update([
+      anonymousId,
+      sessionId,
+      eventName,
+      String(timestamp),
+      stableStringify(properties || {})
+    ].join('|'), 'utf8')
+    .digest('hex')
+
+  return `evt_${digest.slice(0, 32)}`
+}
+
+function buildPageUrlFromProperties({ shopDomain, path }) {
+  if (!shopDomain) return ''
+
+  try {
+    if (path && /^https?:\/\//i.test(path)) {
+      return new URL(path).toString()
+    }
+
+    const normalizedPath = path && path.startsWith('/') ? path : '/'
+    return new URL(normalizedPath, `https://${shopDomain}`).toString()
+  } catch {
+    return `https://${shopDomain}/`
+  }
+}
+
+function getCookieValue(req, name) {
+  const cookieHeader = req.headers.cookie || req.headers.Cookie
+  if (typeof cookieHeader !== 'string' || !cookieHeader) {
+    return null
+  }
+
+  for (const part of cookieHeader.split(';')) {
+    const [cookieName, ...rest] = part.trim().split('=')
+    if (cookieName === name) {
+      return decodeURIComponent(rest.join('='))
+    }
+  }
+
+  return null
+}
+
+function getOwnerAccessToken(req) {
+  const cookieToken = getCookieValue(req, 'behavioralpro_owner_auth')
+  if (cookieToken) return cookieToken
+
+  const bearerToken = getBearerToken(req)
+  if (bearerToken) return bearerToken
+
+  const headerToken = req.headers['x-analytics-token']
+  if (typeof headerToken === 'string' && headerToken.trim()) {
+    return headerToken.trim()
+  }
+
+  if (typeof req.query.token === 'string' && req.query.token.trim()) {
+    return req.query.token.trim()
+  }
+
+  return null
+}
+
+function rejectRateLimited(res, retryAfterSeconds) {
+  return res
+    .status(429)
+    .set('Retry-After', String(retryAfterSeconds))
+    .json({
+      success: false,
+      error: 'Too many requests'
+    })
+}
+
+function sendSafeServerError(res) {
+  return res.status(500).json({
+    success: false,
+    error: 'Internal server error'
+  })
+}
+
+function createRequireOwnerAccess(ownerToken) {
+  return function requireOwnerAccess(req, res, next) {
+    if (!ownerToken) {
+      return res.status(500).json({
+        success: false,
+        error: 'Missing ANALYTICS_OWNER_TOKEN'
+      })
+    }
+
+    const provided = getOwnerAccessToken(req)
+    if (!provided || provided !== ownerToken) {
+      return res.status(401).json({
+        success: false,
+        error: 'Unauthorized'
+      })
+    }
+
+    return next()
+  }
 }
 
 async function forwardEventToTinybird({
@@ -321,9 +636,9 @@ async function forwardEventToTinybird({
     throw new Error('Global fetch is unavailable for Tinybird forwarding')
   }
 
-  const tinybirdToken = env.TINYBIRD_TOKEN
+  const tinybirdToken = getTinybirdIngestToken(env)
   if (!tinybirdToken) {
-    throw new Error('Missing TINYBIRD_TOKEN')
+    throw new Error('Missing Tinybird ingest token')
   }
 
   const response = await fetchImpl(getTinybirdEventsApiUrl(env), {
@@ -409,6 +724,45 @@ async function mirrorPhase1EventToLegacyAnalytics({
   return { mirrored: true, eventType: legacy.eventType }
 }
 
+async function logShadowInterventionDecision({
+  shopDomain,
+  sessionId,
+  session = null,
+  result,
+  env = process.env,
+  fetchImpl = globalThis.fetch
+}) {
+  const metadata = {
+    strategy: result?.strategy || 'unknown',
+    reason: result?.reason || 'unknown',
+    decision: Boolean(result?.decision),
+    intervention_type: result?.intervention_type || 'none',
+    message_id: result?.message_id || getInterventionMessageId(result?.intervention_type || 'none'),
+    calculated_threshold: Number(result?.calculated_threshold || 0),
+    session_score: Number(result?.session_score || 0)
+  }
+
+  const eventRecord = buildPhase1EventRecord({
+    store_id: normalizeStoreId(session?.store_id),
+    event_name: 'shadow_intervention_logged',
+    shop_domain: shopDomain,
+    session_id: sessionId,
+    visitor_id: String(session?.visitor_id || `shadow_${sessionId}`),
+    experiment_variant: String(session?.experiment_variant || 'control'),
+    page_url: String(session?.page_url || `https://${shopDomain}/`),
+    referrer: session?.referrer || null,
+    client_timestamp: new Date().toISOString(),
+    event_id: createPhase1EventId('shadow'),
+    metadata
+  })
+
+  return forwardEventToTinybird({
+    eventRecord,
+    env,
+    fetchImpl
+  })
+}
+
 export async function ingestPhase1Event({
   env = process.env,
   analyticsOptions,
@@ -467,9 +821,133 @@ export async function ingestPhase1Event({
   }
 }
 
+async function queryTinybirdSingleRow({ sql, env, fetchImpl, logLabel }) {
+  const result = await queryTinybirdSql({ sql, env, fetchImpl, logLabel })
+  return Array.isArray(result.data) && result.data[0] ? result.data[0] : null
+}
+
+export async function buildSessionFeaturesHealthReport({
+  env,
+  fetchImpl = globalThis.fetch
+}) {
+  const sessionFeaturesCte = buildSessionFeaturesBaseCte()
+
+  const summary = await queryTinybirdSingleRow({
+    env,
+    fetchImpl,
+    logLabel: 'SESSION FEATURES HEALTH SUMMARY',
+    sql: `
+      ${sessionFeaturesCte}
+      SELECT
+        count() AS total_sessions_processed,
+        uniqExactIf(store_id, notEmpty(ifNull(store_id, ''))) AS unique_stores_represented,
+        countIf(empty(ifNull(store_id, ''))) AS sessions_missing_store_id,
+        sum(toUInt64(purchased)) AS total_purchases,
+        sum(toUInt64(reached_checkout)) AS total_reached_checkout,
+        sum(toUInt64(provisional_abandoned_cart)) AS total_provisional_abandoned_carts,
+        sum(toUInt64(provisional_abandoned_checkout)) AS total_provisional_abandoned_checkouts,
+        sum(toUInt64(had_intervention)) AS total_had_intervention,
+        countIf(empty(ifNull(visitor_id, ''))) AS rows_missing_visitor_id,
+        countIf(empty(ifNull(experiment_variant, ''))) AS rows_missing_experiment_variant,
+        sum(ifNull(malformed_metadata_count, 0)) AS malformed_metadata_count,
+        max(last_seen_at) AS latest_session_seen_at,
+        min(first_seen_at) AS oldest_session_seen_at
+      FROM session_features
+    `
+  })
+
+  const sessionsByStore = await queryTinybirdSql({
+    env,
+    fetchImpl,
+    logLabel: 'SESSION FEATURES HEALTH STORES',
+    sql: `
+      ${sessionFeaturesCte}
+      SELECT
+        store_id,
+        count() AS sessions
+      FROM session_features
+      WHERE notEmpty(ifNull(store_id, ''))
+      GROUP BY store_id
+      ORDER BY sessions DESC, store_id ASC
+      LIMIT 100
+    `
+  })
+
+  const fallbackByShop = await queryTinybirdSql({
+    env,
+    fetchImpl,
+    logLabel: 'SESSION FEATURES HEALTH FALLBACK',
+    sql: `
+      ${sessionFeaturesCte}
+      SELECT
+        shop_domain,
+        count() AS sessions
+      FROM session_features
+      WHERE empty(ifNull(store_id, ''))
+      GROUP BY shop_domain
+      ORDER BY sessions DESC, shop_domain ASC
+      LIMIT 100
+    `
+  })
+
+  const rawDataQuality = await queryTinybirdSingleRow({
+    env,
+    fetchImpl,
+    logLabel: 'SESSION FEATURES HEALTH RAW',
+    sql: `
+      SELECT
+        countIf(empty(ifNull(session_id, ''))) AS rows_missing_session_id,
+        countIf(empty(ifNull(visitor_id, ''))) AS raw_rows_missing_visitor_id,
+        countIf(empty(ifNull(experiment_variant, ''))) AS raw_rows_missing_experiment_variant,
+        count() - uniqExact(event_id) AS duplicate_event_id_count,
+        countIf(notEmpty(ifNull(metadata, '')) AND isValidJSON(metadata) = 0) AS malformed_metadata_count
+      FROM raw_events
+    `
+  })
+
+  const response = {
+    ok: true,
+    total_sessions_processed: Number(summary?.total_sessions_processed || 0),
+    unique_stores_represented: Number(summary?.unique_stores_represented || 0),
+    sessions_missing_store_id: Number(summary?.sessions_missing_store_id || 0),
+    sessions_by_store_id: sessionsByStore.data || [],
+    fallback_sessions_by_shop_domain: fallbackByShop.data || [],
+    conversion_metrics: {
+      total_purchases: Number(summary?.total_purchases || 0),
+      total_reached_checkout: Number(summary?.total_reached_checkout || 0),
+      total_provisional_abandoned_carts: Number(summary?.total_provisional_abandoned_carts || 0),
+      total_provisional_abandoned_checkouts: Number(summary?.total_provisional_abandoned_checkouts || 0),
+      total_had_intervention: Number(summary?.total_had_intervention || 0)
+    },
+    data_quality: {
+      rows_missing_session_id: Number(rawDataQuality?.rows_missing_session_id || 0),
+      rows_missing_visitor_id: Number(summary?.rows_missing_visitor_id || 0),
+      rows_missing_experiment_variant: Number(summary?.rows_missing_experiment_variant || 0),
+      malformed_metadata_count: rawDataQuality?.malformed_metadata_count != null
+        ? Number(rawDataQuality.malformed_metadata_count)
+        : null,
+      duplicate_event_id_count: rawDataQuality?.duplicate_event_id_count != null
+        ? Number(rawDataQuality.duplicate_event_id_count)
+        : null
+    },
+    latest_session_seen_at: summary?.latest_session_seen_at || null,
+    oldest_session_seen_at: summary?.oldest_session_seen_at || null
+  }
+
+  console.log('SESSION FEATURES HEALTH REPORT:', JSON.stringify({
+    total_sessions_processed: response.total_sessions_processed,
+    unique_stores_represented: response.unique_stores_represented,
+    sessions_missing_store_id: response.sessions_missing_store_id
+  }))
+
+  return response
+}
+
 export function buildMetricsPayload(shopDomain, overview) {
   const controlSessions = overview.sessionTable.filter(session => session.variant === 'control')
   const variantSessions = overview.sessionTable.filter(session => session.variant === 'variant')
+  const exposedSessions = overview.sessionTable.filter(session => Array.isArray(session.messages_shown) && session.messages_shown.length > 0)
+  const unexposedSessions = overview.sessionTable.filter(session => !Array.isArray(session.messages_shown) || session.messages_shown.length === 0)
 
   function summarize(sessions) {
     const purchases = sessions.filter(session => session.converted).length
@@ -486,15 +964,30 @@ export function buildMetricsPayload(shopDomain, overview) {
 
   const control = summarize(controlSessions)
   const variant = summarize(variantSessions)
+  const exposed = summarize(exposedSessions)
+  const unexposed = summarize(unexposedSessions)
   const liftPercent = control.revenue_per_session === 0
     ? 0
     : ((variant.revenue_per_session - control.revenue_per_session) / control.revenue_per_session) * 100
+  const exposureLiftPercent = unexposed.revenue_per_session === 0
+    ? 0
+    : ((exposed.revenue_per_session - unexposed.revenue_per_session) / unexposed.revenue_per_session) * 100
+  const incrementalRevenueEstimate = Math.max(
+    0,
+    (variant.revenue_per_session - control.revenue_per_session) * variant.sessions
+  )
 
   return {
     shop_domain: shopDomain,
     control,
     variant,
-    lift_percent: liftPercent
+    exposed,
+    unexposed,
+    totals: overview.totals || {},
+    lift_percent: liftPercent,
+    exposure_rate: overview.sessionTable.length === 0 ? 0 : exposed.sessions / overview.sessionTable.length,
+    exposure_lift_percent: exposureLiftPercent,
+    incremental_revenue_estimate: incrementalRevenueEstimate
   }
 }
 
@@ -552,10 +1045,64 @@ function buildDashboardPage({ shopDomain, apiKey }) {
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 14px;
     }
+    .setup-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 20px;
+    }
     .stat { background: #f9fafb; border-radius: 12px; padding: 14px; }
     .label { font-size: 13px; color: #6b7280; margin-bottom: 6px; }
     .value { font-size: 28px; font-weight: 700; line-height: 1.1; }
     .value.small { font-size: 20px; }
+    .checklist { display: grid; gap: 10px; margin-top: 14px; }
+    .check-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: #f9fafb;
+      font-size: 14px;
+    }
+    .check-row strong { font-size: 14px; }
+    .check-ok { color: #047857; font-weight: 700; }
+    .check-pending { color: #b45309; font-weight: 700; }
+    .controls-form {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 14px;
+    }
+    .field { display: grid; gap: 8px; }
+    .field label { font-size: 13px; color: #374151; font-weight: 600; }
+    .field input, .field select {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid #d1d5db;
+      font-size: 14px;
+      background: #ffffff;
+    }
+    .toggle {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+    }
+    .actions { display: flex; gap: 12px; align-items: center; margin-top: 16px; }
+    .button {
+      appearance: none;
+      border: 0;
+      border-radius: 12px;
+      padding: 11px 14px;
+      background: #111827;
+      color: #ffffff;
+      font-weight: 600;
+      cursor: pointer;
+    }
     .pill {
       display: inline-block;
       padding: 6px 10px;
@@ -588,6 +1135,8 @@ function buildDashboardPage({ shopDomain, apiKey }) {
     .ok { color: #047857; font-weight: 600; }
     @media (max-width: 900px) {
       .grid { grid-template-columns: 1fr; }
+      .setup-grid { grid-template-columns: 1fr; }
+      .controls-form { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
       body { padding: 18px; }
@@ -624,6 +1173,47 @@ function buildDashboardPage({ shopDomain, apiKey }) {
       </ol>
     </div>
 
+    <div class="setup-grid">
+      <div class="card">
+        <div class="pill">Setup Status</div>
+        <h2>Store Readiness</h2>
+        <div class="muted">This checks whether the store is installed, collecting behavior, and showing interventions.</div>
+        <div class="muted" style="margin-top: 8px;">Current stage: <strong id="setup-stage">Loading...</strong></div>
+        <div class="checklist" id="setup-checklist"></div>
+      </div>
+
+      <div class="card">
+        <div class="pill">Controls</div>
+        <h2>Intervention Controls</h2>
+        <div class="muted">These settings change live storefront behavior without editing theme code.</div>
+        <div class="controls-form">
+          <div class="toggle"><input type="checkbox" id="cfg-interventions-enabled" /><label for="cfg-interventions-enabled">Enable interventions</label></div>
+          <div class="toggle"><input type="checkbox" id="cfg-tidio-enabled" /><label for="cfg-tidio-enabled">Deliver through Tidio</label></div>
+          <div class="toggle"><input type="checkbox" id="cfg-shadow-mode" /><label for="cfg-shadow-mode">Shadow mode only</label></div>
+          <div class="field">
+            <label for="cfg-aov-cohort">AOV cohort</label>
+            <select id="cfg-aov-cohort">
+              <option value="impulse">Impulse</option>
+              <option value="mid_tier">Mid-tier</option>
+              <option value="luxury">Luxury</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="cfg-cooldown-seconds">Cooldown seconds</label>
+            <input type="number" id="cfg-cooldown-seconds" min="30" max="3600" step="30" />
+          </div>
+          <div class="field">
+            <label for="cfg-tidio-project-id">Tidio project ID</label>
+            <input type="text" id="cfg-tidio-project-id" />
+          </div>
+        </div>
+        <div class="actions">
+          <button class="button" id="save-controls-button" type="button">Save controls</button>
+          <span class="muted" id="controls-save-status">Waiting for settings...</span>
+        </div>
+      </div>
+    </div>
+
     <div class="grid">
       <div class="card">
         <div class="pill">Control</div>
@@ -652,6 +1242,8 @@ function buildDashboardPage({ shopDomain, apiKey }) {
         <div class="stats-grid">
           <div class="stat"><div class="label">Lift %</div><div class="value" id="lift-percent">—</div></div>
           <div class="stat"><div class="label">Current Status</div><div class="value small" id="status-text">Loading...</div></div>
+          <div class="stat"><div class="label">Exposure Rate</div><div class="value small" id="exposure-rate">—</div></div>
+          <div class="stat"><div class="label">Estimated Incremental Revenue</div><div class="value small" id="incremental-revenue">—</div></div>
         </div>
       </div>
     </div>
@@ -677,6 +1269,7 @@ function buildDashboardPage({ shopDomain, apiKey }) {
 
   <script>
     const shopDomain = ${JSON.stringify(shopDomain)};
+    let currentStoreConfig = null;
 
     function setText(id, value) {
       const el = document.getElementById(id);
@@ -773,6 +1366,62 @@ function buildDashboardPage({ shopDomain, apiKey }) {
       });
     }
 
+    async function authedJson(url, options = {}) {
+      const response = await authedFetch(url, options);
+      const json = await response.json();
+      if (!response.ok || !json.success) {
+        throw new Error(json.error || 'Request failed');
+      }
+      return json.data;
+    }
+
+    function renderSetupStatus(setup) {
+      setText('setup-stage', String(setup && setup.stage ? setup.stage : 'unknown'));
+      const container = document.getElementById('setup-checklist');
+      if (!container) return;
+
+      const checklist = setup && setup.checklist ? setup.checklist : {};
+      const rows = [
+        ['Store registered', checklist.store_registered],
+        ['Sessions received', checklist.embed_receiving_sessions],
+        ['Behavioral events flowing', checklist.events_flowing],
+        ['Interventions recorded', checklist.interventions_recorded],
+        ['Revenue measured', checklist.revenue_attributed]
+      ];
+
+      container.innerHTML = rows.map(function (row) {
+        const ok = Boolean(row[1]);
+        return [
+          '<div class="check-row">',
+          '<strong>' + row[0] + '</strong>',
+          '<span class="' + (ok ? 'check-ok' : 'check-pending') + '">' + (ok ? 'Ready' : 'Pending') + '</span>',
+          '</div>'
+        ].join('');
+      }).join('');
+    }
+
+    function applyStoreConfigToForm(config) {
+      currentStoreConfig = config || {};
+      document.getElementById('cfg-interventions-enabled').checked = currentStoreConfig.interventions_enabled !== false;
+      document.getElementById('cfg-tidio-enabled').checked = currentStoreConfig.tidio_enabled !== false;
+      document.getElementById('cfg-shadow-mode').checked = currentStoreConfig.shadow_mode === true;
+      document.getElementById('cfg-aov-cohort').value = String(currentStoreConfig.aov_cohort || 'mid_tier');
+      document.getElementById('cfg-cooldown-seconds').value = String(currentStoreConfig.cooldown_seconds || 300);
+      document.getElementById('cfg-tidio-project-id').value = String(currentStoreConfig.tidio_project_id || '');
+      setStatus('controls-save-status', 'Settings loaded', 'ok');
+    }
+
+    function readStoreConfigFromForm() {
+      return {
+        interventions_enabled: document.getElementById('cfg-interventions-enabled').checked,
+        tidio_enabled: document.getElementById('cfg-tidio-enabled').checked,
+        shadow_mode: document.getElementById('cfg-shadow-mode').checked,
+        aov_cohort: document.getElementById('cfg-aov-cohort').value,
+        cooldown_seconds: Number(document.getElementById('cfg-cooldown-seconds').value || 300),
+        tidio_project_id: document.getElementById('cfg-tidio-project-id').value.trim()
+      };
+    }
+
     async function verifyEmbeddedAuth() {
       try {
         setStatus('embedded-auth-status', 'Requesting session token...');
@@ -801,6 +1450,51 @@ function buildDashboardPage({ shopDomain, apiKey }) {
         }
 
         return false;
+      }
+    }
+
+    async function loadStoreConfig() {
+      try {
+        const data = await authedJson(
+          '/api/store-config/' +
+            encodeURIComponent(shopDomain) +
+            '?shop=' +
+            encodeURIComponent(shopDomain),
+          { method: 'GET' }
+        );
+
+        applyStoreConfigToForm(data.config || {});
+        renderSetupStatus(data.setup || {});
+      } catch (error) {
+        console.error('Store config error:', error);
+        setStatus('controls-save-status', 'Failed to load settings', 'error');
+      }
+    }
+
+    async function saveStoreConfig() {
+      try {
+        setStatus('controls-save-status', 'Saving...');
+        const data = await authedJson(
+          '/api/store-config/' +
+            encodeURIComponent(shopDomain) +
+            '?shop=' +
+            encodeURIComponent(shopDomain),
+          {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              config: readStoreConfigFromForm()
+            })
+          }
+        );
+
+        applyStoreConfigToForm(data.config || {});
+        setStatus('controls-save-status', 'Saved', 'ok');
+      } catch (error) {
+        console.error('Save controls error:', error);
+        setStatus('controls-save-status', 'Save failed: ' + String(error.message || error), 'error');
       }
     }
 
@@ -838,6 +1532,8 @@ function buildDashboardPage({ shopDomain, apiKey }) {
 
         const lift = Number(data.lift_percent ?? 0);
         setText('lift-percent', lift.toFixed(1) + '%');
+        setText('exposure-rate', formatPercent(data.exposure_rate || 0));
+        setText('incremental-revenue', formatMoney(data.incremental_revenue_estimate || 0));
 
         const totalSessions = Number(control.sessions || 0) + Number(variant.sessions || 0);
         const totalPurchases = Number(control.purchases || 0) + Number(variant.purchases || 0);
@@ -936,7 +1632,7 @@ function renderAbandonmentByVariant(rows) {
     async function boot() {
       const authOk = await verifyEmbeddedAuth();
       if (authOk) {
-        await Promise.all([loadMetrics(), loadAnalyticsRates(), loadAbandonmentByVariant()]);
+        await Promise.all([loadStoreConfig(), loadMetrics(), loadAnalyticsRates(), loadAbandonmentByVariant()]);
       } else {
         setStatus('status-text', 'Blocked by auth', 'error');
         renderAnalyticsRates([]);
@@ -962,13 +1658,18 @@ async function loadAbandonmentByVariant() {
   }
 }
 
+    document.getElementById('save-controls-button').addEventListener('click', saveStoreConfig);
     boot();
   </script>
 </body>
 </html>`
 }
 
-export function createApp({ env = process.env, supabase: providedSupabase } = {}) {
+export function createApp({
+  env = process.env,
+  supabase: providedSupabase,
+  fetchImpl = globalThis.fetch
+} = {}) {
   const app = express()
   const corsOptions = {
     origin: true,
@@ -981,6 +1682,7 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
   const ingestSigningSecret = env.INGEST_SIGNING_SECRET || env.SHOPIFY_API_SECRET
   const legacyAssignmentMirrorEnabled = env.BEHAVIORALPRO_ENABLE_LEGACY_ASSIGNMENT_MIRROR !== 'false'
   const supabaseRawEventMirrorEnabled = env.BEHAVIORALPRO_ENABLE_SUPABASE_RAW_EVENT_MIRROR === 'true'
+  const requireOwnerAccess = createRequireOwnerAccess(env.ANALYTICS_OWNER_TOKEN)
 
   if (!env.SHOPIFY_API_KEY) {
     console.warn('Missing SHOPIFY_API_KEY')
@@ -1000,6 +1702,7 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
 
   app.use(cors(corsOptions))
   app.use(express.json({
+    limit: env.BEHAVIORALPRO_JSON_LIMIT || '16kb',
     verify(req, _res, buf) {
       req.rawBody = buf.toString('utf8')
     }
@@ -1016,7 +1719,9 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
     '/api/metrics/:shop_domain',
     '/api/debug/:shop_domain',
     '/api/embedded-check',
-    '/api/analytics/conversion-rates/:shop_domain'
+    '/api/analytics/conversion-rates/:shop_domain',
+    '/api/admin/session-features-health',
+    '/api/intervention-decision'
   ]) {
     app.options(route, cors(corsOptions))
   }
@@ -1053,7 +1758,7 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
     const requestedShop =
       normalizeShop(req.query.shop) ||
       normalizeShop(req.params.shop_domain) ||
-      normalizeShop(req.body?.shop_domain)
+      getShopDomainFromRequestBody(req.body)
 
     try {
       const token = getBearerToken(req)
@@ -1088,7 +1793,7 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
   }
 
   function requireEventIngestAuth(req, res, next) {
-    const requestedShop = normalizeShop(req.body?.shop_domain)
+    const requestedShop = getShopDomainFromRequestBody(req.body)
 
     try {
       const token = getBearerToken(req)
@@ -1154,7 +1859,8 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
         shop_domain,
         access_token,
         scope,
-        installed_at: new Date().toISOString()
+        installed_at: new Date().toISOString(),
+        settings: normalizeStoreConfig(req.body?.settings || {})
       }
 
       const { data, error } = await supabase
@@ -1164,16 +1870,125 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
 
       if (error) {
         console.log('STORE UPSERT ERROR:', error)
-        return res.status(500).json({ success: false, error })
+        return sendSafeServerError(res)
       }
 
-      return res.json({ success: true, data })
+      return res.json({
+        success: true,
+        data: (data || []).map((row) => ({
+          shop_domain: row.shop_domain,
+          installed_at: row.installed_at,
+          scope: row.scope || null,
+          settings: sanitizeStoreConfigForMerchant(row.settings || {})
+        }))
+      })
     } catch (error) {
       console.log('STORE ROUTE ERROR:', error)
-      return res.status(500).json({
-        success: false,
-        error: String(error.message || error)
+      return sendSafeServerError(res)
+    }
+  })
+
+  app.get('/api/public-storefront-config/:shop_domain', async (req, res) => {
+    try {
+      const shopDomain = normalizeShop(req.params.shop_domain)
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      const storeRecord = await lookupStoreRecord(supabase, shopDomain)
+      const config = getStoreConfigFromRecord(storeRecord)
+
+      return res.json({
+        success: true,
+        data: {
+          shop_domain: shopDomain,
+          config: sanitizeStoreConfigForStorefront(config)
+        }
       })
+    } catch (error) {
+      console.log('PUBLIC STOREFRONT CONFIG ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
+  })
+
+  app.get('/api/store-config/:shop_domain', requireShopifySessionToken, async (req, res) => {
+    try {
+      const shopDomain = normalizeShop(req.params.shop_domain)
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      const [storeRecord, overview, sessions, events] = await Promise.all([
+        lookupStoreRecord(supabase, shopDomain),
+        getAnalyticsOverview({ shopDomain }, analyticsOptions),
+        supabase.from('experiment_sessions').select('*').eq('shop_domain', shopDomain),
+        supabase.from('events').select('*').eq('shop_domain', shopDomain)
+      ])
+
+      const setup = buildSetupStatus({
+        shopDomain,
+        storeRecord,
+        overview,
+        sessionCount: sessions.data?.length || 0,
+        rawEventCount: events.data?.length || 0
+      })
+
+      return res.json({
+        success: true,
+        data: {
+          shop_domain: shopDomain,
+          config: sanitizeStoreConfigForMerchant(getStoreConfigFromRecord(storeRecord)),
+          setup
+        }
+      })
+    } catch (error) {
+      console.log('STORE CONFIG GET ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
+  })
+
+  app.put('/api/store-config/:shop_domain', requireShopifySessionToken, async (req, res) => {
+    try {
+      const shopDomain = normalizeShop(req.params.shop_domain)
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      const existing = await lookupStoreRecord(supabase, shopDomain)
+      const mergedConfig = mergeStoreConfig(existing?.settings || {}, req.body?.config || req.body || {})
+
+      const { data, error } = await supabase
+        .from('stores')
+        .upsert([{
+          shop_domain: shopDomain,
+          settings: mergedConfig
+        }], { onConflict: 'shop_domain' })
+        .select()
+
+      if (error) {
+        console.log('STORE CONFIG UPSERT ERROR:', error)
+        return sendSafeServerError(res)
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          shop_domain: shopDomain,
+          config: sanitizeStoreConfigForMerchant(getStoreConfigFromRecord(data?.[0]))
+        }
+      })
+    } catch (error) {
+      console.log('STORE CONFIG PUT ROUTE ERROR:', error)
+      return sendSafeServerError(res)
     }
   })
 
@@ -1189,33 +2004,56 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
         })
       }
 
-      const { data: existing, error: existingError } = await supabase
-        .from('experiment_sessions')
-        .select('*')
-        .eq('shop_domain', shop_domain)
-        .eq('session_id', session_id)
+      const [existingResult, storeRecord] = await Promise.all([
+        supabase
+          .from('experiment_sessions')
+          .select('*')
+          .eq('shop_domain', shop_domain)
+          .eq('session_id', session_id),
+        lookupStoreRecord(supabase, shop_domain).catch((error) => {
+          console.log('ASSIGN STORE LOOKUP ERROR:', error)
+          return null
+        })
+      ])
 
-      if (existingError) {
-        console.log('ASSIGN LOOKUP ERROR:', existingError)
-        return res.status(500).json({ success: false, error: existingError })
+      const { data: existing, error: existingError } = existingResult
+
+      const resolvedStoreId = normalizeStoreId(storeRecord?.id)
+
+      if (storeRecord && storeRecord.shop_domain && storeRecord.shop_domain !== shop_domain) {
+        console.log('ASSIGN STORE LOOKUP MISMATCH:', JSON.stringify({
+          requested_shop_domain: shop_domain,
+          resolved_shop_domain: storeRecord.shop_domain
+        }))
       }
 
-      if (existing?.[0]) {
+      const assignmentStoreId = resolvedStoreId
+
+      const { data: existingRows, error: existingRowsError } = { data: existing, error: existingError }
+
+      if (existingRowsError) {
+        console.log('ASSIGN LOOKUP ERROR:', existingRowsError)
+        return sendSafeServerError(res)
+      }
+
+      if (existingRows?.[0]) {
         await ingestPhase1Event({
           env,
           analyticsOptions,
           legacyAssignmentMirrorEnabled,
           supabaseRawEventMirrorEnabled,
           authMode: req.ingestAuth?.mode,
+          fetchImpl,
           eventRecord: buildAssignmentEvent({
-            shopDomain: existing[0].shop_domain,
-            sessionId: existing[0].session_id,
-            visitorId: req.body?.visitor_id || `visitor_for_${existing[0].session_id}`,
-            experimentVariant: existing[0].variant,
-            pageUrl: getRequestPageUrl(req) || `https://${existing[0].shop_domain}/`,
+            storeId: assignmentStoreId,
+            shopDomain: existingRows[0].shop_domain,
+            sessionId: existingRows[0].session_id,
+            visitorId: req.body?.visitor_id || `visitor_for_${existingRows[0].session_id}`,
+            experimentVariant: existingRows[0].variant,
+            pageUrl: getRequestPageUrl(req) || `https://${existingRows[0].shop_domain}/`,
             referrer: req.body?.referrer || null,
-            eventId: `assign_${existing[0].shop_domain}_${existing[0].session_id}`,
-            clientTimestamp: existing[0].created_at,
+            eventId: `assign_${existingRows[0].shop_domain}_${existingRows[0].session_id}`,
+            clientTimestamp: existingRows[0].created_at,
             metadata: {
               experiment_name: req.body?.experiment_name || 'agency_revenue_lift_14_day',
               source: 'assign_variant_route'
@@ -1223,7 +2061,13 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
           })
         })
 
-        return res.json({ success: true, data: existing[0] })
+        return res.json({
+          success: true,
+          data: {
+            ...existingRows[0],
+            store_id: assignmentStoreId
+          }
+        })
       }
 
       const variant = Math.random() < 0.5 ? 'control' : 'variant'
@@ -1241,7 +2085,9 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
         legacyAssignmentMirrorEnabled,
         supabaseRawEventMirrorEnabled,
         authMode: req.ingestAuth?.mode,
+        fetchImpl,
         eventRecord: buildAssignmentEvent({
+          storeId: assignmentStoreId,
           shopDomain: shop_domain,
           sessionId: session_id,
           visitorId: req.body?.visitor_id || `visitor_for_${session_id}`,
@@ -1261,6 +2107,7 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
         success: true,
         data: {
           shop_domain,
+          store_id: assignmentStoreId,
           session_id,
           variant: tracked.session.variant,
           created_at: tracked.session.started_at
@@ -1268,54 +2115,101 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
       })
     } catch (error) {
       console.log('ASSIGN ROUTE ERROR:', error)
-      return res.status(500).json({
-        success: false,
-        error: String(error.message || error)
-      })
+      return sendSafeServerError(res)
     }
   })
 
   app.post('/api/events', requireEventIngestAuth, async (req, res) => {
     try {
-      const rawEventName = req.body?.event_name ?? req.body?.event_type ?? req.body?.eventType
+      const validation = validatePublicEventPayload(req.body)
+      if (!validation.value) {
+        console.log('EVENT REJECTED:', JSON.stringify({
+          reason: validation.body.error,
+          shop_domain: req.body?.properties?.shop_domain || null,
+          session_id: req.body?.session_id || null
+        }))
+        return res.status(validation.status).json(validation.body)
+      }
+
+      const {
+        anonymousId: anonymous_id,
+        eventName: event_name,
+        shopDomain: shop_domain,
+        sessionId: session_id,
+        timestamp,
+        path,
+        properties,
+        referrer: validatedReferrer
+      } = validation.value
+      const event_id = buildBehavioralEventId({
+        anonymousId: anonymous_id,
+        sessionId: session_id,
+        eventName: event_name,
+        timestamp,
+        properties
+      })
+      const page_url = buildPageUrlFromProperties({
+        shopDomain: shop_domain,
+        path
+      })
+      const client_timestamp = new Date(timestamp * 1000).toISOString()
+      const server_timestamp = new Date().toISOString()
+      const server_received_timestamp = Math.floor(Date.now() / 1000)
+
+      const rateLimit = eventIngestLimiter.check(buildRateLimitKey([
+        'events',
+        getClientIp(req),
+        shop_domain,
+        session_id
+      ]))
+      if (!rateLimit.ok) {
+        console.log('EVENT RATE LIMITED:', JSON.stringify({
+          shop_domain,
+          session_id,
+          ip: getClientIp(req)
+        }))
+        return rejectRateLimited(res, rateLimit.retryAfterSeconds)
+      }
+
+      if (!originMatchesPageUrl(req, page_url)) {
+        return res.status(400).json({
+          success: false,
+          error: 'origin mismatch'
+        })
+      }
+
+      if (req.ingestAuth?.mode === 'storefront-unsigned' && isBotLikeRequest(req)) {
+        return res.status(401).json({
+          success: false,
+          error: 'Unauthorized'
+        })
+      }
+
       console.log('EVENT RECEIVED:', JSON.stringify({
-        shop_domain: req.body?.shop_domain,
-        session_id: req.body?.session_id,
-        event_name: rawEventName,
-        event_id: req.body?.event_id
+        shop_domain,
+        session_id,
+        event_name,
+        event_id,
+        auth_mode: req.ingestAuth?.mode
       }))
 
-      const shop_domain = normalizeShop(req.body?.shop_domain)
-      const session_id = req.body?.session_id
-
-      if (!shop_domain || !session_id || !rawEventName) {
-        console.log('EVENT REJECTED: missing fields', JSON.stringify(req.body))
-        return res.status(400).json({
-          success: false,
-          error: 'shop_domain, session_id, and event_name are required',
-          received: req.body
+      const [sessionResult, storeRecord] = await Promise.all([
+        supabase
+          .from('experiment_sessions')
+          .select('*')
+          .eq('shop_domain', shop_domain)
+          .eq('session_id', session_id),
+        lookupStoreRecord(supabase, shop_domain).catch((error) => {
+          console.log('EVENT STORE LOOKUP ERROR:', error)
+          return null
         })
-      }
+      ])
 
-      const event_name = String(rawEventName).trim()
-      if (!PHASE1_EVENT_NAME_SET.has(event_name)) {
-        console.log('EVENT REJECTED: invalid event name', event_name)
-        return res.status(400).json({
-          success: false,
-          error: 'invalid event_name',
-          allowed_event_names: [...PHASE1_EVENT_NAME_SET]
-        })
-      }
-
-      const { data: sessionRows, error: sessionError } = await supabase
-        .from('experiment_sessions')
-        .select('*')
-        .eq('shop_domain', shop_domain)
-        .eq('session_id', session_id)
+      const { data: sessionRows, error: sessionError } = sessionResult
 
       if (sessionError) {
         console.log('SESSION LOOKUP ERROR:', sessionError)
-        return res.status(500).json({ success: false, error: sessionError })
+        return sendSafeServerError(res)
       }
 
       if (!sessionRows?.[0]) {
@@ -1328,85 +2222,248 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
         })
       }
 
-      const providedMetadata = (
-        req.body?.metadata && typeof req.body.metadata === 'object' && !Array.isArray(req.body.metadata)
-      )
-        ? req.body.metadata
-        : (
-            req.body?.extra && typeof req.body.extra === 'object' && !Array.isArray(req.body.extra)
-          )
-            ? req.body.extra
-            : {}
+      const resolvedStoreId = normalizeStoreId(storeRecord?.id)
 
-      let phase1Event
+      let eventRecord
       try {
-        phase1Event = buildPhase1EventRecord({
+        eventRecord = {
+          store_id: resolvedStoreId,
+          event_id,
           event_name,
           shop_domain,
           session_id,
-          visitor_id: req.body?.visitor_id,
+          visitor_id: anonymous_id,
           experiment_variant: req.body?.experiment_variant || sessionRows[0].variant,
-          page_url: req.body?.page_url || getRequestPageUrl(req) || `https://${shop_domain}/`,
-          referrer: req.body?.referrer || req.get('referer') || null,
-          client_timestamp: req.body?.client_timestamp || req.body?.occurred_at || new Date().toISOString(),
-          event_id: req.body?.event_id || createPhase1EventId('evt'),
+          page_url,
+          referrer: validatedReferrer || req.get('referer') || null,
+          client_timestamp,
+          server_timestamp,
+          server_received_timestamp,
           metadata: {
-            ...providedMetadata,
-            source: providedMetadata.source || 'shopify_storefront',
+            ...properties,
             user_agent: req.headers['user-agent'] || null,
-            device_type: providedMetadata.device_type ||
-              req.body?.device_type ||
-              getDeviceTypeFromUserAgent(req.headers['user-agent']),
-            experiment_name: providedMetadata.experiment_name ||
-              req.body?.experiment_name ||
-              'agency_revenue_lift_14_day',
-            product_id: providedMetadata.product_id || req.body?.product_id || null,
-            product_handle: providedMetadata.product_handle || req.body?.product_handle || null,
-            cart_value: providedMetadata.cart_value || req.body?.cart_value || null,
-            value: providedMetadata.value ?? req.body?.value ?? 0,
-            trigger_type: providedMetadata.trigger_type || req.body?.trigger_type || null,
-            message_name: providedMetadata.message_name || req.body?.message_name || null,
-            reason: providedMetadata.reason || req.body?.reason || null
+            device_type: properties.device_type || getDeviceTypeFromUserAgent(req.headers['user-agent'])
           }
-        })
+        }
       } catch (validationError) {
         console.log('EVENT REJECTED: malformed payload', validationError.message)
         return res.status(400).json({
           success: false,
-          error: String(validationError.message || validationError),
-          received: req.body
+          error: 'malformed payload'
         })
       }
 
-      const tracked = await ingestPhase1Event({
+      const duplicate = markOrDetectDuplicateEventId(event_id)
+      if (duplicate) {
+        return res.status(202).json({
+          success: true,
+          data: {
+            shop_domain,
+            session_id,
+            event_name,
+            event_id,
+            store_id: resolvedStoreId,
+            duplicate: true,
+            server_timestamp,
+            tinybird_forwarded: false
+          }
+        })
+      }
+
+      const tinybird = await forwardEventToTinybird({
+        eventRecord,
         env,
-        analyticsOptions,
-        legacyAssignmentMirrorEnabled,
-        supabaseRawEventMirrorEnabled,
-        authMode: req.ingestAuth?.mode,
-        eventRecord: phase1Event
+        fetchImpl
       })
 
-      return res.json({
+      supabase
+        .from('stores')
+        .upsert([{
+          shop_domain,
+          last_event_at: server_timestamp
+        }], { onConflict: 'shop_domain' })
+        .select()
+        .catch((error) => {
+          console.log('STORE LAST EVENT UPDATE ERROR:', error)
+          return null
+        })
+
+      return res.status(202).json({
         success: true,
         data: {
           shop_domain,
           session_id,
           event_name,
-          event_id: phase1Event.event_id,
-          duplicate: Boolean(tracked.duplicate),
-          server_timestamp: phase1Event.server_timestamp,
-          tinybird_forwarded: Boolean(tracked.tinybird?.ok),
-          legacy_mirrored: Boolean(tracked.legacyMirror?.mirrored)
+          event_id,
+          store_id: resolvedStoreId,
+          duplicate: false,
+          server_timestamp,
+          tinybird_forwarded: Boolean(tinybird?.ok)
         }
       })
     } catch (error) {
       console.log('EVENT ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
+  })
+
+  app.get('/api/admin/session-features-health', requireOwnerAccess, async (_req, res) => {
+    try {
+      const data = await buildSessionFeaturesHealthReport({
+        env,
+        fetchImpl
+      })
+
+      return res.json(data)
+    } catch (error) {
+      console.log('SESSION FEATURES HEALTH ROUTE ERROR:', error)
       return res.status(500).json({
-        success: false,
-        error: String(error.message || error)
+        ok: false,
+        error: 'Internal server error'
       })
     }
+  })
+
+  async function handleInterventionDecision(req, res, input) {
+    const validation = validateInterventionDecisionQuery(input || {})
+    if (!validation.value) {
+      return res.status(validation.status).json({
+        decision: false,
+        strategy: 'invalid_request',
+        intervention_type: 'none',
+        message_id: getInterventionMessageId('none'),
+        shadow_mode: false
+      })
+    }
+
+    const { shopDomain, sessionId, storeId: requestedStoreId } = validation.value
+    const rateLimit = interventionDecisionLimiter.check(buildRateLimitKey([
+      'intervention-decision',
+      getClientIp(req),
+      shopDomain,
+      sessionId
+    ]))
+
+    if (!rateLimit.ok) {
+      return res
+        .status(429)
+        .set('Retry-After', String(rateLimit.retryAfterSeconds))
+        .json({
+          decision: false,
+          strategy: 'rate_limited',
+          intervention_type: 'none',
+          message_id: getInterventionMessageId('none'),
+          shadow_mode: false
+        })
+    }
+
+    if (isBotLikeRequest(req) && !req.get('origin') && !req.get('referer')) {
+      return res.status(401).json({
+        decision: false,
+        strategy: 'unauthorized',
+        intervention_type: 'none',
+        message_id: getInterventionMessageId('none'),
+        shadow_mode: false
+      })
+    }
+
+    try {
+      const storeRecord = await lookupStoreRecord(supabase, shopDomain).catch((error) => {
+        console.log('INTERVENTION STORE LOOKUP ERROR:', error)
+        return null
+      })
+
+      const {
+        session,
+        result,
+        resolvedStoreId
+      } = await getInterventionDecision({
+        shopDomain,
+        sessionId,
+        requestedStoreId: requestedStoreId || '',
+        storeRecord,
+        env,
+        fetchImpl
+      })
+
+      await logShadowInterventionDecision({
+        shopDomain,
+        sessionId,
+        session,
+        result
+        ,
+        env,
+        fetchImpl
+      }).catch((error) => {
+        console.log('SHADOW DECISION LOG ERROR:', error)
+        return null
+      })
+
+      console.log('INTERVENTION DECISION SUCCESS:', JSON.stringify({
+        shop_domain: shopDomain,
+        session_id: sessionId,
+        store_id: resolvedStoreId,
+        strategy: result.strategy,
+        decision: result.decision,
+        intervention_type: result.intervention_type
+      }))
+
+      supabase
+        .from('stores')
+        .upsert([{
+          shop_domain: shopDomain,
+          last_decision_at: new Date().toISOString()
+        }], { onConflict: 'shop_domain' })
+        .select()
+        .catch((error) => {
+          console.log('STORE LAST DECISION UPDATE ERROR:', error)
+          return null
+        })
+
+      return res
+        .set('Cache-Control', 'no-store')
+        .json(result)
+    } catch (error) {
+      console.log('INTERVENTION DECISION ROUTE ERROR:', error)
+      await logShadowInterventionDecision({
+        shopDomain,
+        sessionId,
+        session: null,
+        result: {
+          decision: false,
+          strategy: 'error_fail_closed',
+          intervention_type: 'none',
+          message_id: getInterventionMessageId('none'),
+          shadow_mode: false,
+          calculated_threshold: 1,
+          session_score: 0,
+          reason: 'error_fail_closed'
+        },
+        env,
+        fetchImpl
+      }).catch((shadowError) => {
+        console.log('SHADOW DECISION LOG ERROR:', shadowError)
+        return null
+      })
+
+      return res
+        .set('Cache-Control', 'no-store')
+        .json({
+          decision: false,
+          strategy: 'error_fail_closed',
+          intervention_type: 'none',
+          message_id: getInterventionMessageId('none'),
+          shadow_mode: false
+        })
+    }
+  }
+
+  app.get('/api/intervention-decision', async (req, res) => {
+    return handleInterventionDecision(req, res, req.query || {})
+  })
+
+  app.post('/api/intervention-decision', async (req, res) => {
+    return handleInterventionDecision(req, res, req.body || {})
   })
 
   app.get('/api/embedded-check', requireShopifySessionToken, async (req, res) => {
@@ -1446,59 +2503,46 @@ export function createApp({ env = process.env, supabase: providedSupabase } = {}
       })
     } catch (error) {
       console.log('ANALYTICS CONVERSION ROUTE ERROR:', error)
-      return res.status(500).json({
-        success: false,
-        error: String(error.message || error)
-      })
+      return sendSafeServerError(res)
     }
   })
 
-app.get('/api/analytics/abandonment-by-variant', async (req, res) => {
-  try {
-    const tinybirdHost = process.env.TINYBIRD_HOST || 'https://api.europe-west2.gcp.tinybird.co'
-    const tinybirdToken = process.env.TINYBIRD_TOKEN
-
-    if (!tinybirdToken) {
-      return res.status(500).json({
-        success: false,
-        error: 'Missing TINYBIRD_TOKEN environment variable',
+  app.get('/api/analytics/abandonment-by-variant', requireShopifySessionToken, async (req, res) => {
+    try {
+      const shopDomain = req.shopifySession.shop
+      const result = await queryTinybirdSql({
+        env,
+        fetchImpl,
+        logLabel: 'ABANDONMENT BY VARIANT',
+        sql: `
+          ${buildSessionFeaturesBaseCte()}
+          SELECT
+            experiment_variant AS variant,
+            count() AS sessions,
+            sum(
+              toUInt64(provisional_abandoned_cart)
+              + toUInt64(provisional_abandoned_checkout) > 0
+            ) AS abandoned_sessions,
+            round(
+              if(count() = 0, 0, abandoned_sessions / count() * 100),
+              2
+            ) AS abandonment_rate_percent
+          FROM session_features
+          WHERE shop_domain = ${toTinybirdSqlString(shopDomain)}
+          GROUP BY experiment_variant
+          ORDER BY experiment_variant ASC
+        `
       })
-    }
 
-    const url = `${tinybirdHost}/v0/pipes/abandonment_by_variant.json`
-
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${tinybirdToken}`,
-      },
-    })
-
-    const text = await response.text()
-
-    if (!response.ok) {
-      return res.status(response.status).json({
-        success: false,
-        error: 'Tinybird request failed',
-        status: response.status,
-        details: text,
+      return res.json({
+        success: true,
+        data: result.data || []
       })
+    } catch (error) {
+      console.error('TINYBIRD ABANDONMENT ROUTE ERROR:', error)
+      return sendSafeServerError(res)
     }
-
-    const tinybirdResponse = JSON.parse(text)
-
-    return res.json({
-      success: true,
-      data: tinybirdResponse.data || [],
-    })
-  } catch (error) {
-    console.error('TINYBIRD ABANDONMENT ROUTE ERROR:', error)
-    return res.status(500).json({
-      success: false,
-      error: String(error.message || error),
-    })
-  }
-})
+  })
 
   app.get('/api/metrics/:shop_domain', requireShopifySessionToken, async (req, res) => {
     try {
@@ -1511,10 +2555,7 @@ app.get('/api/analytics/abandonment-by-variant', async (req, res) => {
       })
     } catch (error) {
       console.log('METRICS ROUTE ERROR:', error)
-      return res.status(500).json({
-        success: false,
-        error: String(error.message || error)
-      })
+      return sendSafeServerError(res)
     }
   })
 
@@ -1537,10 +2578,7 @@ app.get('/api/analytics/abandonment-by-variant', async (req, res) => {
       })
     } catch (error) {
       console.log('DEBUG ROUTE ERROR:', error)
-      return res.status(500).json({
-        success: false,
-        error: String(error.message || error)
-      })
+      return sendSafeServerError(res)
     }
   })
 
@@ -1623,6 +2661,30 @@ app.get('/api/analytics/abandonment-by-variant', async (req, res) => {
 
     console.log('WEBHOOK shop/redact:', JSON.stringify(req.body || {}))
     return res.status(200).send('ok')
+  })
+
+  app.use((error, _req, res, next) => {
+    if (!error) {
+      return next()
+    }
+
+    console.log('UNHANDLED ROUTE ERROR:', error)
+
+    if (error.type === 'entity.too.large') {
+      return res.status(413).json({
+        success: false,
+        error: 'payload too large'
+      })
+    }
+
+    if (error.type === 'entity.parse.failed') {
+      return res.status(400).json({
+        success: false,
+        error: 'invalid JSON body'
+      })
+    }
+
+    return sendSafeServerError(res)
   })
 
   return app

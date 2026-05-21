@@ -1,0 +1,643 @@
+import {
+  getTinybirdEventsApiUrl,
+  getTinybirdHost,
+  getTinybirdIngestToken,
+  getTinybirdQueryToken,
+  queryTinybirdSql,
+  toTinybirdSqlString
+} from './tinybird.js'
+
+export const INTERVENTION_COHORT_BENCHMARKS = {
+  impulse: {
+    rageClickThreshold: 1,
+    ctaIdleThreshold: 1,
+    policyViewThreshold: 1,
+    interventionType: 'fast_conversion_nudge'
+  },
+  mid_tier: {
+    rageClickThreshold: 2,
+    ctaIdleThreshold: 2,
+    policyViewThreshold: 1,
+    interventionType: 'reassurance_assist'
+  },
+  luxury: {
+    rageClickThreshold: 3,
+    ctaIdleThreshold: 3,
+    policyViewThreshold: 2,
+    interventionType: 'high_touch_consultation'
+  }
+}
+
+const STORE_BLEND_FLOOR = 100
+const STORE_BLEND_FULL = 1000
+const INTERVENTION_MESSAGE_IDS = {
+  none: 'tidio_no_intervention',
+  checkout_recovery: 'tidio_checkout_recovery_v1',
+  friction_assistance: 'tidio_friction_assistance_v1',
+  trust_reassurance: 'tidio_trust_reassurance_v1',
+  cart_recovery: 'tidio_cart_recovery_v1',
+  fast_conversion_nudge: 'tidio_fast_conversion_nudge_v1',
+  reassurance_assist: 'tidio_reassurance_assist_v1',
+  high_touch_consultation: 'tidio_high_touch_consultation_v1'
+}
+const DEFAULT_INTERVENTION_STORE_CONFIG = {
+  interventions_enabled: true,
+  is_active: true,
+  tidio_enabled: true,
+  shadow_mode: false,
+  tidio_project_id: '63hgfq26munthk1pfvmvz25ryddkjgsf',
+  aov_cohort: 'mid_tier',
+  cooldown_seconds: 300,
+  intervention_threshold: null,
+  allowed_intervention_types: [
+    'friction_assistance',
+    'cart_recovery',
+    'checkout_recovery',
+    'trust_reassurance',
+    'fast_conversion_nudge',
+    'reassurance_assist',
+    'high_touch_consultation'
+  ]
+}
+
+export function resolveInterventionCohort({ storeId = '', shopDomain = '', cohortMap = {} } = {}) {
+  return cohortMap[storeId] || cohortMap[shopDomain] || 'mid_tier'
+}
+
+function toNumber(value, fallback = 0) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function toBooleanFlag(value, fallback = false) {
+  if (value == null) return fallback
+  if (typeof value === 'boolean') return value
+  const normalized = String(value).trim().toLowerCase()
+  if (normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on') return true
+  if (normalized === 'false' || normalized === '0' || normalized === 'no' || normalized === 'off') return false
+  return fallback
+}
+
+function normalizePositiveInteger(value, fallback, {
+  min = 0,
+  max = Number.MAX_SAFE_INTEGER
+} = {}) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return fallback
+  const rounded = Math.round(numeric)
+  return Math.min(max, Math.max(min, rounded))
+}
+
+function normalizeAllowedInterventionTypes(
+  value,
+  fallback = DEFAULT_INTERVENTION_STORE_CONFIG.allowed_intervention_types
+) {
+  if (!Array.isArray(value)) return [...fallback]
+  const unique = new Set()
+  for (const item of value) {
+    const normalized = String(item || '').trim()
+    if (normalized) unique.add(normalized)
+  }
+  return unique.size ? Array.from(unique) : [...fallback]
+}
+
+export function normalizeInterventionStoreConfig(input = {}) {
+  const base = {
+    ...DEFAULT_INTERVENTION_STORE_CONFIG,
+    ...(input && typeof input === 'object' ? input : {})
+  }
+
+  const cohort = ['impulse', 'mid_tier', 'luxury'].includes(String(base.aov_cohort || ''))
+    ? String(base.aov_cohort)
+    : DEFAULT_INTERVENTION_STORE_CONFIG.aov_cohort
+
+  return {
+    interventions_enabled: toBooleanFlag(
+      base.interventions_enabled,
+      DEFAULT_INTERVENTION_STORE_CONFIG.interventions_enabled
+    ),
+    is_active: toBooleanFlag(
+      base.is_active ?? base.interventions_enabled,
+      DEFAULT_INTERVENTION_STORE_CONFIG.is_active
+    ),
+    tidio_enabled: toBooleanFlag(
+      base.tidio_enabled,
+      DEFAULT_INTERVENTION_STORE_CONFIG.tidio_enabled
+    ),
+    shadow_mode: toBooleanFlag(base.shadow_mode, DEFAULT_INTERVENTION_STORE_CONFIG.shadow_mode),
+    tidio_project_id:
+      String(base.tidio_project_id || DEFAULT_INTERVENTION_STORE_CONFIG.tidio_project_id).trim() ||
+      DEFAULT_INTERVENTION_STORE_CONFIG.tidio_project_id,
+    aov_cohort: cohort,
+    cooldown_seconds: normalizePositiveInteger(
+      base.cooldown_seconds,
+      DEFAULT_INTERVENTION_STORE_CONFIG.cooldown_seconds,
+      { min: 30, max: 3600 }
+    ),
+    intervention_threshold: Number.isFinite(Number(base.intervention_threshold))
+      ? Number(base.intervention_threshold)
+      : null,
+    allowed_intervention_types: normalizeAllowedInterventionTypes(base.allowed_intervention_types)
+  }
+}
+
+export function getInterventionStoreConfigFromRecord(storeRecord) {
+  return normalizeInterventionStoreConfig({
+    ...(storeRecord?.store_config || {}),
+    ...(storeRecord?.settings || {}),
+    is_active: storeRecord?.is_active ?? storeRecord?.settings?.is_active,
+    intervention_threshold:
+      storeRecord?.intervention_threshold ?? storeRecord?.settings?.intervention_threshold
+  })
+}
+
+function buildDecisionResult({
+  decision = false,
+  strategy,
+  interventionType = 'none',
+  messageId = getInterventionMessageId(interventionType),
+  shadowMode = false,
+  calculatedThreshold = 1,
+  sessionScore = 0,
+  reason = strategy
+}) {
+  return {
+    decision,
+    strategy,
+    intervention_type: interventionType,
+    message_id: messageId,
+    shadow_mode: shadowMode,
+    calculated_threshold: calculatedThreshold,
+    session_score: sessionScore,
+    reason
+  }
+}
+
+function buildCohortMap({ env = process.env, storeConfig, resolvedStoreId, shopDomain }) {
+  let envCohorts = {}
+
+  if (env.BEHAVIORALPRO_AOV_COHORTS) {
+    try {
+      envCohorts = JSON.parse(env.BEHAVIORALPRO_AOV_COHORTS)
+    } catch {
+      envCohorts = {}
+    }
+  }
+
+  return {
+    ...envCohorts,
+    ...(resolvedStoreId ? { [resolvedStoreId]: storeConfig.aov_cohort } : {}),
+    [shopDomain]: storeConfig.aov_cohort
+  }
+}
+
+export async function getInterventionDecision({
+  shopDomain,
+  sessionId,
+  requestedStoreId = '',
+  storeRecord = null,
+  env = process.env,
+  fetchImpl = globalThis.fetch
+}) {
+  const session = await fetchCurrentSessionFeatures({
+    shopDomain,
+    sessionId,
+    env,
+    fetchImpl
+  })
+
+  const storeConfig = getInterventionStoreConfigFromRecord(storeRecord)
+
+  if (!session) {
+    return {
+      session: null,
+      storeConfig,
+      resolvedStoreId: '',
+      result: buildDecisionResult({
+        strategy: 'no_session_data',
+        reason: 'no_session_data'
+      })
+    }
+  }
+
+  const resolvedStoreId = String(session?.store_id || requestedStoreId || '').trim()
+
+  if (!storeConfig.is_active || !storeConfig.interventions_enabled) {
+    return {
+      session,
+      storeConfig,
+      resolvedStoreId,
+      result: buildDecisionResult({
+        strategy: 'store_inactive',
+        reason: 'store_inactive'
+      })
+    }
+  }
+
+  const interventionTriggeredCount = toNumber(session?.intervention_triggered_count, 0)
+  if (interventionTriggeredCount > 0 && session?.first_intervention_triggered_at) {
+    const firstTriggeredAt = new Date(session.first_intervention_triggered_at)
+    if (!Number.isNaN(firstTriggeredAt.getTime())) {
+      const deltaSeconds = Math.floor((Date.now() - firstTriggeredAt.getTime()) / 1000)
+      if (deltaSeconds < storeConfig.cooldown_seconds) {
+        return {
+          session,
+          storeConfig,
+          resolvedStoreId,
+          result: buildDecisionResult({
+            strategy: 'cooldown_active',
+            calculatedThreshold: Number(storeConfig.cooldown_seconds || 0),
+            reason: 'cooldown_active'
+          })
+        }
+      }
+    }
+  }
+
+  const storeBenchmarks = await fetchStoreInterventionBenchmarks({
+    shopDomain,
+    env,
+    fetchImpl
+  })
+
+  const cohort = resolveInterventionCohort({
+    storeId: resolvedStoreId,
+    shopDomain,
+    cohortMap: buildCohortMap({ env, storeConfig, resolvedStoreId, shopDomain })
+  })
+
+  let result = evaluate({
+    session,
+    cohort,
+    storeBenchmarks,
+    storeConfig: {
+      intervention_threshold: storeConfig.intervention_threshold,
+      is_active: storeConfig.is_active
+    }
+  })
+
+  if (
+    result.decision &&
+    !storeConfig.allowed_intervention_types.includes(result.intervention_type)
+  ) {
+    result = buildDecisionResult({
+      strategy: 'intervention_filtered_by_store_config',
+      calculatedThreshold: Number(result.calculated_threshold || 1),
+      sessionScore: Number(result.session_score || 0),
+      reason: 'intervention_filtered_by_store_config'
+    })
+  }
+
+  return {
+    session,
+    storeConfig,
+    resolvedStoreId,
+    result: {
+      ...result,
+      shadow_mode: Boolean(storeConfig.shadow_mode)
+    }
+  }
+}
+
+export function computeBlendWeight(storeHistoricalSessionCount) {
+  if (storeHistoricalSessionCount < STORE_BLEND_FLOOR) {
+    return 0
+  }
+
+  return Math.min(1, storeHistoricalSessionCount / STORE_BLEND_FULL)
+}
+
+export function blendThreshold(cohortBenchmark, storeBenchmark, storeHistoricalSessionCount) {
+  const weight = computeBlendWeight(storeHistoricalSessionCount)
+  return ((1 - weight) * cohortBenchmark) + (weight * storeBenchmark)
+}
+
+export async function fetchTinybirdPipeJson({
+  pipeName,
+  params = {},
+  env = process.env,
+  fetchImpl = globalThis.fetch
+}) {
+  if (typeof fetchImpl !== 'function') {
+    throw new Error('Global fetch is unavailable for Tinybird pipe queries')
+  }
+
+  const token = getTinybirdQueryToken(env)
+  if (!token) {
+    throw new Error('Missing Tinybird query token')
+  }
+
+  const url = new URL(`${getTinybirdHost(env)}/v0/pipes/${pipeName}.json`)
+  for (const [key, value] of Object.entries(params)) {
+    if (value != null && value !== '') {
+      url.searchParams.set(key, String(value))
+    }
+  }
+
+  const response = await fetchImpl(url.toString(), {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${token}`
+    }
+  })
+
+  const text = await response.text().catch(() => '')
+  if (!response.ok) {
+    throw new Error(`Tinybird pipe failed with status ${response.status}: ${text}`)
+  }
+
+  const parsed = text ? JSON.parse(text) : { data: [] }
+  return Array.isArray(parsed.data) ? parsed.data : []
+}
+
+export async function fetchCurrentSessionFeatures({
+  shopDomain,
+  sessionId,
+  env = process.env,
+  fetchImpl = globalThis.fetch
+}) {
+  const rows = await fetchTinybirdPipeJson({
+    pipeName: 'v1_session_features_by_session',
+    params: {
+      shop_domain: shopDomain,
+      session_id: sessionId
+    },
+    env,
+    fetchImpl
+  })
+
+  return rows[0] || null
+}
+
+export function getInterventionMessageId(interventionType) {
+  const normalized = String(interventionType || 'none').trim()
+  return INTERVENTION_MESSAGE_IDS[normalized] || `tidio_${normalized}_v1`
+}
+
+function createShadowDecisionEventId() {
+  return `shadow_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+}
+
+function sendShadowDecisionTelemetry({
+  session,
+  result,
+  storeConfig = {},
+  env = process.env,
+  fetchImpl = globalThis.fetch
+}) {
+  const token = getTinybirdIngestToken(env)
+  if (!token || typeof fetchImpl !== 'function') {
+    return
+  }
+
+  const shopDomain = String(session?.shop_domain || '').trim()
+  const sessionId = String(session?.session_id || '').trim()
+  if (!shopDomain || !sessionId) {
+    return
+  }
+
+  const payload = {
+    store_id: session?.store_id ? String(session.store_id) : '',
+    event_id: createShadowDecisionEventId(),
+    event_name: 'shadow_intervention_logged',
+    shop_domain: shopDomain,
+    session_id: sessionId,
+    visitor_id: String(session?.visitor_id || `shadow_${sessionId}`),
+    experiment_variant: String(session?.experiment_variant || 'control'),
+    page_url: String(session?.page_url || `https://${shopDomain}/`),
+    referrer: session?.referrer || null,
+    client_timestamp: new Date().toISOString(),
+    server_timestamp: new Date().toISOString(),
+    metadata: JSON.stringify({
+      session_id: sessionId,
+      calculated_score: Number(result?.session_score || 0),
+      threshold_used: Number(
+        storeConfig?.intervention_threshold ?? result?.calculated_threshold ?? 0
+      ),
+      decision_made: Boolean(result?.decision),
+      reason: String(result?.reason || 'unknown'),
+      is_shadow_mode: Boolean(storeConfig?.shadow_mode)
+    })
+  }
+
+  fetchImpl(getTinybirdEventsApiUrl(env), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/x-ndjson'
+    },
+    body: `${JSON.stringify(payload)}\n`
+  }).catch(() => {})
+}
+
+export async function fetchStoreInterventionBenchmarks({
+  shopDomain,
+  env = process.env,
+  fetchImpl = globalThis.fetch
+}) {
+  const sql = `
+    WITH deduped_events AS (
+      SELECT
+        shop_domain,
+        session_id,
+        event_name,
+        event_id,
+        coalesce(server_timestamp, client_timestamp) AS event_ts
+      FROM raw_events
+      WHERE shop_domain = ${toTinybirdSqlString(shopDomain)}
+        AND notEmpty(ifNull(session_id, ''))
+        AND coalesce(server_timestamp, client_timestamp) IS NOT NULL
+      ORDER BY event_id, event_ts DESC
+      LIMIT 1 BY event_id
+    ),
+    session_rollup AS (
+      SELECT
+        shop_domain,
+        session_id,
+        countIf(event_name = 'rage_click') AS rage_click_count,
+        countIf(event_name = 'cta_idle_15s') AS cta_idle_15s_count,
+        countIf(event_name = 'policy_page_view') AS policy_page_view_count,
+        toUInt8(countIf(event_name = 'begin_checkout') > 0) AS reached_checkout,
+        toUInt8(countIf(event_name = 'purchase') > 0) AS purchased
+      FROM deduped_events
+      GROUP BY shop_domain, session_id
+    )
+    SELECT
+      count() AS historical_session_count,
+      quantileTDigest(0.75)(rage_click_count) AS p75_rage_click_count,
+      quantileTDigest(0.75)(cta_idle_15s_count) AS p75_cta_idle_15s_count,
+      quantileTDigest(0.75)(policy_page_view_count) AS p75_policy_page_view_count,
+      avg(reached_checkout) AS reached_checkout_rate,
+      avg(purchased) AS purchase_rate
+    FROM session_rollup
+  `
+
+  const result = await queryTinybirdSql({
+    sql,
+    env,
+    fetchImpl,
+    logLabel: 'INTERVENTION STORE BENCHMARKS'
+  })
+
+  return result.data?.[0] || {
+    historical_session_count: 0,
+    p75_rage_click_count: 0,
+    p75_cta_idle_15s_count: 0,
+    p75_policy_page_view_count: 0,
+    reached_checkout_rate: 0,
+    purchase_rate: 0
+  }
+}
+
+export function evaluateInterventionDecision({
+  session,
+  cohort,
+  storeBenchmarks,
+  storeConfig = {}
+}) {
+  const storeIsActive = storeConfig?.is_active !== false
+  const configuredInterventionThreshold = Number.isFinite(Number(storeConfig?.intervention_threshold))
+    ? Number(storeConfig.intervention_threshold)
+    : null
+  const cohortBenchmark = INTERVENTION_COHORT_BENCHMARKS[cohort] || INTERVENTION_COHORT_BENCHMARKS.mid_tier
+  const historicalSessionCount = toNumber(storeBenchmarks?.historical_session_count, 0)
+
+  const rageClickThreshold = blendThreshold(
+    cohortBenchmark.rageClickThreshold,
+    toNumber(storeBenchmarks?.p75_rage_click_count, cohortBenchmark.rageClickThreshold),
+    historicalSessionCount
+  )
+
+  const ctaIdleThreshold = blendThreshold(
+    cohortBenchmark.ctaIdleThreshold,
+    toNumber(storeBenchmarks?.p75_cta_idle_15s_count, cohortBenchmark.ctaIdleThreshold),
+    historicalSessionCount
+  )
+
+  const policyViewThreshold = blendThreshold(
+    cohortBenchmark.policyViewThreshold,
+    toNumber(storeBenchmarks?.p75_policy_page_view_count, cohortBenchmark.policyViewThreshold),
+    historicalSessionCount
+  )
+
+  const rageClicks = toNumber(session?.rage_click_count, 0)
+  const ctaIdleEvents = toNumber(session?.cta_idle_15s_count, 0)
+  const policyViews = toNumber(session?.policy_page_view_count, 0)
+  const addToCartCount = toNumber(session?.add_to_cart_count, 0)
+  const reachedCheckout = toBooleanFlag(session?.reached_checkout)
+  const purchased = toBooleanFlag(session?.purchased)
+  const provisionalAbandonedCart = toBooleanFlag(session?.provisional_abandoned_cart)
+  const provisionalAbandonedCheckout = toBooleanFlag(session?.provisional_abandoned_checkout)
+  const strategy = historicalSessionCount < STORE_BLEND_FLOOR ? 'cold_start_static' : 'dynamic_blend'
+  const rageClickScore = rageClickThreshold <= 0 ? 0 : rageClicks / rageClickThreshold
+  const ctaIdleScore = ctaIdleThreshold <= 0 ? 0 : ctaIdleEvents / ctaIdleThreshold
+  const policyViewScore = policyViewThreshold <= 0 ? 0 : policyViews / policyViewThreshold
+  const cartRecoveryScore = provisionalAbandonedCart && !reachedCheckout ? 1 : 0
+  const checkoutRecoveryScore = provisionalAbandonedCheckout ? 1 : 0
+  const sessionScore = Math.max(
+    rageClickScore,
+    ctaIdleScore,
+    policyViewScore,
+    cartRecoveryScore,
+    checkoutRecoveryScore,
+    0
+  )
+
+  function buildResult(decision, interventionType, {
+    reason = decision ? 'threshold_met' : 'insufficient_intent',
+    calculatedThreshold = configuredInterventionThreshold ?? 1
+  } = {}) {
+    return {
+      decision,
+      strategy,
+      intervention_type: interventionType,
+      message_id: getInterventionMessageId(interventionType),
+      calculated_threshold: calculatedThreshold,
+      session_score: Number(sessionScore.toFixed(4)),
+      reason
+    }
+  }
+
+  let result
+
+  if (!storeIsActive) {
+    result = buildResult(false, 'none', {
+      reason: 'store_inactive',
+      calculatedThreshold: configuredInterventionThreshold ?? 1
+    })
+  } else {
+    function applyConfiguredThreshold(resultValue) {
+      if (
+        resultValue.decision &&
+        configuredInterventionThreshold != null &&
+        sessionScore < configuredInterventionThreshold
+      ) {
+        return {
+          ...buildResult(false, 'none', {
+            reason: 'below_threshold',
+            calculatedThreshold: configuredInterventionThreshold
+          }),
+          strategy: resultValue.strategy
+        }
+      }
+
+      if (configuredInterventionThreshold != null) {
+        return {
+          ...resultValue,
+          calculated_threshold: configuredInterventionThreshold
+        }
+      }
+
+      return resultValue
+    }
+
+    if (purchased) {
+      result = applyConfiguredThreshold(buildResult(false, 'none', {
+        reason: 'already_purchased',
+        calculatedThreshold: 1
+      }))
+    } else if (provisionalAbandonedCheckout) {
+      result = applyConfiguredThreshold(buildResult(true, 'checkout_recovery', {
+        reason: 'checkout_abandonment_detected',
+        calculatedThreshold: 1
+      }))
+    } else if (rageClicks >= rageClickThreshold) {
+      result = applyConfiguredThreshold(buildResult(true, 'friction_assistance', {
+        reason: 'rage_click_threshold_exceeded',
+        calculatedThreshold: Number(rageClickThreshold.toFixed(4))
+      }))
+    } else if (ctaIdleEvents >= ctaIdleThreshold && addToCartCount === 0) {
+      result = applyConfiguredThreshold(buildResult(true, cohortBenchmark.interventionType, {
+        reason: 'cta_idle_threshold_exceeded',
+        calculatedThreshold: Number(ctaIdleThreshold.toFixed(4))
+      }))
+    } else if (policyViews >= policyViewThreshold) {
+      result = applyConfiguredThreshold(buildResult(true, 'trust_reassurance', {
+        reason: 'policy_view_threshold_exceeded',
+        calculatedThreshold: Number(policyViewThreshold.toFixed(4))
+      }))
+    } else if (provisionalAbandonedCart && !reachedCheckout) {
+      result = applyConfiguredThreshold(buildResult(true, 'cart_recovery', {
+        reason: 'cart_abandonment_detected',
+        calculatedThreshold: 1
+      }))
+    } else {
+      result = applyConfiguredThreshold(buildResult(false, 'none', {
+        reason: 'below_threshold',
+        calculatedThreshold: configuredInterventionThreshold ?? Number(Math.max(rageClickThreshold, ctaIdleThreshold, policyViewThreshold, 1).toFixed(4))
+      }))
+    }
+  }
+
+  sendShadowDecisionTelemetry({
+    session,
+    result,
+    storeConfig
+  })
+
+  return result
+}
+
+export function evaluate(input) {
+  return evaluateInterventionDecision(input)
+}

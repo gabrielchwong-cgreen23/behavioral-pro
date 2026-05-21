@@ -6,6 +6,28 @@ import {
 } from '@behavioral-pro/analytics'
 
 function getOwnerToken(req) {
+  const cookieHeader = req.headers.cookie || req.headers.Cookie
+  if (typeof cookieHeader === 'string' && cookieHeader) {
+    const cookieParts = cookieHeader.split(';')
+    for (const part of cookieParts) {
+      const [name, ...rest] = part.trim().split('=')
+      if (name === 'behavioralpro_owner_auth') {
+        const value = rest.join('=')
+        if (value) {
+          return decodeURIComponent(value)
+        }
+      }
+    }
+  }
+
+  const authHeader = req.headers.authorization || req.headers.Authorization
+  if (typeof authHeader === 'string') {
+    const match = authHeader.match(/^Bearer\s+(.+)$/i)
+    if (match?.[1]?.trim()) {
+      return match[1].trim()
+    }
+  }
+
   const headerToken = req.headers['x-analytics-token']
   if (typeof headerToken === 'string' && headerToken.trim()) {
     return headerToken.trim()
@@ -42,9 +64,7 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;')
 }
 
-function buildOwnerAnalyticsPage(token) {
-  const safeToken = escapeHtml(token || '')
-
+function buildOwnerAnalyticsPage() {
   return `<!doctype html>
 <html>
 <head>
@@ -264,8 +284,6 @@ function buildOwnerAnalyticsPage(token) {
   </div>
 
   <script>
-    const token = ${JSON.stringify(safeToken)};
-
     function setStatus(text, isError) {
       const el = document.getElementById('status-text');
       if (!el) return;
@@ -400,23 +418,15 @@ function buildOwnerAnalyticsPage(token) {
       if (!select || !rawJsonLink || !rawEventsLink || !select.value) return;
 
       rawJsonLink.href =
-        '/owner-analytics/raw/' +
-        encodeURIComponent(select.value) +
-        '?token=' +
-        encodeURIComponent(token);
+        '/owner-analytics/raw/' + encodeURIComponent(select.value);
 
       rawEventsLink.href =
-        '/api/owner/raw-events/' +
-        encodeURIComponent(select.value) +
-        '?token=' +
-        encodeURIComponent(token);
+        '/api/owner/raw-events/' + encodeURIComponent(select.value);
     }
 
     async function fetchJson(url) {
       const response = await fetch(url, {
-        headers: {
-          'x-analytics-token': token
-        }
+        credentials: 'same-origin'
       });
 
       const json = await response.json();
@@ -504,7 +514,14 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken, analyt
   const requireOwner = requireOwnerToken(ownerToken)
 
   app.get('/owner-analytics', requireOwner, (req, res) => {
-    res.send(buildOwnerAnalyticsPage(ownerToken))
+    const isSecure = req.secure || req.get('x-forwarded-proto') === 'https'
+    res.cookie('behavioralpro_owner_auth', ownerToken, {
+      httpOnly: true,
+      sameSite: 'strict',
+      secure: Boolean(isSecure),
+      path: '/'
+    })
+    res.send(buildOwnerAnalyticsPage())
   })
 
   app.get('/api/owner/stores', requireOwner, async (req, res) => {
@@ -516,7 +533,7 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken, analyt
 
       if (error) {
         console.log('OWNER STORES ERROR:', error)
-        return res.status(500).json({ success: false, error })
+        return res.status(500).json({ success: false, error: 'Internal server error' })
       }
 
       return res.json({
@@ -529,7 +546,7 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken, analyt
       console.log('OWNER STORES ROUTE ERROR:', error)
       return res.status(500).json({
         success: false,
-        error: String(error.message || error)
+        error: 'Internal server error'
       })
     }
   })
@@ -559,7 +576,7 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken, analyt
       console.log('OWNER OVERVIEW ROUTE ERROR:', error)
       return res.status(500).json({
         success: false,
-        error: String(error.message || error)
+        error: 'Internal server error'
       })
     }
   })
@@ -588,7 +605,7 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken, analyt
       console.log('OWNER ANALYTICS ROUTE ERROR:', error)
       return res.status(500).json({
         success: false,
-        error: String(error.message || error)
+        error: 'Internal server error'
       })
     }
   })
@@ -617,7 +634,7 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken, analyt
       console.log('OWNER SESSION CRO ROUTE ERROR:', error)
       return res.status(500).json({
         success: false,
-        error: String(error.message || error)
+        error: 'Internal server error'
       })
     }
   })
@@ -646,7 +663,7 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken, analyt
       console.log('OWNER RAW EVENTS ROUTE ERROR:', error)
       return res.status(500).json({
         success: false,
-        error: String(error.message || error)
+        error: 'Internal server error'
       })
     }
   })
@@ -674,7 +691,7 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken, analyt
       )
     } catch (error) {
       console.log('OWNER RAW SESSION CRO PAGE ERROR:', error)
-      return res.status(500).send(String(error.message || error))
+      return res.status(500).send('Internal server error')
     }
   })
 }
