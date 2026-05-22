@@ -415,6 +415,7 @@ function mapSessionStateRowToSyntheticRawEvents(sessionStateRow) {
     sessionStateRow.last_seen_at || sessionStateRow.updated_at || sessionStateRow.first_seen_at || new Date().toISOString()
   )
   const rawEvents = []
+  const purchaseRevenueTotal = Number(counters.purchase_revenue_total || 0)
 
   for (const [counterKey, rawValue] of Object.entries(counters)) {
     const eventType = mapSessionStateCounterKeyToEventType(counterKey)
@@ -425,6 +426,10 @@ function mapSessionStateRowToSyntheticRawEvents(sessionStateRow) {
     }
 
     for (let index = 0; index < count; index += 1) {
+      const isPurchaseEvent = eventType === 'purchase'
+      const value = isPurchaseEvent && index === count - 1
+        ? purchaseRevenueTotal
+        : 0
       rawEvents.push(normalizeRawEventRecord({
         event_id: `session_state_${sessionStateRow.id || 'row'}_${counterKey}_${index + 1}`,
         session_id: sessionStateRow.session_id,
@@ -432,6 +437,7 @@ function mapSessionStateRowToSyntheticRawEvents(sessionStateRow) {
         variant: sessionStateRow.experiment_variant || 'control',
         event_type: eventType,
         occurred_at: occurredAt,
+        value,
         metadata: {
           ...mapSessionStateCounterKeyToMetadata(counterKey),
           storage: 'session_state',

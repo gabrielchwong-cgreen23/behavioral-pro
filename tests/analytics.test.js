@@ -125,3 +125,39 @@ test('analytics overview supplements session_state-backed sessions when events t
   assert.deepEqual(session.triggers_fired, ['product_view', 'rage_click', 'rage_click'])
   assert.deepEqual(session.messages_shown, ['intervention_triggered'])
 })
+
+test('analytics overview carries purchase revenue from session_state-backed sessions', async () => {
+  const supabase = createMockSupabase({
+    experiment_sessions: [{
+      id: 1,
+      shop_domain: 'alpha.myshopify.com',
+      session_id: 'sess-hot-purchase',
+      variant: 'variant',
+      created_at: '2026-05-21T17:40:00.000Z'
+    }],
+    session_state: [{
+      id: 2,
+      shop_domain: 'alpha.myshopify.com',
+      session_id: 'sess-hot-purchase',
+      experiment_variant: 'variant',
+      counters: {
+        page_views: 1,
+        product_views: 1,
+        add_to_cart_count: 1,
+        begin_checkout_count: 1,
+        purchase_count: 1,
+        purchase_revenue_total: 79
+      },
+      first_seen_at: '2026-05-21T17:40:00.000Z',
+      last_seen_at: '2026-05-21T17:40:06.000Z',
+      updated_at: '2026-05-21T17:40:06.000Z'
+    }]
+  })
+
+  const overview = await getAnalyticsOverview({ shopDomain: 'alpha.myshopify.com' }, { supabase })
+  const session = overview.sessionTable.find((row) => row.session_id === 'sess-hot-purchase')
+
+  assert.ok(session)
+  assert.equal(session.converted, true)
+  assert.equal(session.revenue, 79)
+})

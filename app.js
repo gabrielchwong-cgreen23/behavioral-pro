@@ -351,7 +351,14 @@ async function lookupStoreRecord(supabase, shopDomain) {
   return data || null
 }
 
-function buildSessionStateCounterDeltas(eventName) {
+function buildSessionStateCounterDeltas(eventName, metadata = {}) {
+  const purchaseValue = Number(
+    metadata?.value ??
+    metadata?.purchase_value ??
+    metadata?.cart_value ??
+    0
+  )
+
   switch (String(eventName || '').trim()) {
     case 'page_view':
       return { page_views: 1 }
@@ -362,7 +369,10 @@ function buildSessionStateCounterDeltas(eventName) {
     case 'begin_checkout':
       return { begin_checkout_count: 1 }
     case 'purchase':
-      return { purchase_count: 1 }
+      return {
+        purchase_count: 1,
+        purchase_revenue_total: Number.isFinite(purchaseValue) ? purchaseValue : 0
+      }
     case 'rage_click':
       return { rage_click_count: 1 }
     case 'cta_idle_15s':
@@ -2378,7 +2388,7 @@ export function createApp({
         pageUrl: page_url,
         referrer: validatedReferrer || req.get('referer') || null,
         seenAt: server_timestamp,
-        counterDeltas: buildSessionStateCounterDeltas(event_name)
+        counterDeltas: buildSessionStateCounterDeltas(event_name, eventRecord.metadata)
       }).catch((error) => {
         console.log('SESSION STATE EVENT UPSERT ERROR:', error)
         return null
