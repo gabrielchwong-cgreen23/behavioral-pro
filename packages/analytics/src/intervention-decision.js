@@ -762,62 +762,6 @@ export function getInterventionMessageId(interventionType) {
   return INTERVENTION_MESSAGE_IDS[normalized] || `tidio_${normalized}_v1`
 }
 
-function createShadowDecisionEventId() {
-  return `shadow_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
-}
-
-function sendShadowDecisionTelemetry({
-  session,
-  result,
-  storeConfig = {},
-  env = process.env,
-  fetchImpl = globalThis.fetch
-}) {
-  const token = getTinybirdIngestToken(env)
-  if (!token || typeof fetchImpl !== 'function') {
-    return
-  }
-
-  const shopDomain = String(session?.shop_domain || '').trim()
-  const sessionId = String(session?.session_id || '').trim()
-  if (!shopDomain || !sessionId) {
-    return
-  }
-
-  const payload = {
-    store_id: session?.store_id ? String(session.store_id) : '',
-    event_id: createShadowDecisionEventId(),
-    event_name: 'shadow_intervention_logged',
-    shop_domain: shopDomain,
-    session_id: sessionId,
-    visitor_id: String(session?.visitor_id || `shadow_${sessionId}`),
-    experiment_variant: String(session?.experiment_variant || 'control'),
-    page_url: String(session?.page_url || `https://${shopDomain}/`),
-    referrer: session?.referrer || null,
-    client_timestamp: new Date().toISOString(),
-    server_timestamp: new Date().toISOString(),
-    metadata: JSON.stringify({
-      session_id: sessionId,
-      calculated_score: Number(result?.session_score || 0),
-      threshold_used: Number(
-        storeConfig?.intervention_threshold ?? result?.calculated_threshold ?? 0
-      ),
-      decision_made: Boolean(result?.decision),
-      reason: String(result?.reason || 'unknown'),
-      is_shadow_mode: Boolean(storeConfig?.shadow_mode)
-    })
-  }
-
-  fetchImpl(getTinybirdEventsApiUrl(env), {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/x-ndjson'
-    },
-    body: `${JSON.stringify(payload)}\n`
-  }).catch(() => {})
-}
-
 export async function fetchStoreInterventionBenchmarks({
   shopDomain,
   env = process.env,
@@ -1016,12 +960,6 @@ export function evaluateInterventionDecision({
       }))
     }
   }
-
-  sendShadowDecisionTelemetry({
-    session,
-    result,
-    storeConfig
-  })
 
   return result
 }
