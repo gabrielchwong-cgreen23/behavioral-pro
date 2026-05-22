@@ -89,3 +89,39 @@ test('shared analytics stays session-based and dedupes duplicate purchases', asy
   assert.equal(rates[0].triggerType, 'product_page_view')
   assert.equal(rates[0].conversionRate, 1)
 })
+
+test('analytics overview supplements session_state-backed sessions when events table is empty', async () => {
+  const supabase = createMockSupabase({
+    experiment_sessions: [{
+      id: 1,
+      shop_domain: 'alpha.myshopify.com',
+      session_id: 'sess-hot-dashboard',
+      variant: 'variant',
+      created_at: '2026-05-21T17:35:50.985Z'
+    }],
+    session_state: [{
+      id: 1,
+      shop_domain: 'alpha.myshopify.com',
+      session_id: 'sess-hot-dashboard',
+      experiment_variant: 'variant',
+      counters: {
+        page_views: 1,
+        product_views: 1,
+        rage_click_count: 2,
+        intervention_triggered_count: 1
+      },
+      first_seen_at: '2026-05-21T17:35:50.985Z',
+      last_seen_at: '2026-05-21T17:35:56.422Z',
+      updated_at: '2026-05-21T17:35:56.422Z'
+    }]
+  })
+
+  const overview = await getAnalyticsOverview({ shopDomain: 'alpha.myshopify.com' }, { supabase })
+  const session = overview.sessionTable.find((row) => row.session_id === 'sess-hot-dashboard')
+
+  assert.equal(overview.totals.sessions, 1)
+  assert.equal(overview.totals.rawEventCount, 6)
+  assert.ok(session)
+  assert.deepEqual(session.triggers_fired, ['product_view', 'rage_click', 'rage_click'])
+  assert.deepEqual(session.messages_shown, ['intervention_triggered'])
+})

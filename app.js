@@ -524,11 +524,13 @@ function buildSetupStatus({
   storeRecord,
   overview,
   sessionCount,
-  rawEventCount
+  rawEventCount,
+  sessionStateCount = 0
 }) {
   const totals = overview?.totals || {}
   const sessions = Number((sessionCount ?? totals.sessions) || 0)
   const events = Number((rawEventCount ?? totals.rawEventCount) || 0)
+  const hotSessions = Number(sessionStateCount || 0)
   const purchases = Number(totals.convertedSessions || 0)
   const triggerCount = Number(totals.triggerCount || 0)
   const messageCount = Number(totals.messageCount || 0)
@@ -554,6 +556,7 @@ function buildSetupStatus({
       last_event_at: storeRecord?.last_event_at || null,
       last_decision_at: storeRecord?.last_decision_at || null,
       sessions,
+      session_state_rows: hotSessions,
       raw_events: events,
       purchases,
       triggers_fired: triggerCount,
@@ -1982,11 +1985,12 @@ export function createApp({
         })
       }
 
-      const [storeRecord, overview, sessions, events] = await Promise.all([
+      const [storeRecord, overview, sessions, events, sessionStateRows] = await Promise.all([
         lookupStoreRecord(supabase, shopDomain),
         getAnalyticsOverview({ shopDomain }, analyticsOptions),
         supabase.from('experiment_sessions').select('*').eq('shop_domain', shopDomain),
-        supabase.from('events').select('*').eq('shop_domain', shopDomain)
+        supabase.from('events').select('*').eq('shop_domain', shopDomain),
+        supabase.from('session_state').select('*').eq('shop_domain', shopDomain)
       ])
 
       const setup = buildSetupStatus({
@@ -1994,7 +1998,11 @@ export function createApp({
         storeRecord,
         overview,
         sessionCount: sessions.data?.length || 0,
-        rawEventCount: events.data?.length || 0
+        rawEventCount: Math.max(
+          Number(events.data?.length || 0),
+          Number(overview?.totals?.rawEventCount || 0)
+        ),
+        sessionStateCount: sessionStateRows.data?.length || 0
       })
 
       return res.json({
@@ -2667,9 +2675,10 @@ export function createApp({
   app.get('/api/debug/:shop_domain', requireShopifySessionToken, async (req, res) => {
     try {
       const shopDomain = normalizeShop(req.params.shop_domain)
-      const [sessions, events, overview] = await Promise.all([
+      const [sessions, events, sessionStateRows, overview] = await Promise.all([
         supabase.from('experiment_sessions').select('*').eq('shop_domain', shopDomain),
         supabase.from('events').select('*').eq('shop_domain', shopDomain),
+        supabase.from('session_state').select('*').eq('shop_domain', shopDomain),
         getAnalyticsOverview({ shopDomain }, analyticsOptions)
       ])
 
@@ -2677,8 +2686,10 @@ export function createApp({
         success: true,
         sessionCount: sessions.data?.length || 0,
         eventCount: events.data?.length || 0,
+        sessionStateCount: sessionStateRows.data?.length || 0,
         sessions: sessions.data || [],
         events: events.data || [],
+        session_state: sessionStateRows.data || [],
         derived: overview
       })
     } catch (error) {

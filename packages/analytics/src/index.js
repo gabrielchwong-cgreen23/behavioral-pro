@@ -17,7 +17,13 @@ const REPEATABLE_TRIGGER_TYPES = new Set([
   'trigger_fired',
   'product_page_view',
   'add_to_cart_click',
-  'begin_checkout_click'
+  'begin_checkout_click',
+  'product_view',
+  'add_to_cart',
+  'begin_checkout',
+  'rage_click',
+  'cta_idle_15s',
+  'policy_page_view'
 ])
 const SINGLE_EVENT_TYPES = new Set([
   'purchase',
@@ -360,6 +366,84 @@ function mapSessionToAssignmentEvent(session) {
   })
 }
 
+function mapSessionStateCounterKeyToEventType(counterKey) {
+  const mapping = {
+    page_views: 'page_view',
+    product_views: 'product_view',
+    add_to_cart_count: 'add_to_cart',
+    begin_checkout_count: 'begin_checkout',
+    purchase_count: 'purchase',
+    rage_click_count: 'trigger_fired',
+    cta_idle_15s_count: 'trigger_fired',
+    policy_page_view_count: 'trigger_fired',
+    intervention_triggered_count: 'message_shown'
+  }
+
+  return mapping[counterKey] || null
+}
+
+function mapSessionStateCounterKeyToMetadata(counterKey) {
+  const triggerTypes = {
+    rage_click_count: 'rage_click',
+    cta_idle_15s_count: 'cta_idle_15s',
+    policy_page_view_count: 'policy_page_view'
+  }
+
+  if (counterKey === 'intervention_triggered_count') {
+    return {
+      message_name: 'intervention_triggered'
+    }
+  }
+
+  if (triggerTypes[counterKey]) {
+    return {
+      trigger_type: triggerTypes[counterKey]
+    }
+  }
+
+  return {}
+}
+
+function mapSessionStateRowToSyntheticRawEvents(sessionStateRow) {
+  if (!sessionStateRow || typeof sessionStateRow !== 'object') return []
+
+  const counters =
+    sessionStateRow.counters && typeof sessionStateRow.counters === 'object'
+      ? sessionStateRow.counters
+      : {}
+  const occurredAt = normalizeTimestamp(
+    sessionStateRow.last_seen_at || sessionStateRow.updated_at || sessionStateRow.first_seen_at || new Date().toISOString()
+  )
+  const rawEvents = []
+
+  for (const [counterKey, rawValue] of Object.entries(counters)) {
+    const eventType = mapSessionStateCounterKeyToEventType(counterKey)
+    const count = Number(rawValue || 0)
+
+    if (!eventType || !Number.isFinite(count) || count <= 0) {
+      continue
+    }
+
+    for (let index = 0; index < count; index += 1) {
+      rawEvents.push(normalizeRawEventRecord({
+        event_id: `session_state_${sessionStateRow.id || 'row'}_${counterKey}_${index + 1}`,
+        session_id: sessionStateRow.session_id,
+        shop_domain: sessionStateRow.shop_domain,
+        variant: sessionStateRow.experiment_variant || 'control',
+        event_type: eventType,
+        occurred_at: occurredAt,
+        metadata: {
+          ...mapSessionStateCounterKeyToMetadata(counterKey),
+          storage: 'session_state',
+          synthetic: true
+        }
+      }))
+    }
+  }
+
+  return rawEvents
+}
+
 function cleanupRecentIngestKeys() {
   const cutoff = Date.now() - DEDUPE_TTL_MS
 
@@ -434,6 +518,9 @@ function buildSessionTableFromSharedRows(sessionRows, rawEvents) {
       startedAt: event.occurred_at
     })
     const parsed = parseStoredEventType(event.event_type)
+    const metadata = event.metadata && typeof event.metadata === 'object' ? event.metadata : {}
+    const derivedTriggerType = parsed.triggerType || metadata.trigger_type || metadata.triggerType
+    const derivedMessageName = parsed.messageName || metadata.message_name || metadata.messageName
     const next = { ...existing }
 
     if (!next.started_at || event.occurred_at < next.started_at) {
@@ -441,11 +528,11 @@ function buildSessionTableFromSharedRows(sessionRows, rawEvents) {
     }
 
     if (parsed.eventType === 'trigger_fired') {
-      next.triggers_fired = [...next.triggers_fired, parsed.triggerType || 'trigger_fired']
+      next.triggers_fired = [...next.triggers_fired, derivedTriggerType || 'trigger_fired']
     } else if (REPEATABLE_TRIGGER_TYPES.has(parsed.eventType)) {
       next.triggers_fired = [...next.triggers_fired, parsed.eventType]
     } else if (parsed.eventType === 'message_shown') {
-      next.messages_shown = [...next.messages_shown, parsed.messageName || 'message_shown']
+      next.messages_shown = [...next.messages_shown, derivedMessageName || 'message_shown']
     } else if (parsed.eventType === 'purchase' || parsed.eventType === 'checkout_completed') {
       next.converted = true
       next.revenue = Math.max(normalizeRevenue(next.revenue), normalizeRevenue(event.value))
@@ -490,7 +577,7 @@ async function querySupabaseRows(table, filters = {}, options = {}) {
     throw new Error('Invalid until timestamp')
   }
 
-  const timestampField = table === 'experiment_sessions' ? 'created_at' : 'created_at'
+  const timestampField = table === 'session_state' ? 'updated_at' : 'created_at'
 
   return rows.filter(row => matchesWindow(row[timestampField], since, until))
 }
@@ -506,6 +593,15 @@ async function getSupabaseSessions(filters = {}, options = {}) {
 
 async function getSupabaseEvents(filters = {}, options = {}) {
   return querySupabaseRows('events', {
+    shopDomain: normalizeOptionalString(filters.shopDomain || filters.shop_domain),
+    sessionId: normalizeOptionalString(filters.sessionId || filters.session_id),
+    since: filters.since,
+    until: filters.until
+  }, options)
+}
+
+async function getSupabaseSessionState(filters = {}, options = {}) {
+  return querySupabaseRows('session_state', {
     shopDomain: normalizeOptionalString(filters.shopDomain || filters.shop_domain),
     sessionId: normalizeOptionalString(filters.sessionId || filters.session_id),
     since: filters.since,
@@ -1076,12 +1172,26 @@ export async function trackBehavioralEvent(input, options = {}) {
 
 export async function getSessionCROTable(filters = {}, options = {}) {
   if (isSupabaseBacked(options)) {
-    const [sessions, events] = await Promise.all([
+    const [sessions, events, sessionStateRows] = await Promise.all([
       getSupabaseSessions(filters, options),
-      getSupabaseEvents(filters, options)
+      getSupabaseEvents(filters, options),
+      getSupabaseSessionState(filters, options)
     ])
 
-    return buildSessionTableFromSharedRows(sessions, events)
+    const sessionsWithMirroredEvents = new Set(
+      events.map((event) => `${event.shop_domain}::${event.session_id}`)
+    )
+    const supplementedEvents = [
+      ...events,
+      ...sessionStateRows.flatMap((row) => {
+        const key = `${row.shop_domain}::${row.session_id}`
+        return sessionsWithMirroredEvents.has(key)
+          ? []
+          : mapSessionStateRowToSyntheticRawEvents(row)
+      })
+    ]
+
+    return buildSessionTableFromSharedRows(sessions, supplementedEvents)
   }
 
   const records = await readSessionTable(options)
@@ -1105,14 +1215,26 @@ export async function getSessionCROTable(filters = {}, options = {}) {
 
 export async function getRawEventLog(filters = {}, options = {}) {
   if (isSupabaseBacked(options)) {
-    const [sessionRows, eventRows] = await Promise.all([
+    const [sessionRows, eventRows, sessionStateRows] = await Promise.all([
       getSupabaseSessions(filters, options),
-      getSupabaseEvents(filters, options)
+      getSupabaseEvents(filters, options),
+      getSupabaseSessionState(filters, options)
     ])
+
+    const sessionsWithMirroredEvents = new Set(
+      eventRows.map((event) => `${event.shop_domain}::${event.session_id}`)
+    )
+    const syntheticEvents = sessionStateRows.flatMap((row) => {
+      const key = `${row.shop_domain}::${row.session_id}`
+      return sessionsWithMirroredEvents.has(key)
+        ? []
+        : mapSessionStateRowToSyntheticRawEvents(row)
+    })
 
     return [
       ...sessionRows.map(mapSessionToAssignmentEvent),
-      ...eventRows.map(mapSupabaseEventToRawRecord)
+      ...eventRows.map(mapSupabaseEventToRawRecord),
+      ...syntheticEvents
     ].sort((left, right) => right.occurred_at.localeCompare(left.occurred_at))
   }
 
