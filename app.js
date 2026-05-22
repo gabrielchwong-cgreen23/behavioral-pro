@@ -2642,9 +2642,16 @@ export function createApp({
           SELECT
             experiment_variant AS variant,
             count() AS sessions,
-            sum(
-              toUInt64(provisional_abandoned_cart)
-              + toUInt64(provisional_abandoned_checkout) > 0
+            countIf(
+              (
+                add_to_cart_count > 0
+                AND begin_checkout_count = 0
+                AND purchase_count = 0
+              )
+              OR (
+                begin_checkout_count > 0
+                AND purchase_count = 0
+              )
             ) AS abandoned_sessions,
             round(
               if(count() = 0, 0, abandoned_sessions / count() * 100),
