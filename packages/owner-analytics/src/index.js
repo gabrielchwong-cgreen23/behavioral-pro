@@ -226,6 +226,7 @@ function buildOwnerAnalyticsPage() {
         <span class="muted" id="status-text">Loading stores...</span>
       </div>
       <div class="link-row">
+        <a class="link" id="exact-dashboard-link" href="#">Open exact store dashboard</a>
         <a class="link" id="raw-json-link" href="#">Open raw session JSON</a>
         <a class="link" id="raw-events-link" href="#">Open raw events JSON</a>
       </div>
@@ -413,9 +414,13 @@ function buildOwnerAnalyticsPage() {
 
     function updateLinks() {
       const select = document.getElementById('store-select');
+      const exactDashboardLink = document.getElementById('exact-dashboard-link');
       const rawJsonLink = document.getElementById('raw-json-link');
       const rawEventsLink = document.getElementById('raw-events-link');
-      if (!select || !rawJsonLink || !rawEventsLink || !select.value) return;
+      if (!select || !exactDashboardLink || !rawJsonLink || !rawEventsLink || !select.value) return;
+
+      exactDashboardLink.href =
+        '/owner-dashboard?shop=' + encodeURIComponent(select.value);
 
       rawJsonLink.href =
         '/owner-analytics/raw/' + encodeURIComponent(select.value);

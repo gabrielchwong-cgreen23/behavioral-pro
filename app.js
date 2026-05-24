@@ -1062,7 +1062,7 @@ export function buildMetricsPayload(shopDomain, overview) {
   }
 }
 
-function buildDashboardPage({ shopDomain, apiKey }) {
+function buildDashboardPage({ shopDomain, apiKey, authMode = 'shopify' }) {
   const escapedShop = escapeHtml(shopDomain)
   const escapedApiKey = escapeHtml(apiKey || '')
 
@@ -1340,6 +1340,7 @@ function buildDashboardPage({ shopDomain, apiKey }) {
 
   <script>
     const shopDomain = ${JSON.stringify(shopDomain)};
+    const authMode = ${JSON.stringify(authMode)};
     let currentStoreConfig = null;
 
     function setText(id, value) {
@@ -1408,6 +1409,10 @@ function buildDashboardPage({ shopDomain, apiKey }) {
     }
 
     async function getSessionTokenOrThrow() {
+      if (authMode === 'owner') {
+        return 'owner-access';
+      }
+
       if (!window.shopify) {
         throw new Error('window.shopify is missing');
       }
@@ -1426,9 +1431,12 @@ function buildDashboardPage({ shopDomain, apiKey }) {
     }
 
     async function authedFetch(url, options = {}) {
-      const token = await getSessionTokenOrThrow();
       const headers = new Headers(options.headers || {});
-      headers.set('Authorization', 'Bearer ' + token);
+
+      if (authMode !== 'owner') {
+        const token = await getSessionTokenOrThrow();
+        headers.set('Authorization', 'Bearer ' + token);
+      }
 
       return fetch(url, {
         ...options,
@@ -1495,10 +1503,17 @@ function buildDashboardPage({ shopDomain, apiKey }) {
 
     async function verifyEmbeddedAuth() {
       try {
-        setStatus('embedded-auth-status', 'Requesting session token...');
+        setStatus(
+          'embedded-auth-status',
+          authMode === 'owner' ? 'Checking owner access...' : 'Requesting session token...'
+        );
 
         const response = await authedFetch(
-          '/api/embedded-check?shop=' + encodeURIComponent(shopDomain),
+          (
+            authMode === 'owner'
+              ? '/api/owner/embedded-check?shop='
+              : '/api/embedded-check?shop='
+          ) + encodeURIComponent(shopDomain),
           { method: 'GET' }
         );
 
@@ -1508,7 +1523,11 @@ function buildDashboardPage({ shopDomain, apiKey }) {
           throw new Error(json.error || 'Embedded auth check failed');
         }
 
-        setStatus('embedded-auth-status', 'Session token accepted', 'ok');
+        setStatus(
+          'embedded-auth-status',
+          authMode === 'owner' ? 'Owner access accepted' : 'Session token accepted',
+          'ok'
+        );
         return true;
       } catch (error) {
         console.error('Embedded auth check error:', error);
@@ -1527,7 +1546,7 @@ function buildDashboardPage({ shopDomain, apiKey }) {
     async function loadStoreConfig() {
       try {
         const data = await authedJson(
-          '/api/store-config/' +
+          (authMode === 'owner' ? '/api/owner/store-config/' : '/api/store-config/') +
             encodeURIComponent(shopDomain) +
             '?shop=' +
             encodeURIComponent(shopDomain),
@@ -1546,7 +1565,7 @@ function buildDashboardPage({ shopDomain, apiKey }) {
       try {
         setStatus('controls-save-status', 'Saving...');
         const data = await authedJson(
-          '/api/store-config/' +
+          (authMode === 'owner' ? '/api/owner/store-config/' : '/api/store-config/') +
             encodeURIComponent(shopDomain) +
             '?shop=' +
             encodeURIComponent(shopDomain),
@@ -1572,7 +1591,7 @@ function buildDashboardPage({ shopDomain, apiKey }) {
     async function loadMetrics() {
       try {
         const response = await authedFetch(
-          '/api/metrics/' +
+          (authMode === 'owner' ? '/api/owner/metrics/' : '/api/metrics/') +
             encodeURIComponent(shopDomain) +
             '?shop=' +
             encodeURIComponent(shopDomain),
@@ -1680,7 +1699,9 @@ function renderAbandonmentByVariant(rows) {
     async function loadAnalyticsRates() {
       try {
         const response = await authedFetch(
-          '/api/analytics/conversion-rates/' +
+          (authMode === 'owner'
+            ? '/api/owner/analytics/conversion-rates/'
+            : '/api/analytics/conversion-rates/') +
             encodeURIComponent(shopDomain) +
             '?shop=' +
             encodeURIComponent(shopDomain),
@@ -1712,9 +1733,14 @@ function renderAbandonmentByVariant(rows) {
 
 async function loadAbandonmentByVariant() {
   try {
-    const response = await authedFetch('/api/analytics/abandonment-by-variant', {
-      method: 'GET'
-    })
+    const response = await authedFetch(
+      authMode === 'owner'
+        ? '/api/owner/analytics/abandonment-by-variant?shop=' + encodeURIComponent(shopDomain)
+        : '/api/analytics/abandonment-by-variant',
+      {
+        method: 'GET'
+      }
+    )
 
     const json = await response.json()
 
@@ -2600,6 +2626,25 @@ export function createApp({
     })
   })
 
+  app.get('/api/owner/embedded-check', requireOwnerAccess, async (req, res) => {
+    const shopDomain = normalizeShop(req.query.shop)
+    if (!shopDomain) {
+      return res.status(400).json({
+        success: false,
+        error: 'shop_domain is required'
+      })
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        ok: true,
+        shop: shopDomain,
+        user: 'owner'
+      }
+    })
+  })
+
   app.get('/api/analytics/conversion-rates/:shop_domain', requireShopifySessionToken, async (req, res) => {
     try {
       const shopDomain = normalizeShop(req.params.shop_domain)
@@ -2626,6 +2671,36 @@ export function createApp({
       })
     } catch (error) {
       console.log('ANALYTICS CONVERSION ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
+  })
+
+  app.get('/api/owner/analytics/conversion-rates/:shop_domain', requireOwnerAccess, async (req, res) => {
+    try {
+      const shopDomain = normalizeShop(req.params.shop_domain)
+
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      const filters = { shopDomain }
+      if (req.query.since) filters.since = req.query.since
+      if (req.query.until) filters.until = req.query.until
+
+      const conversionRates = await getTriggerConversionRates(filters, analyticsOptions)
+
+      return res.json({
+        success: true,
+        data: {
+          shop_domain: shopDomain,
+          conversion_rates: conversionRates
+        }
+      })
+    } catch (error) {
+      console.log('OWNER ANALYTICS CONVERSION ROUTE ERROR:', error)
       return sendSafeServerError(res)
     }
   })
@@ -2670,6 +2745,155 @@ export function createApp({
       })
     } catch (error) {
       console.error('TINYBIRD ABANDONMENT ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
+  })
+
+  app.get('/api/owner/analytics/abandonment-by-variant', requireOwnerAccess, async (req, res) => {
+    try {
+      const shopDomain = normalizeShop(req.query.shop)
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      const result = await queryTinybirdSql({
+        env,
+        fetchImpl,
+        logLabel: 'OWNER ABANDONMENT BY VARIANT',
+        sql: `
+          ${buildSessionFeaturesBaseCte()}
+          SELECT
+            experiment_variant AS variant,
+            count() AS sessions,
+            countIf(
+              (
+                add_to_cart_count > 0
+                AND begin_checkout_count = 0
+                AND purchase_count = 0
+              )
+              OR (
+                begin_checkout_count > 0
+                AND purchase_count = 0
+              )
+            ) AS abandoned_sessions,
+            round(
+              if(count() = 0, 0, abandoned_sessions / count() * 100),
+              2
+            ) AS abandonment_rate_percent
+          FROM session_features
+          WHERE shop_domain = ${toTinybirdSqlString(shopDomain)}
+          GROUP BY experiment_variant
+          ORDER BY experiment_variant ASC
+        `
+      })
+
+      return res.json({
+        success: true,
+        data: result.data || []
+      })
+    } catch (error) {
+      console.error('OWNER TINYBIRD ABANDONMENT ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
+  })
+
+  app.get('/api/owner/store-config/:shop_domain', requireOwnerAccess, async (req, res) => {
+    try {
+      const shopDomain = normalizeShop(req.params.shop_domain)
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      const [storeRecord, overview, sessions, events, sessionStateRows] = await Promise.all([
+        lookupStoreRecord(supabase, shopDomain),
+        getAnalyticsOverview({ shopDomain }, analyticsOptions),
+        supabase.from('experiment_sessions').select('*').eq('shop_domain', shopDomain),
+        supabase.from('events').select('*').eq('shop_domain', shopDomain),
+        supabase.from('session_state').select('*').eq('shop_domain', shopDomain)
+      ])
+
+      const setup = buildSetupStatus({
+        shopDomain,
+        storeRecord,
+        overview,
+        sessionCount: sessions.data?.length || 0,
+        rawEventCount: Math.max(
+          Number(events.data?.length || 0),
+          Number(overview?.totals?.rawEventCount || 0)
+        ),
+        sessionStateCount: sessionStateRows.data?.length || 0
+      })
+
+      return res.json({
+        success: true,
+        data: {
+          shop_domain: shopDomain,
+          config: sanitizeStoreConfigForMerchant(getStoreConfigFromRecord(storeRecord)),
+          setup
+        }
+      })
+    } catch (error) {
+      console.log('OWNER STORE CONFIG GET ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
+  })
+
+  app.put('/api/owner/store-config/:shop_domain', requireOwnerAccess, async (req, res) => {
+    try {
+      const shopDomain = normalizeShop(req.params.shop_domain)
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      const existing = await lookupStoreRecord(supabase, shopDomain)
+      const mergedConfig = mergeStoreConfig(existing?.settings || {}, req.body?.config || req.body || {})
+
+      const { data, error } = await supabase
+        .from('stores')
+        .upsert([{
+          shop_domain: shopDomain,
+          settings: mergedConfig
+        }], { onConflict: 'shop_domain' })
+        .select()
+
+      if (error) {
+        console.log('OWNER STORE CONFIG UPSERT ERROR:', error)
+        return sendSafeServerError(res)
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          shop_domain: shopDomain,
+          config: sanitizeStoreConfigForMerchant(getStoreConfigFromRecord(data?.[0]))
+        }
+      })
+    } catch (error) {
+      console.log('OWNER STORE CONFIG PUT ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
+  })
+
+  app.get('/api/owner/metrics/:shop_domain', requireOwnerAccess, async (req, res) => {
+    try {
+      const shopDomain = normalizeShop(req.params.shop_domain)
+      const overview = await getAnalyticsOverview({ shopDomain }, analyticsOptions)
+
+      return res.json({
+        success: true,
+        data: buildMetricsPayload(shopDomain, overview)
+      })
+    } catch (error) {
+      console.log('OWNER METRICS ROUTE ERROR:', error)
       return sendSafeServerError(res)
     }
   })
@@ -2719,7 +2943,29 @@ export function createApp({
     const shopDomain = normalizeShop(req.query.shop) || 'behavior-test-store.myshopify.com'
     res.send(buildDashboardPage({
       shopDomain,
-      apiKey: env.SHOPIFY_API_KEY
+      apiKey: env.SHOPIFY_API_KEY,
+      authMode: 'shopify'
+    }))
+  })
+
+  app.get('/owner-dashboard', requireOwnerAccess, (req, res) => {
+    const shopDomain = normalizeShop(req.query.shop)
+    if (!shopDomain) {
+      return res.status(400).send('Missing shop parameter')
+    }
+
+    const isSecure = req.secure || req.get('x-forwarded-proto') === 'https'
+    res.cookie('behavioralpro_owner_auth', env.ANALYTICS_OWNER_TOKEN, {
+      httpOnly: true,
+      sameSite: 'strict',
+      secure: Boolean(isSecure),
+      path: '/'
+    })
+
+    res.send(buildDashboardPage({
+      shopDomain,
+      apiKey: env.SHOPIFY_API_KEY,
+      authMode: 'owner'
     }))
   })
 
