@@ -1341,3 +1341,5 @@ export async function getAnalyticsOverview(filters = {}, options = {}) {
 export async function getAnalyticsSnapshot(filters = {}, options = {}) {
   return getAnalyticsOverview(filters, options)
 }
+
+export { buildMetricsPayload } from './metrics-payload.js'
