@@ -1382,8 +1382,6 @@ function buildDashboardPage({ shopDomain, apiKey, authMode = 'shopify' }) {
         <div class="stats-grid">
           <div class="stat"><div class="label">Lift %</div><div class="value" id="lift-percent">—</div></div>
           <div class="stat"><div class="label">Current Status</div><div class="value small" id="status-text">Loading...</div></div>
-          <div class="stat"><div class="label">Exposure Rate</div><div class="value small" id="exposure-rate">—</div></div>
-          <div class="stat"><div class="label">Estimated Incremental Revenue</div><div class="value small" id="incremental-revenue">—</div></div>
         </div>
       </div>
     </div>
@@ -1597,8 +1595,6 @@ function buildDashboardPage({ shopDomain, apiKey, authMode = 'shopify' }) {
 
         const lift = Number(data.lift_percent ?? 0);
         setText('lift-percent', lift.toFixed(1) + '%');
-        setText('exposure-rate', formatPercent(data.exposure_rate || 0));
-        setText('incremental-revenue', formatMoney(data.incremental_revenue_estimate || 0));
 
         const totalSessions = Number(control.sessions || 0) + Number(variant.sessions || 0);
         const totalPurchases = Number(control.purchases || 0) + Number(variant.purchases || 0);
