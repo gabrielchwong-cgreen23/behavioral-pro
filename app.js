@@ -1354,17 +1354,6 @@ function buildDashboardPage({ shopDomain, apiKey, authMode = 'shopify' }) {
       </ol>
     </div>
 
-    <div class="setup-grid">
-      <div class="card">
-        <div class="pill">Setup Status</div>
-        <h2>Store Readiness</h2>
-        <div class="muted">This checks whether the store is installed, collecting behavior, and showing interventions.</div>
-        <div class="muted" style="margin-top: 8px;">Current stage: <strong id="setup-stage">Loading...</strong></div>
-        <div class="checklist" id="setup-checklist"></div>
-      </div>
-
-    </div>
-
     <div class="grid">
       <div class="card">
         <div class="pill">Control</div>
@@ -1532,31 +1521,6 @@ function buildDashboardPage({ shopDomain, apiKey, authMode = 'shopify' }) {
       return json.data;
     }
 
-    function renderSetupStatus(setup) {
-      setText('setup-stage', String(setup && setup.stage ? setup.stage : 'unknown'));
-      const container = document.getElementById('setup-checklist');
-      if (!container) return;
-
-      const checklist = setup && setup.checklist ? setup.checklist : {};
-      const rows = [
-        ['Store registered', checklist.store_registered],
-        ['Sessions received', checklist.embed_receiving_sessions],
-        ['Behavioral events flowing', checklist.events_flowing],
-        ['Interventions recorded', checklist.interventions_recorded],
-        ['Revenue measured', checklist.revenue_attributed]
-      ];
-
-      container.innerHTML = rows.map(function (row) {
-        const ok = Boolean(row[1]);
-        return [
-          '<div class="check-row">',
-          '<strong>' + row[0] + '</strong>',
-          '<span class="' + (ok ? 'check-ok' : 'check-pending') + '">' + (ok ? 'Ready' : 'Pending') + '</span>',
-          '</div>'
-        ].join('');
-      }).join('');
-    }
-
     async function verifyEmbeddedAuth() {
       try {
         setStatus(
@@ -1596,23 +1560,6 @@ function buildDashboardPage({ shopDomain, apiKey, authMode = 'shopify' }) {
         }
 
         return false;
-      }
-    }
-
-    async function loadStoreConfig() {
-      try {
-        const data = await authedJson(
-          (authMode === 'owner' ? '/api/owner/store-config/' : '/api/store-config/') +
-            encodeURIComponent(shopDomain) +
-            '?shop=' +
-            encodeURIComponent(shopDomain),
-          { method: 'GET' }
-        );
-
-        renderSetupStatus(data.setup || {});
-      } catch (error) {
-        console.error('Store config error:', error);
-        renderSetupStatus({});
       }
     }
 
@@ -1752,7 +1699,7 @@ function renderAbandonmentByVariant(rows) {
     async function boot() {
       const authOk = await verifyEmbeddedAuth();
       if (authOk) {
-        await Promise.all([loadStoreConfig(), loadMetrics(), loadAnalyticsRates(), loadAbandonmentByVariant()]);
+        await Promise.all([loadMetrics(), loadAnalyticsRates(), loadAbandonmentByVariant()]);
       } else {
         setStatus('status-text', 'Blocked by auth', 'error');
         renderAnalyticsRates([]);
