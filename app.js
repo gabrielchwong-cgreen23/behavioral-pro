@@ -6,6 +6,7 @@ import { createClient } from '@supabase/supabase-js'
 import { pathToFileURL } from 'node:url'
 import {
   getAnalyticsOverview,
+  buildMetricsPayload,
   getTriggerConversionRates,
   trackBehavioralEvent,
   trackSessionStarted
@@ -834,6 +835,161 @@ async function logShadowInterventionDecision({
   })
 }
 
+async function logInterventionDecisionPerformance({
+  supabase,
+  env = process.env,
+  shopDomain,
+  sessionId,
+  requestedStoreId = '',
+  resolvedStoreId = '',
+  result = null,
+  outcomeStatus = 'success',
+  responseStatusCode = 200,
+  ingestStartedAtMs,
+  decisionEndedAtMs,
+  timing = {}
+}) {
+  if (!supabase) {
+    return null
+  }
+
+  const safeIngestStartedAtMs = Number(ingestStartedAtMs || 0)
+  const safeDecisionEndedAtMs = Number(decisionEndedAtMs || Date.now())
+  const totalDurationMs =
+    safeIngestStartedAtMs > 0
+      ? Math.max(0, safeDecisionEndedAtMs - safeIngestStartedAtMs)
+      : null
+  const deploymentVersion =
+    String(
+      env?.BEHAVIORALPRO_DEPLOYMENT_VERSION ||
+      env?.VERCEL_GIT_COMMIT_SHA ||
+      env?.RAILWAY_GIT_COMMIT_SHA ||
+      env?.RENDER_GIT_COMMIT ||
+      env?.COMMIT_SHA ||
+      env?.GIT_SHA ||
+      ''
+    ).trim() || null
+  const pilotCohort = String(env?.BEHAVIORALPRO_PILOT_COHORT || 'pilot_default').trim()
+  const rolloutKey = String(env?.BEHAVIORALPRO_ROLLOUT_KEY || 'rule_based_pilot').trim()
+
+  const row = {
+    route_name: '/api/intervention-decision',
+    route_runtime: 'express',
+    deployment_version: deploymentVersion,
+    pilot_cohort: pilotCohort,
+    rollout_key: rolloutKey,
+    shop_domain: shopDomain,
+    session_id: sessionId,
+    requested_store_id: String(requestedStoreId || '').trim() || null,
+    resolved_store_id: String(resolvedStoreId || '').trim() || null,
+    decision: Boolean(result?.decision),
+    outcome_status: String(outcomeStatus || 'success'),
+    response_status_code: Number.isFinite(Number(responseStatusCode))
+      ? Number(responseStatusCode)
+      : 200,
+    strategy: String(result?.strategy || 'unknown'),
+    intervention_type: String(result?.intervention_type || 'none'),
+    reason: String(result?.reason || result?.strategy || 'unknown'),
+    ingest_start_time: safeIngestStartedAtMs > 0
+      ? new Date(safeIngestStartedAtMs).toISOString()
+      : null,
+    decision_end_time: new Date(safeDecisionEndedAtMs).toISOString(),
+    total_duration_ms: totalDurationMs,
+    fetch_store_intervention_benchmarks_ms:
+      Number.isFinite(Number(timing?.fetch_store_intervention_benchmarks_ms))
+        ? Number(timing.fetch_store_intervention_benchmarks_ms)
+        : null,
+    evaluate_ms: Number.isFinite(Number(timing?.evaluate_ms))
+      ? Number(timing.evaluate_ms)
+      : null,
+    metadata: {
+      shadow_mode: Boolean(result?.shadow_mode),
+      message_id: result?.message_id || getInterventionMessageId(result?.intervention_type || 'none'),
+      calculated_threshold: Number(result?.calculated_threshold || 0),
+      session_score: Number(result?.session_score || 0),
+      decision_source: 'express'
+    }
+  }
+
+  const { error } = await supabase
+    .from('performance_metrics')
+    .insert([row])
+
+  if (error) {
+    throw new Error(error.message || 'Failed to insert performance_metrics row')
+  }
+
+  return row
+}
+
+export function scheduleInterventionDecisionPerformanceLog({
+  logger,
+  payload,
+  onError = (error) => {
+    console.log('PERFORMANCE METRICS LOG ERROR:', error)
+  }
+}) {
+  setTimeout(() => {
+    Promise.resolve()
+      .then(() => logger(payload))
+      .catch(onError)
+  }, 0)
+}
+
+function buildInterventionDecisionPerformanceResult({
+  strategy,
+  reason = strategy,
+  decision = false,
+  shadowMode = false
+}) {
+  return {
+    decision,
+    strategy,
+    intervention_type: 'none',
+    message_id: getInterventionMessageId('none'),
+    shadow_mode: shadowMode,
+    calculated_threshold: 1,
+    session_score: 0,
+    reason
+  }
+}
+
+function scheduleRoutePerformanceLog({
+  supabase,
+  env = process.env,
+  shopDomain = '',
+  sessionId = '',
+  requestedStoreId = '',
+  resolvedStoreId = '',
+  result,
+  outcomeStatus,
+  responseStatusCode,
+  ingestStartedAtMs,
+  decisionEndedAtMs = Date.now(),
+  timing = {
+    fetch_store_intervention_benchmarks_ms: null,
+    evaluate_ms: null
+  }
+}) {
+  scheduleInterventionDecisionPerformanceLog({
+    logger: logInterventionDecisionPerformance,
+    payload: {
+      supabase,
+      env,
+      shopDomain,
+      sessionId,
+      requestedStoreId,
+      resolvedStoreId,
+      result,
+      outcomeStatus,
+      responseStatusCode,
+      ingestStartedAtMs,
+      decisionEndedAtMs,
+      timing
+    }
+  })
+}
+
 export async function ingestPhase1Event({
   env = process.env,
   analyticsOptions,
@@ -1014,55 +1170,9 @@ export async function buildSessionFeaturesHealthReport({
   return response
 }
 
-export function buildMetricsPayload(shopDomain, overview) {
-  const controlSessions = overview.sessionTable.filter(session => session.variant === 'control')
-  const variantSessions = overview.sessionTable.filter(session => session.variant === 'variant')
-  const exposedSessions = overview.sessionTable.filter(session => Array.isArray(session.messages_shown) && session.messages_shown.length > 0)
-  const unexposedSessions = overview.sessionTable.filter(session => !Array.isArray(session.messages_shown) || session.messages_shown.length === 0)
+export { buildMetricsPayload }
 
-  function summarize(sessions) {
-    const purchases = sessions.filter(session => session.converted).length
-    const revenue = sessions.reduce((sum, session) => sum + Number(session.revenue || 0), 0)
-
-    return {
-      sessions: sessions.length,
-      purchases,
-      revenue,
-      conversion_rate: sessions.length === 0 ? 0 : purchases / sessions.length,
-      revenue_per_session: sessions.length === 0 ? 0 : revenue / sessions.length
-    }
-  }
-
-  const control = summarize(controlSessions)
-  const variant = summarize(variantSessions)
-  const exposed = summarize(exposedSessions)
-  const unexposed = summarize(unexposedSessions)
-  const liftPercent = control.revenue_per_session === 0
-    ? 0
-    : ((variant.revenue_per_session - control.revenue_per_session) / control.revenue_per_session) * 100
-  const exposureLiftPercent = unexposed.revenue_per_session === 0
-    ? 0
-    : ((exposed.revenue_per_session - unexposed.revenue_per_session) / unexposed.revenue_per_session) * 100
-  const incrementalRevenueEstimate = Math.max(
-    0,
-    (variant.revenue_per_session - control.revenue_per_session) * variant.sessions
-  )
-
-  return {
-    shop_domain: shopDomain,
-    control,
-    variant,
-    exposed,
-    unexposed,
-    totals: overview.totals || {},
-    lift_percent: liftPercent,
-    exposure_rate: overview.sessionTable.length === 0 ? 0 : exposed.sessions / overview.sessionTable.length,
-    exposure_lift_percent: exposureLiftPercent,
-    incremental_revenue_estimate: incrementalRevenueEstimate
-  }
-}
-
-function buildDashboardPage({ shopDomain, apiKey }) {
+function buildDashboardPage({ shopDomain, apiKey, authMode = 'shopify' }) {
   const escapedShop = escapeHtml(shopDomain)
   const escapedApiKey = escapeHtml(apiKey || '')
 
@@ -1253,36 +1363,6 @@ function buildDashboardPage({ shopDomain, apiKey }) {
         <div class="checklist" id="setup-checklist"></div>
       </div>
 
-      <div class="card">
-        <div class="pill">Controls</div>
-        <h2>Intervention Controls</h2>
-        <div class="muted">These settings change live storefront behavior without editing theme code.</div>
-        <div class="controls-form">
-          <div class="toggle"><input type="checkbox" id="cfg-interventions-enabled" /><label for="cfg-interventions-enabled">Enable interventions</label></div>
-          <div class="toggle"><input type="checkbox" id="cfg-tidio-enabled" /><label for="cfg-tidio-enabled">Deliver through Tidio</label></div>
-          <div class="toggle"><input type="checkbox" id="cfg-shadow-mode" /><label for="cfg-shadow-mode">Shadow mode only</label></div>
-          <div class="field">
-            <label for="cfg-aov-cohort">AOV cohort</label>
-            <select id="cfg-aov-cohort">
-              <option value="impulse">Impulse</option>
-              <option value="mid_tier">Mid-tier</option>
-              <option value="luxury">Luxury</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="cfg-cooldown-seconds">Cooldown seconds</label>
-            <input type="number" id="cfg-cooldown-seconds" min="30" max="3600" step="30" />
-          </div>
-          <div class="field">
-            <label for="cfg-tidio-project-id">Tidio project ID</label>
-            <input type="text" id="cfg-tidio-project-id" />
-          </div>
-        </div>
-        <div class="actions">
-          <button class="button" id="save-controls-button" type="button">Save controls</button>
-          <span class="muted" id="controls-save-status">Waiting for settings...</span>
-        </div>
-      </div>
     </div>
 
     <div class="grid">
@@ -1340,8 +1420,7 @@ function buildDashboardPage({ shopDomain, apiKey }) {
 
   <script>
     const shopDomain = ${JSON.stringify(shopDomain)};
-    let currentStoreConfig = null;
-
+    const authMode = ${JSON.stringify(authMode)};
     function setText(id, value) {
       const el = document.getElementById(id);
       if (el) el.textContent = value;
@@ -1408,6 +1487,10 @@ function buildDashboardPage({ shopDomain, apiKey }) {
     }
 
     async function getSessionTokenOrThrow() {
+      if (authMode === 'owner') {
+        return 'owner-access';
+      }
+
       if (!window.shopify) {
         throw new Error('window.shopify is missing');
       }
@@ -1426,9 +1509,12 @@ function buildDashboardPage({ shopDomain, apiKey }) {
     }
 
     async function authedFetch(url, options = {}) {
-      const token = await getSessionTokenOrThrow();
       const headers = new Headers(options.headers || {});
-      headers.set('Authorization', 'Bearer ' + token);
+
+      if (authMode !== 'owner') {
+        const token = await getSessionTokenOrThrow();
+        headers.set('Authorization', 'Bearer ' + token);
+      }
 
       return fetch(url, {
         ...options,
@@ -1471,34 +1557,19 @@ function buildDashboardPage({ shopDomain, apiKey }) {
       }).join('');
     }
 
-    function applyStoreConfigToForm(config) {
-      currentStoreConfig = config || {};
-      document.getElementById('cfg-interventions-enabled').checked = currentStoreConfig.interventions_enabled !== false;
-      document.getElementById('cfg-tidio-enabled').checked = currentStoreConfig.tidio_enabled !== false;
-      document.getElementById('cfg-shadow-mode').checked = currentStoreConfig.shadow_mode === true;
-      document.getElementById('cfg-aov-cohort').value = String(currentStoreConfig.aov_cohort || 'mid_tier');
-      document.getElementById('cfg-cooldown-seconds').value = String(currentStoreConfig.cooldown_seconds || 300);
-      document.getElementById('cfg-tidio-project-id').value = String(currentStoreConfig.tidio_project_id || '');
-      setStatus('controls-save-status', 'Settings loaded', 'ok');
-    }
-
-    function readStoreConfigFromForm() {
-      return {
-        interventions_enabled: document.getElementById('cfg-interventions-enabled').checked,
-        tidio_enabled: document.getElementById('cfg-tidio-enabled').checked,
-        shadow_mode: document.getElementById('cfg-shadow-mode').checked,
-        aov_cohort: document.getElementById('cfg-aov-cohort').value,
-        cooldown_seconds: Number(document.getElementById('cfg-cooldown-seconds').value || 300),
-        tidio_project_id: document.getElementById('cfg-tidio-project-id').value.trim()
-      };
-    }
-
     async function verifyEmbeddedAuth() {
       try {
-        setStatus('embedded-auth-status', 'Requesting session token...');
+        setStatus(
+          'embedded-auth-status',
+          authMode === 'owner' ? 'Checking owner access...' : 'Requesting session token...'
+        );
 
         const response = await authedFetch(
-          '/api/embedded-check?shop=' + encodeURIComponent(shopDomain),
+          (
+            authMode === 'owner'
+              ? '/api/owner/embedded-check?shop='
+              : '/api/embedded-check?shop='
+          ) + encodeURIComponent(shopDomain),
           { method: 'GET' }
         );
 
@@ -1508,7 +1579,11 @@ function buildDashboardPage({ shopDomain, apiKey }) {
           throw new Error(json.error || 'Embedded auth check failed');
         }
 
-        setStatus('embedded-auth-status', 'Session token accepted', 'ok');
+        setStatus(
+          'embedded-auth-status',
+          authMode === 'owner' ? 'Owner access accepted' : 'Session token accepted',
+          'ok'
+        );
         return true;
       } catch (error) {
         console.error('Embedded auth check error:', error);
@@ -1527,52 +1602,24 @@ function buildDashboardPage({ shopDomain, apiKey }) {
     async function loadStoreConfig() {
       try {
         const data = await authedJson(
-          '/api/store-config/' +
+          (authMode === 'owner' ? '/api/owner/store-config/' : '/api/store-config/') +
             encodeURIComponent(shopDomain) +
             '?shop=' +
             encodeURIComponent(shopDomain),
           { method: 'GET' }
         );
 
-        applyStoreConfigToForm(data.config || {});
         renderSetupStatus(data.setup || {});
       } catch (error) {
         console.error('Store config error:', error);
-        setStatus('controls-save-status', 'Failed to load settings', 'error');
-      }
-    }
-
-    async function saveStoreConfig() {
-      try {
-        setStatus('controls-save-status', 'Saving...');
-        const data = await authedJson(
-          '/api/store-config/' +
-            encodeURIComponent(shopDomain) +
-            '?shop=' +
-            encodeURIComponent(shopDomain),
-          {
-            method: 'PUT',
-            headers: {
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              config: readStoreConfigFromForm()
-            })
-          }
-        );
-
-        applyStoreConfigToForm(data.config || {});
-        setStatus('controls-save-status', 'Saved', 'ok');
-      } catch (error) {
-        console.error('Save controls error:', error);
-        setStatus('controls-save-status', 'Save failed: ' + String(error.message || error), 'error');
+        renderSetupStatus({});
       }
     }
 
     async function loadMetrics() {
       try {
         const response = await authedFetch(
-          '/api/metrics/' +
+          (authMode === 'owner' ? '/api/owner/metrics/' : '/api/metrics/') +
             encodeURIComponent(shopDomain) +
             '?shop=' +
             encodeURIComponent(shopDomain),
@@ -1680,7 +1727,9 @@ function renderAbandonmentByVariant(rows) {
     async function loadAnalyticsRates() {
       try {
         const response = await authedFetch(
-          '/api/analytics/conversion-rates/' +
+          (authMode === 'owner'
+            ? '/api/owner/analytics/conversion-rates/'
+            : '/api/analytics/conversion-rates/') +
             encodeURIComponent(shopDomain) +
             '?shop=' +
             encodeURIComponent(shopDomain),
@@ -1712,9 +1761,16 @@ function renderAbandonmentByVariant(rows) {
 
 async function loadAbandonmentByVariant() {
   try {
-    const response = await authedFetch('/api/analytics/abandonment-by-variant', {
+    const response = await authedFetch(
+      (
+        authMode === 'owner'
+          ? '/api/owner/analytics/abandonment-by-variant?shop=' + encodeURIComponent(shopDomain)
+          : '/api/analytics/abandonment-by-variant'
+      ),
+      {
       method: 'GET'
-    })
+      }
+    )
 
     const json = await response.json()
 
@@ -1729,7 +1785,6 @@ async function loadAbandonmentByVariant() {
   }
 }
 
-    document.getElementById('save-controls-button').addEventListener('click', saveStoreConfig);
     boot();
   </script>
 </body>
@@ -2445,8 +2500,24 @@ export function createApp({
   })
 
   async function handleInterventionDecision(req, res, input) {
+    const ingestStartedAtMs = Date.now()
     const validation = validateInterventionDecisionQuery(input || {})
     if (!validation.value) {
+      const result = buildInterventionDecisionPerformanceResult({
+        strategy: 'invalid_request',
+        reason: 'invalid_request'
+      })
+      scheduleRoutePerformanceLog({
+        supabase,
+        env,
+        shopDomain: String(input?.shop_domain || input?.shopDomain || '').trim(),
+        sessionId: String(input?.session_id || input?.sessionId || '').trim(),
+        requestedStoreId: String(input?.store_id || input?.storeId || '').trim(),
+        result,
+        outcomeStatus: 'aborted',
+        responseStatusCode: validation.status,
+        ingestStartedAtMs
+      })
       return res.status(validation.status).json({
         decision: false,
         strategy: 'invalid_request',
@@ -2465,6 +2536,21 @@ export function createApp({
     ]))
 
     if (!rateLimit.ok) {
+      const result = buildInterventionDecisionPerformanceResult({
+        strategy: 'rate_limited',
+        reason: 'rate_limited'
+      })
+      scheduleRoutePerformanceLog({
+        supabase,
+        env,
+        shopDomain,
+        sessionId,
+        requestedStoreId,
+        result,
+        outcomeStatus: 'blocked',
+        responseStatusCode: 429,
+        ingestStartedAtMs
+      })
       return res
         .status(429)
         .set('Retry-After', String(rateLimit.retryAfterSeconds))
@@ -2478,6 +2564,21 @@ export function createApp({
     }
 
     if (isBotLikeRequest(req) && !req.get('origin') && !req.get('referer')) {
+      const result = buildInterventionDecisionPerformanceResult({
+        strategy: 'unauthorized',
+        reason: 'unauthorized'
+      })
+      scheduleRoutePerformanceLog({
+        supabase,
+        env,
+        shopDomain,
+        sessionId,
+        requestedStoreId,
+        result,
+        outcomeStatus: 'blocked',
+        responseStatusCode: 401,
+        ingestStartedAtMs
+      })
       return res.status(401).json({
         decision: false,
         strategy: 'unauthorized',
@@ -2488,6 +2589,10 @@ export function createApp({
     }
 
     try {
+      const decisionTiming = {
+        fetch_store_intervention_benchmarks_ms: null,
+        evaluate_ms: null
+      }
       const storeRecord = await lookupStoreRecord(supabase, shopDomain).catch((error) => {
         console.log('INTERVENTION STORE LOOKUP ERROR:', error)
         return null
@@ -2504,10 +2609,12 @@ export function createApp({
         storeRecord,
         supabase,
         env,
-        fetchImpl
+        fetchImpl,
+        decisionTiming
       })
+      const decisionEndedAtMs = Date.now()
 
-      await logShadowInterventionDecision({
+      logShadowInterventionDecision({
         shopDomain,
         sessionId,
         session,
@@ -2543,12 +2650,28 @@ export function createApp({
         }
       })()
 
+      scheduleRoutePerformanceLog({
+        supabase,
+        env,
+        shopDomain,
+        sessionId,
+        requestedStoreId,
+        resolvedStoreId,
+        result,
+        outcomeStatus: 'success',
+        responseStatusCode: 200,
+        ingestStartedAtMs,
+        decisionEndedAtMs,
+        timing: decisionTiming
+      })
+
       return res
         .set('Cache-Control', 'no-store')
         .json(result)
     } catch (error) {
       console.log('INTERVENTION DECISION ROUTE ERROR:', error)
-      await logShadowInterventionDecision({
+      const decisionEndedAtMs = Date.now()
+      logShadowInterventionDecision({
         shopDomain,
         sessionId,
         session: null,
@@ -2567,6 +2690,27 @@ export function createApp({
       }).catch((shadowError) => {
         console.log('SHADOW DECISION LOG ERROR:', shadowError)
         return null
+      })
+
+      scheduleRoutePerformanceLog({
+        supabase,
+        env,
+        shopDomain,
+        sessionId,
+        requestedStoreId,
+        resolvedStoreId: '',
+        result: buildInterventionDecisionPerformanceResult({
+          strategy: 'error_fail_closed',
+          reason: 'error_fail_closed'
+        }),
+        outcomeStatus: 'error',
+        responseStatusCode: 500,
+        ingestStartedAtMs,
+        decisionEndedAtMs,
+        timing: {
+          fetch_store_intervention_benchmarks_ms: null,
+          evaluate_ms: null
+        }
       })
 
       return res
@@ -2674,6 +2818,173 @@ export function createApp({
     }
   })
 
+  app.get('/api/owner/embedded-check', requireOwnerAccess, async (req, res) => {
+    const shopDomain = normalizeShop(req.query.shop)
+    if (!shopDomain) {
+      return res.status(400).json({
+        success: false,
+        error: 'shop_domain is required'
+      })
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        shop_domain: shopDomain,
+        auth_mode: 'owner'
+      }
+    })
+  })
+
+  app.get('/api/owner/analytics/abandonment-by-variant', requireOwnerAccess, async (req, res) => {
+    try {
+      const shopDomain = normalizeShop(req.query.shop)
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      const result = await queryTinybirdSql({
+        env,
+        fetchImpl,
+        logLabel: 'OWNER ABANDONMENT BY VARIANT',
+        sql: `
+          ${buildSessionFeaturesBaseCte()}
+          SELECT
+            experiment_variant AS variant,
+            count() AS sessions,
+            countIf(
+              (
+                add_to_cart_count > 0
+                AND begin_checkout_count = 0
+                AND purchase_count = 0
+              )
+              OR (
+                begin_checkout_count > 0
+                AND purchase_count = 0
+              )
+            ) AS abandoned_sessions,
+            round(
+              if(count() = 0, 0, abandoned_sessions / count() * 100),
+              2
+            ) AS abandonment_rate_percent
+          FROM session_features
+          WHERE shop_domain = ${toTinybirdSqlString(shopDomain)}
+          GROUP BY experiment_variant
+          ORDER BY experiment_variant ASC
+        `
+      })
+
+      return res.json({
+        success: true,
+        data: result.data || []
+      })
+    } catch (error) {
+      console.error('OWNER TINYBIRD ABANDONMENT ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
+  })
+
+  app.get('/api/owner/store-config/:shop_domain', requireOwnerAccess, async (req, res) => {
+    try {
+      const shopDomain = normalizeShop(req.params.shop_domain)
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      const [storeRecord, overview, sessions, events, sessionStateRows] = await Promise.all([
+        lookupStoreRecord(supabase, shopDomain),
+        getAnalyticsOverview({ shopDomain }, analyticsOptions),
+        supabase.from('experiment_sessions').select('*').eq('shop_domain', shopDomain),
+        supabase.from('events').select('*').eq('shop_domain', shopDomain),
+        supabase.from('session_state').select('*').eq('shop_domain', shopDomain)
+      ])
+
+      const setup = buildSetupStatus({
+        shopDomain,
+        storeRecord,
+        overview,
+        sessionCount: sessions.data?.length || 0,
+        rawEventCount: Math.max(
+          Number(events.data?.length || 0),
+          Number(overview?.totals?.rawEventCount || 0)
+        ),
+        sessionStateCount: sessionStateRows.data?.length || 0
+      })
+
+      return res.json({
+        success: true,
+        data: {
+          shop_domain: shopDomain,
+          config: sanitizeStoreConfigForMerchant(getStoreConfigFromRecord(storeRecord)),
+          setup
+        }
+      })
+    } catch (error) {
+      console.log('OWNER STORE CONFIG GET ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
+  })
+
+  app.put('/api/owner/store-config/:shop_domain', requireOwnerAccess, async (req, res) => {
+    try {
+      const shopDomain = normalizeShop(req.params.shop_domain)
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      const existing = await lookupStoreRecord(supabase, shopDomain)
+      const mergedConfig = mergeStoreConfig(existing?.settings || {}, req.body?.config || req.body || {})
+
+      const { data, error } = await supabase
+        .from('stores')
+        .upsert([{
+          shop_domain: shopDomain,
+          settings: mergedConfig
+        }], { onConflict: 'shop_domain' })
+        .select()
+
+      if (error) {
+        console.log('OWNER STORE CONFIG UPSERT ERROR:', error)
+        return sendSafeServerError(res)
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          shop_domain: shopDomain,
+          config: sanitizeStoreConfigForMerchant(getStoreConfigFromRecord((data || [])[0] || { settings: mergedConfig }))
+        }
+      })
+    } catch (error) {
+      console.log('OWNER STORE CONFIG PUT ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
+  })
+
+  app.get('/api/owner/metrics/:shop_domain', requireOwnerAccess, async (req, res) => {
+    try {
+      const shopDomain = normalizeShop(req.params.shop_domain)
+      const overview = await getAnalyticsOverview({ shopDomain }, analyticsOptions)
+
+      return res.json({
+        success: true,
+        data: buildMetricsPayload(shopDomain, overview)
+      })
+    } catch (error) {
+      console.log('OWNER METRICS ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
+  })
+
   app.get('/api/metrics/:shop_domain', requireShopifySessionToken, async (req, res) => {
     try {
       const shopDomain = normalizeShop(req.params.shop_domain)
@@ -2719,7 +3030,29 @@ export function createApp({
     const shopDomain = normalizeShop(req.query.shop) || 'behavior-test-store.myshopify.com'
     res.send(buildDashboardPage({
       shopDomain,
-      apiKey: env.SHOPIFY_API_KEY
+      apiKey: env.SHOPIFY_API_KEY,
+      authMode: 'shopify'
+    }))
+  })
+
+  app.get('/owner-dashboard', requireOwnerAccess, (req, res) => {
+    const shopDomain = normalizeShop(req.query.shop)
+    if (!shopDomain) {
+      return res.status(400).send('Missing shop parameter')
+    }
+
+    const isSecure = req.secure || req.get('x-forwarded-proto') === 'https'
+    res.cookie('behavioralpro_owner_auth', env.ANALYTICS_OWNER_TOKEN, {
+      httpOnly: true,
+      sameSite: 'strict',
+      secure: Boolean(isSecure),
+      path: '/'
+    })
+
+    res.send(buildDashboardPage({
+      shopDomain,
+      apiKey: env.SHOPIFY_API_KEY,
+      authMode: 'owner'
     }))
   })
 
