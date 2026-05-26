@@ -25,7 +25,7 @@
       "type": "checkbox",
       "id": "review_mode",
       "label": "Reviewer Demo Mode",
-      "default": true
+      "default": false
     },
     {
       "type": "range",
@@ -67,6 +67,10 @@
     tidioId: "63hgfq26munthk1pfvmvz25ryddkjgsf",
     experimentName: "agency_revenue_lift_14_day",
     legacyMirrorsEnabled: true,
+    tidioEnabled: true,
+    shadowMode: false,
+    allowedInterventionTypes: [],
+    cooldownSeconds: 300,
 
     sessionKey: "behavioral_pro_session_id",
     variantKey: "behavioral_pro_variant",
@@ -101,6 +105,8 @@
     review_section_dwell_10s: 1,
     cta_idle_15s: 1,
     rage_click: 1,
+    exit_intent: 1,
+    tidio_widget_open: 1,
     intervention_triggered: 1,
     intervention_type: 1
   };
@@ -110,13 +116,16 @@
   var assignmentPromise = null;
   var assignmentReady = false;
   var tidioRequested = false;
+  var tidioOpenBindingRequested = false;
   var memorySessionId = null;
   var clickTrackingBound = false;
   var fallbackUiMounted = false;
-  var statusBadgeMounted = false;
   var interactionDisplayed = false;
   var backendFailed = false;
   var tidioFailed = false;
+  var decisionRequestInFlight = false;
+  var pendingDecisionCheck = null;
+  var lastDecisionStrategy = null;
   var ctaIdleTimer = null;
   var ctaIdleTarget = null;
   var ctaInteracted = false;
@@ -124,6 +133,10 @@
   var reviewObserver = null;
   var reviewDwellTimer = null;
   var reviewDwellFired = false;
+  var motionTrackerStarted = false;
+  var STRICT_SESSION_DEDUPE_MS = 12 * 60 * 60 * 1000;
+  var SHORT_EVENT_DEBOUNCE_MS = 1500;
+  var MEDIUM_EVENT_DEBOUNCE_MS = 5000;
 
   function log() {
     if (!CONFIG.debug || !window.console || typeof window.console.log !== "function") return;
@@ -222,19 +235,12 @@
   function getReviewModeFlag() {
     var flag = getQueryParam("behavioralpro_review");
     if (flag === "1" || flag === "true") {
-      safeSetLocalStorage("behavioral_pro_review_mode", "1");
       return true;
     }
     if (flag === "0" || flag === "false") {
-      safeSetLocalStorage("behavioral_pro_review_mode", "0");
       return false;
     }
-
-    var stored = safeGetLocalStorage("behavioral_pro_review_mode");
-    if (stored === "1") return true;
-    if (stored === "0") return false;
-
-    return !!CONFIG.reviewModeSetting;
+    return false;
   }
 
   CONFIG.reviewMode = getReviewModeFlag();
@@ -391,15 +397,47 @@
     safeSetSessionStorage(CONFIG.eventDedupKey, JSON.stringify(map || {}));
   }
 
-  function hasSeenEvent(signature) {
-    var map = getEventDedupMap();
-    return map[signature] === 1;
+  function pruneEventDedupMap(map, now) {
+    var next = map || {};
+    var currentTime = typeof now === "number" ? now : Date.now();
+    Object.keys(next).forEach(function (key) {
+      var value = Number(next[key] || 0);
+      if (!value || currentTime - value > STRICT_SESSION_DEDUPE_MS) {
+        delete next[key];
+      }
+    });
+    return next;
   }
 
-  function markSeenEvent(signature) {
+  function getEventDedupTimestamp(signature) {
     var map = getEventDedupMap();
-    map[signature] = 1;
+    return Number(map[signature] || 0);
+  }
+
+  function rememberEventSignature(signature) {
+    var map = getEventDedupMap();
+    var now = Date.now();
+    map[signature] = now;
+    pruneEventDedupMap(map, now);
     setEventDedupMap(map);
+  }
+
+  function shouldSuppressEventSignature(signature, windowMs) {
+    var lastSeenAt = getEventDedupTimestamp(signature);
+    if (!lastSeenAt) return false;
+
+    var ttl = Number(windowMs || 0);
+    if (ttl <= 0) return false;
+
+    return (Date.now() - lastSeenAt) < ttl;
+  }
+
+  function shouldSuppressOncePerSession(signature) {
+    return shouldSuppressEventSignature(signature, STRICT_SESSION_DEDUPE_MS);
+  }
+
+  function shouldSuppressRapidDuplicate(signature) {
+    return shouldSuppressEventSignature(signature, SHORT_EVENT_DEBOUNCE_MS);
   }
 
   function normalizeBaseUrl(url) {
@@ -413,8 +451,9 @@
     return true;
   }
 
-  function postJson(path, body) {
+  function postJson(path, body, options) {
     var base = normalizeBaseUrl(CONFIG.backendBase);
+    var requestOptions = options || {};
 
     if (typeof window.fetch !== "function" || !isUsableBackendBase(base)) {
       return Promise.reject(new Error("backend_unavailable"));
@@ -428,7 +467,208 @@
       body: JSON.stringify(body),
       keepalive: true,
       credentials: "omit",
-      mode: "cors"
+      mode: "cors",
+      signal: requestOptions.signal
+    }).then(function (response) {
+      if (response.redirected) {
+        throw new Error("redirected_request:" + response.status);
+      }
+      return response;
+    });
+  }
+
+  function postJsonBeacon(path, body) {
+    var base = normalizeBaseUrl(CONFIG.backendBase);
+
+    if (!isUsableBackendBase(base)) {
+      return false;
+    }
+
+    var payload = JSON.stringify(body);
+
+    if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
+      try {
+        if (navigator.sendBeacon(base + path, new Blob([payload], { type: "application/json" }))) {
+          return true;
+        }
+      } catch (e) {}
+    }
+
+    if (typeof window.fetch === "function") {
+      window.fetch(base + path, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: payload,
+        keepalive: true,
+        credentials: "omit",
+        mode: "cors"
+      }).catch(function () {});
+      return true;
+    }
+
+    return false;
+  }
+
+  function encodeByteArrayBase64(bytes) {
+    var binary = "";
+    var chunkSize = 8192;
+    var index = 0;
+
+    while (index < bytes.length) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(index, index + chunkSize));
+      index += chunkSize;
+    }
+
+    return window.btoa(binary);
+  }
+
+  function startPackedMotionTracking() {
+    if (motionTrackerStarted || !assignmentReady) return;
+    motionTrackerStarted = true;
+
+    var SAMPLE_BYTES = 14;
+    var MAX_SAMPLES = 128;
+    var FLUSH_MS = 100;
+    var EVENT_NAME = "mouse_path_batch";
+    var buffer = new ArrayBuffer(SAMPLE_BYTES * MAX_SAMPLES);
+    var view = new DataView(buffer);
+    var count = 0;
+    var baseTs = 0;
+    var lastX = 0;
+    var lastY = 0;
+    var lastScrollX = Math.max(0, window.scrollX || 0);
+    var lastScrollY = Math.max(0, window.scrollY || 0);
+
+    function clampU16(value) {
+      value = value | 0;
+      if (value < 0) return 0;
+      if (value > 65535) return 65535;
+      return value;
+    }
+
+    function clampU32(value) {
+      value = Math.floor(Number(value) || 0);
+      if (value < 0) return 0;
+      if (value > 4294967295) return 4294967295;
+      return value;
+    }
+
+    function flush() {
+      if (!count || !assignmentReady) return;
+
+      var variant = getStoredVariant();
+      if (variant !== "control" && variant !== "variant") return;
+
+      var visitorId = getVisitorId();
+      var sessionId = getSessionId();
+      var context = getBaseEventContext();
+      var byteLength = count * SAMPLE_BYTES;
+      var bytes = new Uint8Array(buffer, 0, byteLength);
+      var sentAt = Date.now();
+
+      postJsonBeacon("/api/events", {
+        anonymous_id: visitorId,
+        session_id: sessionId,
+        event_name: EVENT_NAME,
+        timestamp: Math.floor(baseTs / 1000),
+        experiment_variant: variant,
+        properties: {
+          referrer: context.referrer,
+          traffic_source: context.traffic_source,
+          device_type: context.device_type,
+          product_id: context.product_id,
+          product_handle: context.product_handle,
+          cart_value: context.cart_value,
+          template_name: context.template_name,
+          currency: context.currency,
+          shop_domain: CONFIG.shopDomain,
+          path: window.location.pathname,
+          experiment_variant: variant,
+          client_event_id: createId("evt"),
+          timeseries_block: {
+            version: 1,
+            kind: "mouse_pointer_scroll",
+            encoding: "base64",
+            endian: "LE",
+            stride_bytes: SAMPLE_BYTES,
+            sample_count: count,
+            base_timestamp_ms: baseTs,
+            flushed_timestamp_ms: sentAt,
+            schema: ["u16:x", "u16:y", "u16:dt_ms", "u32:scroll_x", "u32:scroll_y"],
+            data: encodeByteArrayBase64(bytes)
+          }
+        }
+      });
+
+      count = 0;
+      baseTs = 0;
+    }
+
+    function pushSample(x, y, ts, scrollX, scrollY) {
+      if (count >= MAX_SAMPLES) {
+        flush();
+      }
+
+      if (!count) {
+        baseTs = ts;
+      }
+
+      var offset = count * SAMPLE_BYTES;
+      view.setUint16(offset, clampU16(x), true);
+      view.setUint16(offset + 2, clampU16(y), true);
+      view.setUint16(offset + 4, clampU16(ts - baseTs), true);
+      view.setUint32(offset + 6, clampU32(scrollX), true);
+      view.setUint32(offset + 10, clampU32(scrollY), true);
+      count += 1;
+    }
+
+    function readScrollOffsets() {
+      lastScrollX = Math.max(0, window.scrollX || document.documentElement.scrollLeft || 0);
+      lastScrollY = Math.max(0, window.scrollY || document.documentElement.scrollTop || 0);
+    }
+
+    document.addEventListener("mousemove", function (event) {
+      lastX = clampU16(event.clientX || 0);
+      lastY = clampU16(event.clientY || 0);
+      readScrollOffsets();
+      pushSample(lastX, lastY, Date.now(), lastScrollX, lastScrollY);
+    }, { passive: true });
+
+    window.addEventListener("scroll", function () {
+      readScrollOffsets();
+      pushSample(lastX, lastY, Date.now(), lastScrollX, lastScrollY);
+    }, { passive: true });
+
+    window.setInterval(flush, FLUSH_MS);
+    window.addEventListener("pagehide", flush);
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "hidden") {
+        flush();
+      }
+    });
+  }
+
+  function getJson(path, params) {
+    var base = normalizeBaseUrl(CONFIG.backendBase);
+
+    if (typeof window.fetch !== "function" || !isUsableBackendBase(base)) {
+      return Promise.reject(new Error("backend_unavailable"));
+    }
+
+    var url = new URL(base + path);
+    Object.keys(params || {}).forEach(function (key) {
+      var value = params[key];
+      if (value == null || value === "") return;
+      url.searchParams.set(key, String(value));
+    });
+
+    return window.fetch(url.toString(), {
+      method: "GET",
+      credentials: "omit",
+      mode: "cors",
+      cache: "no-store"
     }).then(function (response) {
       if (response.redirected) {
         throw new Error("redirected_request:" + response.status);
@@ -462,10 +702,19 @@
     }
 
     var messages = {
-      page_view: "Welcome in. I can help you find the best place to start.",
-      product_view: "Still looking? I can help find the right product.",
-      add_to_cart: "Great choice. Need help before checkout?",
-      begin_checkout: "Questions before you finish checkout?"
+      page_view: "Hi there. If you'd like a hand getting started, I'm here.",
+      product_view: "If you'd like a second opinion on this product, I can help.",
+      add_to_cart: "Nice pick. If you have any questions before checkout, I'm here.",
+      begin_checkout: "If anything feels unclear during checkout, I can help.",
+      friction_assistance: "If anything on this page feels unclear, I'm happy to help.",
+      cart_recovery: "If you'd like help deciding or have a quick question about your cart, I'm here.",
+      checkout_recovery: "If you have any last-minute questions before checkout, I can help.",
+      trust_reassurance: "Happy to help with shipping, returns, sizing, or product details.",
+      fast_conversion_nudge: "If you'd like a quick recommendation, I can help.",
+      reassurance_assist: "If you'd like a quick answer before you decide, I'm here.",
+      high_touch_consultation: "If you'd like a more tailored recommendation, I'd be happy to help.",
+      review_mode: "BehavioralPro review mode is active. Open chat to test the intervention.",
+      fallback: "If you'd like a hand while you shop, I'm here."
     };
 
     return {
@@ -540,47 +789,18 @@
     return true;
   }
 
-  function ensureStatusBadge() {
-    if (statusBadgeMounted) return document.getElementById("behavioral-pro-status-badge");
-
-    try {
-      if (!document.getElementById("behavioral-pro-status-style")) {
-        var style = document.createElement("style");
-        style.id = "behavioral-pro-status-style";
-        style.textContent =
-          "#behavioral-pro-status-badge{position:fixed;left:16px;bottom:16px;z-index:2147483646;max-width:280px;background:#ffffff;color:#111827;border:1px solid rgba(17,24,39,.12);border-radius:999px;box-shadow:0 10px 30px rgba(17,24,39,.12);padding:10px 14px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;line-height:1.4;display:flex;align-items:center;gap:10px}" +
-          "#behavioral-pro-status-badge[hidden]{display:none!important}" +
-          "#behavioral-pro-status-dot{width:10px;height:10px;border-radius:999px;background:#22c55e;flex:0 0 auto}" +
-          "#behavioral-pro-status-copy strong{display:block;font-size:13px}" +
-          "#behavioral-pro-status-copy span{display:block;color:#4b5563;font-size:12px}";
-
-        (document.head || document.documentElement).appendChild(style);
-      }
-
-      var badge = document.createElement("div");
-      badge.id = "behavioral-pro-status-badge";
-      badge.innerHTML =
-        '<div id="behavioral-pro-status-dot" aria-hidden="true"></div>' +
-        '<div id="behavioral-pro-status-copy">' +
-        '<strong>BehavioralPro is active</strong>' +
-        '<span>App embed added successfully on this store.</span>' +
-        '</div>';
-
-      (document.body || document.documentElement).appendChild(badge);
-      statusBadgeMounted = true;
-      return badge;
-    } catch (e) {
-      warn("Failed to mount status badge", e);
-      return null;
-    }
-  }
-
   function shouldTriggerInteractionForEvent(eventName) {
     return (
       eventName === "page_view" ||
       eventName === "product_view" ||
+      eventName === "policy_page_view" ||
+      eventName === "coupon_field_focus" ||
+      eventName === "cta_idle_15s" ||
+      eventName === "rage_click" ||
+      eventName === "exit_intent" ||
       eventName === "add_to_cart" ||
-      eventName === "begin_checkout"
+      eventName === "begin_checkout" ||
+      eventName === "checkout_back"
     );
   }
 
@@ -668,7 +888,10 @@
       script.async = true;
       script.src = "https://code.tidio.co/" + encodeURIComponent(CONFIG.tidioId) + ".js";
       script.id = "behavioral-pro-tidio-loader";
-      script.onload = function () { log("Tidio loaded"); };
+      script.onload = function () {
+        log("Tidio loaded");
+        bindTidioOpenTracking();
+      };
       script.onerror = function (event) {
         tidioFailed = true;
         warn("Tidio failed to load");
@@ -688,7 +911,41 @@
   }
 
   function maybeLoadTidioForVariant(variant) {
+    if (!CONFIG.tidioEnabled) return;
     if (variant === "variant" || CONFIG.reviewMode) loadTidio();
+  }
+
+  function trackTidioWidgetOpen(extra) {
+    var metadata = extra || {};
+    var dedupeKey = metadata.dedupe_key || ("tidio_widget_open:" + (metadata.source || "unknown"));
+    if (shouldSuppressEventSignature(dedupeKey, MEDIUM_EVENT_DEBOUNCE_MS)) return;
+    rememberEventSignature(dedupeKey);
+
+    trackEvent("tidio_widget_open", metadata);
+  }
+
+  function bindTidioOpenTracking() {
+    if (tidioOpenBindingRequested) return;
+    tidioOpenBindingRequested = true;
+
+    document.addEventListener("click", function (event) {
+      try {
+        var target = event.target;
+        if (!target || !target.closest) return;
+
+        var launcher = target.closest(
+          '[id*="tidio"], [class*="tidio"], [data-tidio], [aria-label*="chat" i], [aria-label*="tidio" i]'
+        );
+        if (!launcher) return;
+
+        trackTidioWidgetOpen({
+          dedupe_key: "tidio_widget_open:launcher:" + window.location.pathname,
+          source: "launcher_click"
+        });
+      } catch (e) {
+        warn("Tidio launcher tracking failed", e);
+      }
+    }, true);
   }
 
   function ensureVariant(sessionId) {
@@ -815,16 +1072,32 @@
     }
   }
 
-  function maybeTriggerBehavioralUi(eventType) {
-    var interaction = getInteractionConfig(eventType, "tidio_behavioral_intercept");
+  function maybeTriggerBehavioralUi(eventType, reason, messageId) {
+    if (!CONFIG.active) return;
+    if (
+      Array.isArray(CONFIG.allowedInterventionTypes) &&
+      CONFIG.allowedInterventionTypes.length > 0 &&
+      CONFIG.allowedInterventionTypes.indexOf(eventType) === -1 &&
+      eventType !== "review_mode" &&
+      eventType !== "fallback"
+    ) {
+      log("Intervention blocked by storefront config:", eventType);
+      return;
+    }
+
+    var interaction = getInteractionConfig(eventType, reason || "tidio_behavioral_intercept");
     var dedup = CONFIG.uiPrefix + ":" + interaction.eventType;
-    if (hasSeenEvent(dedup)) return;
-    markSeenEvent(dedup);
+    if (shouldSuppressOncePerSession(dedup)) return;
+    rememberEventSignature(dedup);
 
     var usedTidio = false;
 
     try {
       if (window.tidioChatApi) {
+        if (messageId && typeof window.tidioChatApi.display === "function") {
+          window.tidioChatApi.display(messageId);
+          usedTidio = true;
+        }
         if (typeof window.tidioChatApi.show === "function") {
           window.tidioChatApi.show();
           usedTidio = true;
@@ -838,7 +1111,7 @@
       if (!usedTidio) {
         tidioFailed = true;
         log("tidioChatApi not ready for", interaction.eventType);
-        showFallbackUi(interaction.message);
+        return;
       }
 
       interactionDisplayed = true;
@@ -846,27 +1119,107 @@
       trackEvent("intervention_triggered", {
         dedupe_key: dedup,
         intervention_type: interaction.eventType,
-        message_name: (usedTidio ? "tidio_" : "fallback_") + interaction.eventType,
-        reason: usedTidio ? interaction.reason : "fallback_behavioral_intercept",
+        message_name: messageId || ("tidio_" + interaction.eventType),
+        reason: interaction.reason,
         message_copy: interaction.message,
-        delivery: usedTidio ? "tidio" : "fallback"
+        delivery: "tidio"
       });
       trackEvent("intervention_type", {
         dedupe_key: dedup + ":type",
         intervention_type: interaction.eventType,
-        message_name: (usedTidio ? "tidio_" : "fallback_") + interaction.eventType,
-        delivery: usedTidio ? "tidio" : "fallback"
+        message_name: messageId || ("tidio_" + interaction.eventType),
+        delivery: "tidio"
       });
-      log("Triggered UI for", interaction.eventType, usedTidio ? "via Tidio" : "via fallback");
+      log("Triggered UI for", interaction.eventType, "via Tidio", messageId || "no_message_id");
     } catch (e) {
       tidioFailed = true;
       warn("Failed to trigger UI", e);
       errorLog("BehavioralPro Tidio error", e);
-      if (showFallbackUi(interaction.message)) {
-        interactionDisplayed = true;
-        info("BehavioralPro interaction displayed");
-      }
     }
+  }
+
+  async function shouldIntervene(sessionId, eventType, metadata) {
+    var variant = getStoredVariant();
+    if ((variant !== "variant" && !CONFIG.reviewMode) || interactionDisplayed || decisionRequestInFlight) {
+      return { decision: false };
+    }
+
+    decisionRequestInFlight = true;
+    var timeoutId = null;
+
+    try {
+      var controller = typeof window.AbortController === "function" ? new window.AbortController() : null;
+      var timeoutPromise = new Promise(function (_, reject) {
+        timeoutId = window.setTimeout(function () {
+          if (controller) {
+            controller.abort();
+          }
+          reject(new Error("intervention_decision_timeout"));
+        }, 400);
+      });
+
+      var response = await Promise.race([
+        postJson("/api/intervention-decision", {
+        shop_domain: CONFIG.shopDomain,
+        session_id: sessionId,
+        event_name: eventType,
+        metadata: metadata || {}
+      }, {
+        signal: controller ? controller.signal : undefined
+        }),
+        timeoutPromise
+      ]);
+
+      if (!response.ok) {
+        throw new Error("intervention_decision_failed_status:" + response.status);
+      }
+
+      var json = await response.json();
+      lastDecisionStrategy = json && json.strategy ? json.strategy : null;
+
+      if (json && json.shadow_mode) {
+        log("Shadow intervention:", eventType || "unknown_event", lastDecisionStrategy || "no_strategy", json.message_id || "no_message_id");
+        return { decision: false };
+      }
+
+      if (!json || !json.decision) {
+        log("Decision held:", eventType || "unknown_event", lastDecisionStrategy || "no_strategy", json && json.message_id ? json.message_id : "no_message_id");
+        return { decision: false };
+      }
+
+      var interventionType = json.intervention_type || eventType || "page_view";
+      log("Decision approved:", interventionType, lastDecisionStrategy || "no_strategy", json.message_id || "no_message_id");
+      maybeTriggerBehavioralUi(interventionType, json.strategy || "backend_decision", json.message_id || null);
+      return json;
+    } catch (err) {
+      return { decision: false };
+    } finally {
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
+      decisionRequestInFlight = false;
+    }
+  }
+
+  function scheduleDecisionCheck(triggerEventName, metadata) {
+    if (interactionDisplayed || decisionRequestInFlight) return;
+    if (!shouldTriggerInteractionForEvent(triggerEventName)) return;
+
+    if (pendingDecisionCheck) {
+      window.clearTimeout(pendingDecisionCheck);
+      pendingDecisionCheck = null;
+    }
+
+    pendingDecisionCheck = window.setTimeout(function () {
+      pendingDecisionCheck = null;
+
+      if (interactionDisplayed || decisionRequestInFlight) return;
+
+      var variant = getStoredVariant();
+      if (variant !== "variant" && !CONFIG.reviewMode) return;
+
+      shouldIntervene(getSessionId(), triggerEventName, metadata || {});
+    }, 350);
   }
 
   function trackEvent(eventName, extra) {
@@ -890,16 +1243,17 @@
     trackGA4Event(payload);
 
     postJson("/api/events", {
-      event_name: payload.event_name,
-      shop_domain: payload.shop_domain,
+      anonymous_id: payload.visitor_id,
       session_id: payload.session_id,
-      visitor_id: payload.visitor_id,
-      experiment_variant: payload.experiment_variant,
-      page_url: payload.page_url,
-      referrer: payload.referrer,
-      client_timestamp: payload.client_timestamp,
-      event_id: payload.event_id,
-      metadata: payload.metadata
+      event_name: payload.event_name,
+      timestamp: Math.floor(new Date(payload.client_timestamp).getTime() / 1000),
+      properties: Object.assign({}, payload.metadata || {}, {
+        client_event_id: payload.event_id,
+        path: window.location.pathname,
+        shop_domain: payload.shop_domain,
+        referrer: payload.referrer,
+        experiment_variant: payload.experiment_variant
+      })
     })
     .then(function (response) {
       if (!response.ok) {
@@ -916,10 +1270,9 @@
       eventName !== "intervention_triggered" &&
       eventName !== "intervention_type" &&
       (variant === "variant" || CONFIG.reviewMode) &&
-      shouldTriggerInteractionForEvent(eventName) &&
       !(CONFIG.reviewMode && shouldDelayInteractionForReviewMode(eventName))
     ) {
-      maybeTriggerBehavioralUi(eventName);
+      scheduleDecisionCheck(eventName, extra);
     }
   }
 
@@ -1137,16 +1490,15 @@
           var formData = null;
           var variantId = null;
           var quantity = null;
-
           try {
             formData = new FormData(form);
             variantId = formData.get("id");
             quantity = formData.get("quantity");
           } catch (e) {}
 
-          var sig = "add_to_cart_submit:" + window.location.pathname + ":" + (variantId || "");
-          if (hasSeenEvent(sig)) return;
-          markSeenEvent(sig);
+          var sig = "add_to_cart_action:" + window.location.pathname + ":" + (variantId || "");
+          if (shouldSuppressRapidDuplicate(sig)) return;
+          rememberEventSignature(sig);
 
           trackEvent("add_to_cart", {
             dedupe_key: sig,
@@ -1158,9 +1510,9 @@
         }
 
         if (form.matches('form[action*="/checkout"]')) {
-          var checkoutSig = "begin_checkout_submit:" + window.location.pathname;
-          if (hasSeenEvent(checkoutSig)) return;
-          markSeenEvent(checkoutSig);
+          var checkoutSig = "begin_checkout_action:" + window.location.pathname;
+          if (shouldSuppressRapidDuplicate(checkoutSig)) return;
+          rememberEventSignature(checkoutSig);
 
           trackEvent("begin_checkout", {
             dedupe_key: checkoutSig,
@@ -1178,8 +1530,8 @@
         if (!isCouponField(event.target)) return;
 
         var sig = "coupon_field_focus:" + (event.target.name || event.target.id || "unknown");
-        if (hasSeenEvent(sig)) return;
-        markSeenEvent(sig);
+        if (shouldSuppressEventSignature(sig, MEDIUM_EVENT_DEBOUNCE_MS)) return;
+        rememberEventSignature(sig);
 
         trackEvent("coupon_field_focus", {
           dedupe_key: sig,
@@ -1255,9 +1607,9 @@
 
         if (isAddToCartTarget(target)) {
           ctaInteracted = true;
-          var addSig = "add_to_cart_click:" + window.location.pathname;
-          if (!hasSeenEvent(addSig)) {
-            markSeenEvent(addSig);
+          var addSig = "add_to_cart_action:" + window.location.pathname;
+          if (!shouldSuppressRapidDuplicate(addSig)) {
+            rememberEventSignature(addSig);
             trackEvent("add_to_cart", {
               dedupe_key: addSig
             });
@@ -1266,9 +1618,9 @@
 
         if (isBeginCheckoutTarget(target)) {
           ctaInteracted = true;
-          var checkoutSig = "begin_checkout_click:" + window.location.pathname;
-          if (!hasSeenEvent(checkoutSig)) {
-            markSeenEvent(checkoutSig);
+          var checkoutSig = "begin_checkout_action:" + window.location.pathname;
+          if (!shouldSuppressRapidDuplicate(checkoutSig)) {
+            rememberEventSignature(checkoutSig);
             trackEvent("begin_checkout", {
               dedupe_key: checkoutSig
             });
@@ -1301,8 +1653,8 @@
 
   function trackPageEvents() {
     var pageSig = "page_view:" + window.location.pathname;
-    if (!hasSeenEvent(pageSig)) {
-      markSeenEvent(pageSig);
+    if (!shouldSuppressOncePerSession(pageSig)) {
+      rememberEventSignature(pageSig);
       trackEvent("page_view", {
         dedupe_key: pageSig
       });
@@ -1310,8 +1662,8 @@
 
     if (isProductPage()) {
       var productSig = "product_view:" + window.location.pathname;
-      if (!hasSeenEvent(productSig)) {
-        markSeenEvent(productSig);
+      if (!shouldSuppressOncePerSession(productSig)) {
+        rememberEventSignature(productSig);
         trackEvent("product_view", {
           dedupe_key: productSig
         });
@@ -1320,8 +1672,8 @@
 
     if (isPolicyPage()) {
       var policySig = "policy_page_view:" + window.location.pathname;
-      if (!hasSeenEvent(policySig)) {
-        markSeenEvent(policySig);
+      if (!shouldSuppressOncePerSession(policySig)) {
+        rememberEventSignature(policySig);
         trackEvent("policy_page_view", {
           dedupe_key: policySig
         });
@@ -1334,8 +1686,8 @@
       window.location.pathname.indexOf("/checkouts/") === -1
     ) {
       var checkoutBackSig = "checkout_back:" + window.location.pathname;
-      if (!hasSeenEvent(checkoutBackSig)) {
-        markSeenEvent(checkoutBackSig);
+      if (!shouldSuppressEventSignature(checkoutBackSig, MEDIUM_EVENT_DEBOUNCE_MS)) {
+        rememberEventSignature(checkoutBackSig);
         trackEvent("checkout_back", {
           dedupe_key: checkoutBackSig,
           from_referrer: document.referrer
@@ -1366,8 +1718,8 @@
     if (!orderId || !isThankYouPage) return;
 
     var purchaseSig = CONFIG.purchasePrefix + ":" + orderId;
-    if (hasSeenEvent(purchaseSig)) return;
-    markSeenEvent(purchaseSig);
+    if (shouldSuppressOncePerSession(purchaseSig)) return;
+    rememberEventSignature(purchaseSig);
 
     var rawValue = checkoutData.total_price || checkoutData.totalPrice || checkoutData.payment_due || 0;
     var value = Number(rawValue) || 0;
@@ -1398,8 +1750,8 @@
 
       thresholds.forEach(function (threshold) {
         var sig = "scroll_depth_reached:" + threshold + ":" + window.location.pathname;
-        if (percent >= threshold && !hasSeenEvent(sig)) {
-          markSeenEvent(sig);
+        if (percent >= threshold && !shouldSuppressOncePerSession(sig)) {
+          rememberEventSignature(sig);
           trackEvent("scroll_depth_reached", {
             dedupe_key: sig,
             scroll_percent: threshold
@@ -1412,15 +1764,36 @@
     onScroll();
   }
 
+  function bindExitIntentTracking() {
+    document.addEventListener("mouseout", function (event) {
+      try {
+        if (interactionDisplayed) return;
+        if (!event || event.relatedTarget || event.toElement) return;
+        if (typeof event.clientY !== "number" || event.clientY > 8) return;
+
+        var sig = "exit_intent:" + window.location.pathname;
+        if (shouldSuppressOncePerSession(sig)) return;
+        rememberEventSignature(sig);
+
+        trackEvent("exit_intent", {
+          dedupe_key: sig,
+          client_y: Math.round(event.clientY || 0)
+        });
+      } catch (e) {
+        warn("Exit intent tracking error", e);
+      }
+    }, true);
+  }
+
   function scheduleProductDwellTracking() {
     if (!isProductPage()) return;
 
     var sig = "product_dwell_12s:" + window.location.pathname;
-    if (hasSeenEvent(sig)) return;
+    if (shouldSuppressOncePerSession(sig)) return;
 
     window.setTimeout(function () {
-      if (hasSeenEvent(sig)) return;
-      markSeenEvent(sig);
+      if (shouldSuppressOncePerSession(sig)) return;
+      rememberEventSignature(sig);
       trackEvent("product_dwell_12s", {
         dedupe_key: sig,
         dwell_seconds: 12
@@ -1441,6 +1814,7 @@
 
           reviewDwellTimer = window.setTimeout(function () {
             reviewDwellFired = true;
+            rememberEventSignature("review_section_dwell_10s:" + window.location.pathname);
             trackEvent("review_section_dwell_10s", {
               dedupe_key: "review_section_dwell_10s:" + window.location.pathname,
               dwell_seconds: 10
@@ -1464,6 +1838,7 @@
 
     ctaIdleTimer = window.setTimeout(function () {
       if (ctaInteracted) return;
+      rememberEventSignature("cta_idle_15s:" + window.location.pathname);
 
       trackEvent("cta_idle_15s", {
         dedupe_key: "cta_idle_15s:" + window.location.pathname,
@@ -1480,8 +1855,35 @@
       if (interactionDisplayed) return;
       if (!CONFIG.reviewMode && !backendFailed && !tidioFailed) return;
 
-      maybeTriggerBehavioralUi(getInteractionConfig(null, CONFIG.reviewMode ? "review_mode" : "fallback").eventType);
+      maybeTriggerBehavioralUi(getInteractionConfig(null, CONFIG.reviewMode ? "review_mode" : "fallback").eventType, CONFIG.reviewMode ? "review_mode" : "fallback");
     }, delay);
+  }
+
+  function loadStorefrontConfig() {
+    return getJson("/api/public-storefront-config/" + encodeURIComponent(CONFIG.shopDomain), {})
+      .then(function (response) {
+        if (!response.ok) throw new Error("public_config_failed:" + response.status);
+        return response.json();
+      })
+      .then(function (json) {
+        var config = json && json.data && json.data.config ? json.data.config : null;
+        if (!config) return;
+
+        CONFIG.active = config.interventions_enabled !== false && CONFIG.active !== false;
+        CONFIG.tidioEnabled = config.tidio_enabled !== false;
+        CONFIG.shadowMode = config.shadow_mode === true;
+        CONFIG.cooldownSeconds = Number(config.cooldown_seconds || CONFIG.cooldownSeconds || 300);
+        CONFIG.allowedInterventionTypes = Array.isArray(config.allowed_intervention_types)
+          ? config.allowed_intervention_types.slice()
+          : [];
+
+        if (config.tidio_project_id) {
+          CONFIG.tidioId = String(config.tidio_project_id);
+        }
+      })
+      .catch(function (err) {
+        warn("Public storefront config unavailable", err);
+      });
   }
 
   function init() {
@@ -1489,27 +1891,35 @@
     log("Init start");
     log("Backend base:", CONFIG.backendBase);
 
-    ensureStatusBadge();
     if (CONFIG.legacyMirrorsEnabled) {
       ensureGTM(CONFIG.gtmId);
       ensureGA4(CONFIG.ga4Id);
     }
 
-    var sessionId = getSessionId();
+    loadStorefrontConfig().then(function () {
+      if (!CONFIG.active) {
+        log("Interventions disabled by storefront config");
+        return;
+      }
 
-    ensureVariant(sessionId).then(function (variant) {
-      log("Resolved variant:", variant);
-      trackEvent("experiment_assignment", {
-        assigned_at: nowIso()
+      var sessionId = getSessionId();
+
+      ensureVariant(sessionId).then(function (variant) {
+        log("Resolved variant:", variant);
+        trackEvent("experiment_assignment", {
+          assigned_at: nowIso()
+        });
+        trackPageEvents();
+        bindEventTracking();
+        startPackedMotionTracking();
+        bindScrollDepthTracking();
+        bindExitIntentTracking();
+        scheduleProductDwellTracking();
+        scheduleReviewSectionDwellTracking();
+        scheduleCtaIdleTracking();
+        trackPurchaseIfAvailable();
+        scheduleReviewerInteraction();
       });
-      trackPageEvents();
-      bindEventTracking();
-      bindScrollDepthTracking();
-      scheduleProductDwellTracking();
-      scheduleReviewSectionDwellTracking();
-      scheduleCtaIdleTracking();
-      trackPurchaseIfAvailable();
-      scheduleReviewerInteraction();
     });
   }
 
