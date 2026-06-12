@@ -44,6 +44,7 @@
 (function () {
   if (window.__behavioralProAgencyRevenueLiftLoaded) return;
   window.__behavioralProAgencyRevenueLiftLoaded = true;
+  window.__BEHAVIORAL_PRO_BACKEND_BASE__ = {{ block.settings.backend_base | json }};
   if (window.console && typeof window.console.log === "function") {
     window.console.log("BehavioralPro embed loaded");
   }
@@ -68,6 +69,7 @@
     experimentName: "agency_revenue_lift_14_day",
     legacyMirrorsEnabled: true,
     tidioEnabled: true,
+    sessionFrameTelemetryEnabled: true,
     shadowMode: false,
     allowedInterventionTypes: [],
     cooldownSeconds: 300,
@@ -105,6 +107,8 @@
     review_section_dwell_10s: 1,
     cta_idle_15s: 1,
     rage_click: 1,
+    state_node_transition: 1,
+    session_frame: 1,
     exit_intent: 1,
     tidio_widget_open: 1,
     intervention_triggered: 1,
@@ -134,9 +138,33 @@
   var reviewDwellTimer = null;
   var reviewDwellFired = false;
   var motionTrackerStarted = false;
+  var frameTelemetryStarted = false;
+  var frameTimer = null;
+  var frameState = null;
+  var frameSessionStartedAtMs = 0;
   var STRICT_SESSION_DEDUPE_MS = 12 * 60 * 60 * 1000;
   var SHORT_EVENT_DEBOUNCE_MS = 1500;
   var MEDIUM_EVENT_DEBOUNCE_MS = 5000;
+  var SESSION_FRAME_INTERVAL_MS = 2000;
+  var DECISION_REQUEST_TIMEOUT_MS = 1000;
+  var SAVED_CART_STORAGE_KEY = "behavioral_pro_saved_cart";
+  var FAILURE_COUNT_STORAGE_KEY = "behavioral_pro_failure_count";
+  var CIRCUIT_BROKEN_STORAGE_KEY = "behavioral_pro_circuit_broken";
+  var CIRCUIT_REPORTED_STORAGE_KEY = "behavioral_pro_circuit_reported";
+  var CIRCUIT_BREAKER_THRESHOLD = 3;
+  var SILENT_FALLBACK_REASON = "silent_fallback";
+  var INTERVENTION_MESSAGE_MATRIX = {
+    tidio_checkout_recovery_v1: "If you're running into any technical issues or have a quick question about shipping times, let me know right here—I'm happy to look into it for you!",
+    tidio_trust_reassurance_v1: "you can ask any policy questions here, we'll get you exactly what you need",
+    tidio_friction_assistance_v1: "If theres anything you're having trouble with, I can manually process your request here",
+    tidio_cohort_v1: "Let me know if you have any questions about anything you're looking at",
+    tidio_cart_recovery_v1: "If you need anything else, please let me know. Otherwise, I've saved your initial items so you won't lose them!"
+  };
+  var COHORT_MESSAGE_IDS = {
+    tidio_fast_conversion_nudge_v1: 1,
+    tidio_reassurance_assist_v1: 1,
+    tidio_high_touch_consultation_v1: 1
+  };
 
   function log() {
     if (!CONFIG.debug || !window.console || typeof window.console.log !== "function") return;
@@ -186,6 +214,12 @@
     } catch (e) {}
   }
 
+  function safeRemoveLocalStorage(key) {
+    try {
+      window.localStorage.removeItem(key);
+    } catch (e) {}
+  }
+
   function getSessionStorage() {
     try {
       window.sessionStorage.setItem("__bp_test", "1");
@@ -208,6 +242,87 @@
     try {
       window.sessionStorage.setItem(key, value);
     } catch (e) {}
+  }
+
+  function safeRemoveSessionStorage(key) {
+    try {
+      window.sessionStorage.removeItem(key);
+    } catch (e) {}
+  }
+
+  function parseFailureCount(value) {
+    var parsed = parseInt(value == null ? "" : String(value), 10);
+    if (!isFinite(parsed) || parsed <= 0) {
+      return 0;
+    }
+    return Math.min(CIRCUIT_BREAKER_THRESHOLD, parsed);
+  }
+
+  function isCircuitBroken() {
+    return safeGetSessionStorage(CIRCUIT_BROKEN_STORAGE_KEY) === "true";
+  }
+
+  function buildSilentFallbackDecision() {
+    return {
+      decision: false,
+      strategy: SILENT_FALLBACK_REASON,
+      intervention_type: "none",
+      shadow_mode: false,
+      metadata: {
+        reason: SILENT_FALLBACK_REASON
+      }
+    };
+  }
+
+  function stringifyError(error) {
+    try {
+      if (error && typeof error === "object") {
+        if (typeof error.stack === "string" && error.stack) return error.stack;
+        if (typeof error.message === "string" && error.message) return error.message;
+      }
+      if (typeof error === "string") return error;
+      return JSON.stringify(error);
+    } catch (e) {
+      try {
+        return String(error);
+      } catch (stringError) {
+        return "unknown_error";
+      }
+    }
+  }
+
+  function reportCircuitBreakerTrip(error) {
+    if (safeGetSessionStorage(CIRCUIT_REPORTED_STORAGE_KEY) === "true") {
+      return;
+    }
+
+    safeSetSessionStorage(CIRCUIT_REPORTED_STORAGE_KEY, "true");
+    postJsonBeacon("/api/log-system-error", {
+      shop_domain: CONFIG.shopDomain,
+      error_context: "circuit_breaker_tripped",
+      error_message: stringifyError(error)
+    });
+  }
+
+  function resetDecisionFailureCount() {
+    safeSetSessionStorage(FAILURE_COUNT_STORAGE_KEY, "0");
+  }
+
+  function recordDecisionFailure(error) {
+    if (isCircuitBroken()) {
+      return;
+    }
+
+    var nextCount = Math.min(
+      CIRCUIT_BREAKER_THRESHOLD,
+      parseFailureCount(safeGetSessionStorage(FAILURE_COUNT_STORAGE_KEY)) + 1
+    );
+    safeSetSessionStorage(FAILURE_COUNT_STORAGE_KEY, String(nextCount));
+
+    if (nextCount === CIRCUIT_BREAKER_THRESHOLD) {
+      safeSetSessionStorage(CIRCUIT_BROKEN_STORAGE_KEY, "true");
+      reportCircuitBreakerTrip(error);
+    }
   }
 
   function nowIso() {
@@ -444,6 +559,102 @@
     return String(url || "").replace(/\/+$/, "");
   }
 
+  function ensureTrailingSlash(value) {
+    var normalized = String(value || "/");
+    return /\/$/.test(normalized) ? normalized : (normalized + "/");
+  }
+
+  function getShopifyAjaxUrl(path) {
+    var root =
+      window.Shopify &&
+      window.Shopify.routes &&
+      typeof window.Shopify.routes.root === "string"
+        ? window.Shopify.routes.root
+        : "/";
+    var normalizedRoot = ensureTrailingSlash(root.charAt(0) === "/" ? root : ("/" + root));
+    return normalizedRoot + String(path || "").replace(/^\/+/, "");
+  }
+
+  function normalizeSavedCartItems(items) {
+    if (!Array.isArray(items)) return [];
+
+    return items.reduce(function (acc, rawItem) {
+      if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) {
+        return acc;
+      }
+
+      var id = Number(rawItem.id);
+      var quantity = Number(rawItem.quantity);
+      if (!Number.isFinite(id) || !Number.isFinite(quantity) || quantity <= 0) {
+        return acc;
+      }
+
+      acc.push({
+        id: Math.trunc(id),
+        quantity: Math.trunc(quantity)
+      });
+      return acc;
+    }, []);
+  }
+
+  async function snapshotActiveCart() {
+    if (typeof window.fetch !== "function") return false;
+
+    try {
+      var response = await window.fetch(getShopifyAjaxUrl("/cart.js"), {
+        method: "GET",
+        headers: {
+          Accept: "application/json"
+        },
+        credentials: "same-origin"
+      });
+
+      if (!response.ok) {
+        return false;
+      }
+
+      var json = await response.json().catch(function () {
+        return null;
+      });
+      var items = normalizeSavedCartItems(json && json.items);
+      if (!items.length) {
+        safeRemoveLocalStorage(SAVED_CART_STORAGE_KEY);
+        return false;
+      }
+
+      safeSetLocalStorage(SAVED_CART_STORAGE_KEY, JSON.stringify(items));
+      return true;
+    } catch (e) {
+      warn("Failed to snapshot active cart", e);
+      return false;
+    }
+  }
+
+  function resolveInterventionMessageId(eventType, messageId) {
+    var normalizedMessageId = String(messageId || "").trim();
+    if (INTERVENTION_MESSAGE_MATRIX[normalizedMessageId]) {
+      return normalizedMessageId;
+    }
+
+    if (COHORT_MESSAGE_IDS[normalizedMessageId]) {
+      return "tidio_cohort_v1";
+    }
+
+    if (eventType === "checkout_recovery") {
+      return "tidio_checkout_recovery_v1";
+    }
+    if (eventType === "trust_reassurance") {
+      return "tidio_trust_reassurance_v1";
+    }
+    if (eventType === "friction_assistance") {
+      return "tidio_friction_assistance_v1";
+    }
+    if (eventType === "cart_recovery") {
+      return "tidio_cart_recovery_v1";
+    }
+    return "tidio_cohort_v1";
+  }
+
   function isUsableBackendBase(base) {
     if (!base) return false;
     if (base.indexOf("localhost") !== -1) return false;
@@ -511,68 +722,147 @@
     return false;
   }
 
-  function encodeByteArrayBase64(bytes) {
-    var binary = "";
-    var chunkSize = 8192;
-    var index = 0;
-
-    while (index < bytes.length) {
-      binary += String.fromCharCode.apply(null, bytes.subarray(index, index + chunkSize));
-      index += chunkSize;
-    }
-
-    return window.btoa(binary);
-  }
-
   function startPackedMotionTracking() {
     if (motionTrackerStarted || !assignmentReady) return;
     motionTrackerStarted = true;
 
-    var SAMPLE_BYTES = 14;
-    var MAX_SAMPLES = 128;
-    var FLUSH_MS = 100;
-    var EVENT_NAME = "mouse_path_batch";
-    var buffer = new ArrayBuffer(SAMPLE_BYTES * MAX_SAMPLES);
-    var view = new DataView(buffer);
-    var count = 0;
-    var baseTs = 0;
+    var MAX_SAMPLES = 64;
+    var TARGET_DWELL_MS = 2000;
+    var CHECK_MS = 100;
+    var VELOCITY_THRESHOLD = 0.03;
+    var samples = [];
     var lastX = 0;
     var lastY = 0;
+    var lastTs = 0;
+    var lastVelocity = 0;
     var lastScrollX = Math.max(0, window.scrollX || 0);
     var lastScrollY = Math.max(0, window.scrollY || 0);
+    var targetCandidate = null;
+    var scrollTicking = false;
 
-    function clampU16(value) {
-      value = value | 0;
-      if (value < 0) return 0;
-      if (value > 65535) return 65535;
-      return value;
+    function readScrollOffsets() {
+      lastScrollX = Math.max(0, window.scrollX || document.documentElement.scrollLeft || 0);
+      lastScrollY = Math.max(0, window.scrollY || document.documentElement.scrollTop || 0);
     }
 
-    function clampU32(value) {
-      value = Math.floor(Number(value) || 0);
-      if (value < 0) return 0;
-      if (value > 4294967295) return 4294967295;
-      return value;
+    function getElementLabel(el) {
+      if (!el) return null;
+      var label = String(
+        el.getAttribute("aria-label") || "" ||
+        el.getAttribute("data-action") || "" ||
+        el.getAttribute("name") || "" ||
+        el.textContent || "" ||
+        el.value || "" ||
+        el.id || "" ||
+        el.className || ""
+      ).replace(/\s+/g, " ").trim();
+      return label || null;
     }
 
-    function flush() {
-      if (!count || !assignmentReady) return;
+    function getSizingChartTarget(target) {
+      if (!target || !target.closest) return null;
+      var el = target.closest('button, a, summary, [role="button"], [data-size-chart], [data-sizing-chart]');
+      if (!el) return null;
+
+      var text = String(
+        (el.textContent || "") + " " +
+        (el.getAttribute("aria-label") || "") + " " +
+        (el.getAttribute("data-size-chart") || "") + " " +
+        (el.getAttribute("data-sizing-chart") || "") + " " +
+        (el.getAttribute("href") || "") + " " +
+        (el.id || "") + " " +
+        (typeof el.className === "string" ? el.className : "")
+      ).toLowerCase();
+
+      if (
+        text.indexOf("size chart") !== -1 ||
+        text.indexOf("sizing chart") !== -1 ||
+        text.indexOf("size guide") !== -1 ||
+        text.indexOf("sizing guide") !== -1
+      ) {
+        return el;
+      }
+
+      return null;
+    }
+
+    function getHighValueHoverTarget(target) {
+      var checkoutTarget = isBeginCheckoutTarget(target)
+        ? target.closest('button, input[type="submit"], input[type="button"], a, form[action*="/checkout"]')
+        : null;
+      if (checkoutTarget) {
+        return {
+          kind: "checkout_button",
+          element: checkoutTarget,
+          label: getElementLabel(checkoutTarget)
+        };
+      }
+
+      var sizingChartTarget = getSizingChartTarget(target);
+      if (sizingChartTarget) {
+        return {
+          kind: "sizing_chart",
+          element: sizingChartTarget,
+          label: getElementLabel(sizingChartTarget)
+        };
+      }
+
+      return null;
+    }
+
+    function pushSample(x, y, ts) {
+      var velocity = 0;
+
+      if (lastTs > 0 && ts > lastTs) {
+        var dx = x - lastX;
+        var dy = y - lastY;
+        velocity = Math.sqrt(dx * dx + dy * dy) / (ts - lastTs);
+      }
+
+      lastVelocity = velocity;
+      lastX = x;
+      lastY = y;
+      lastTs = ts;
+
+      samples.push({
+        x: x,
+        y: y,
+        t: ts,
+        sx: lastScrollX,
+        sy: lastScrollY,
+        v: velocity
+      });
+
+      if (samples.length > MAX_SAMPLES) {
+        samples.shift();
+      }
+    }
+
+    function resetTargetCandidate() {
+      targetCandidate = null;
+    }
+
+    function sendStateTransition(candidate, durationMs) {
+      if (!candidate || !assignmentReady) return;
 
       var variant = getStoredVariant();
       if (variant !== "control" && variant !== "variant") return;
 
+      var signature = "state_node_transition:" + candidate.kind + ":" + window.location.pathname + ":" + (candidate.label || "unknown");
+      if (shouldSuppressOncePerSession(signature)) return;
+      rememberEventSignature(signature);
+
       var visitorId = getVisitorId();
       var sessionId = getSessionId();
       var context = getBaseEventContext();
-      var byteLength = count * SAMPLE_BYTES;
-      var bytes = new Uint8Array(buffer, 0, byteLength);
-      var sentAt = Date.now();
+      var latest = samples.length ? samples[samples.length - 1] : null;
+      var effectiveVelocity = (Date.now() - lastTs) > 80 ? 0 : lastVelocity;
 
       postJsonBeacon("/api/events", {
         anonymous_id: visitorId,
         session_id: sessionId,
-        event_name: EVENT_NAME,
-        timestamp: Math.floor(baseTs / 1000),
+        event_name: "state_node_transition",
+        timestamp: Math.floor(Date.now() / 1000),
         experiment_variant: variant,
         properties: {
           referrer: context.referrer,
@@ -587,65 +877,71 @@
           path: window.location.pathname,
           experiment_variant: variant,
           client_event_id: createId("evt"),
-          timeseries_block: {
-            version: 1,
-            kind: "mouse_pointer_scroll",
-            encoding: "base64",
-            endian: "LE",
-            stride_bytes: SAMPLE_BYTES,
-            sample_count: count,
-            base_timestamp_ms: baseTs,
-            flushed_timestamp_ms: sentAt,
-            schema: ["u16:x", "u16:y", "u16:dt_ms", "u32:scroll_x", "u32:scroll_y"],
-            data: encodeByteArrayBase64(bytes)
+          state_transition: {
+            from: "pointer_tracking",
+            to: "target_stationary",
+            trigger: "velocity_below_threshold_duration_met",
+            target_kind: candidate.kind,
+            target_label: candidate.label,
+            target_duration_ms: Math.round(durationMs),
+            velocity_px_per_ms: Number(effectiveVelocity.toFixed(4)),
+            scroll_x: latest ? latest.sx : lastScrollX,
+            scroll_y: latest ? latest.sy : lastScrollY
           }
         }
       });
-
-      count = 0;
-      baseTs = 0;
     }
 
-    function pushSample(x, y, ts, scrollX, scrollY) {
-      if (count >= MAX_SAMPLES) {
-        flush();
+    function evaluateTargetIntent() {
+      if (!lastTs) return;
+      var effectiveVelocity = (Date.now() - lastTs) > 80 ? 0 : lastVelocity;
+
+      var targetElement = document.elementFromPoint(lastX, lastY);
+      var highValueTarget = getHighValueHoverTarget(targetElement);
+
+      if (!highValueTarget || effectiveVelocity > VELOCITY_THRESHOLD) {
+        resetTargetCandidate();
+        return;
       }
 
-      if (!count) {
-        baseTs = ts;
+      var signature = highValueTarget.kind + ":" + (highValueTarget.label || "unknown");
+      if (!targetCandidate || targetCandidate.signature !== signature) {
+        targetCandidate = {
+          signature: signature,
+          kind: highValueTarget.kind,
+          label: highValueTarget.label,
+          startedAt: Date.now()
+        };
+        return;
       }
 
-      var offset = count * SAMPLE_BYTES;
-      view.setUint16(offset, clampU16(x), true);
-      view.setUint16(offset + 2, clampU16(y), true);
-      view.setUint16(offset + 4, clampU16(ts - baseTs), true);
-      view.setUint32(offset + 6, clampU32(scrollX), true);
-      view.setUint32(offset + 10, clampU32(scrollY), true);
-      count += 1;
-    }
-
-    function readScrollOffsets() {
-      lastScrollX = Math.max(0, window.scrollX || document.documentElement.scrollLeft || 0);
-      lastScrollY = Math.max(0, window.scrollY || document.documentElement.scrollTop || 0);
+      if (!targetCandidate.sent && (Date.now() - targetCandidate.startedAt) >= TARGET_DWELL_MS) {
+        targetCandidate.sent = true;
+        sendStateTransition(targetCandidate, Date.now() - targetCandidate.startedAt);
+        samples = [];
+      }
     }
 
     document.addEventListener("mousemove", function (event) {
-      lastX = clampU16(event.clientX || 0);
-      lastY = clampU16(event.clientY || 0);
       readScrollOffsets();
-      pushSample(lastX, lastY, Date.now(), lastScrollX, lastScrollY);
+      pushSample(event.clientX || 0, event.clientY || 0, Date.now());
+      evaluateTargetIntent();
     }, { passive: true });
 
     window.addEventListener("scroll", function () {
-      readScrollOffsets();
-      pushSample(lastX, lastY, Date.now(), lastScrollX, lastScrollY);
+      if (scrollTicking) return;
+      scrollTicking = true;
+      window.requestAnimationFrame(function () {
+        scrollTicking = false;
+        readScrollOffsets();
+      });
     }, { passive: true });
 
-    window.setInterval(flush, FLUSH_MS);
-    window.addEventListener("pagehide", flush);
+    window.setInterval(evaluateTargetIntent, CHECK_MS);
+    window.addEventListener("pagehide", resetTargetCandidate);
     document.addEventListener("visibilitychange", function () {
       if (document.visibilityState === "hidden") {
-        flush();
+        resetTargetCandidate();
       }
     });
   }
@@ -677,6 +973,423 @@
     });
   }
 
+  function isCartPage() {
+    return CONFIG.pageType === "cart" || window.location.pathname === "/cart";
+  }
+
+  function isCheckoutPage() {
+    return window.location.pathname.indexOf("/checkouts/") === 0 || CONFIG.pageType === "checkout";
+  }
+
+  function shouldTrackSessionFrames() {
+    if (!CONFIG.sessionFrameTelemetryEnabled || !assignmentReady) return false;
+    if (isCheckoutPage()) return false;
+    return isSupportedInteractionPage() || isCartPage();
+  }
+
+  function getDocumentScrollDepth() {
+    var doc = document.documentElement;
+    var body = document.body;
+    var height = Math.max(
+      body ? body.scrollHeight : 0,
+      doc ? doc.scrollHeight : 0,
+      body ? body.offsetHeight : 0,
+      doc ? doc.offsetHeight : 0
+    );
+    var viewport = window.innerHeight || (doc ? doc.clientHeight : 0) || 0;
+    var scrollTop = window.scrollY || (doc ? doc.scrollTop : 0) || 0;
+    var maxScrollable = Math.max(height - viewport, 1);
+    return Math.max(0, Math.min(1, (scrollTop + viewport) / maxScrollable));
+  }
+
+  function createZoneHoverMap() {
+    return {
+      add_to_cart_zone: 0,
+      checkout_button_zone: 0,
+      price_zone: 0,
+      reviews_zone: 0,
+      shipping_policy_zone: 0,
+      return_policy_zone: 0
+    };
+  }
+
+  function createFrameState(previous) {
+    var carry = previous || {};
+    return {
+      startedAtMs: frameSessionStartedAtMs || Date.now(),
+      lastPointerX: carry.lastPointerX != null ? carry.lastPointerX : null,
+      lastPointerY: carry.lastPointerY != null ? carry.lastPointerY : null,
+      lastPointerTs: carry.lastPointerTs || 0,
+      lastVelocity: carry.lastVelocity || 0,
+      lastScrollY: window.scrollY || 0,
+      lastScrollTs: Date.now(),
+      lastInteractionAt: carry.lastInteractionAt || Date.now(),
+      currentZone: carry.currentZone || "unknown_zone",
+      lastZoneAt: Date.now(),
+      activeZone: carry.activeZone || "unknown_zone",
+      zoneHoverMs: createZoneHoverMap(),
+      mouseVelocitySum: 0,
+      mouseVelocitySamples: 0,
+      mouseVelocityMax: 0,
+      mouseAccelerationSum: 0,
+      mouseAccelerationSamples: 0,
+      mouseDistance: 0,
+      scrollVelocitySum: 0,
+      scrollVelocitySamples: 0,
+      latestScrollDepth: getDocumentScrollDepth(),
+      clickCount: 0,
+      rageClickCount: 0,
+      deadClickCount: 0,
+      recentClicks: []
+    };
+  }
+
+  function getPageTypeLabel() {
+    return String(CONFIG.pageType || "unknown").trim() || "unknown";
+  }
+
+  function getJourneyStageLabel(frame) {
+    if (isCheckoutPage()) return "checkout";
+    if (isCartPage()) return "cart";
+    if (isProductPage()) {
+      if ((frame.zoneHoverMs.add_to_cart_zone || 0) > 900 || frame.clickCount > 0) {
+        return "decision";
+      }
+      if ((frame.zoneHoverMs.price_zone || 0) > 600 || (frame.zoneHoverMs.reviews_zone || 0) > 600) {
+        return "consideration";
+      }
+      return "product";
+    }
+    if (isCollectionPage()) return "browse";
+    if (isHomePage()) return "landing";
+    return "unknown";
+  }
+
+  function getZoneDefinitions() {
+    return [
+      { name: "add_to_cart_zone", selectors: ['form[action*="/cart/add"]', 'button[name="add"]', 'button[id*="add-to-cart" i]', '[data-add-to-cart]', '[name="add"]'] },
+      { name: "checkout_button_zone", selectors: ['form[action*="/checkout"]', 'a[href*="/checkout"]', 'button[name="checkout"]', '[data-checkout-button]'] },
+      { name: "price_zone", selectors: ['[class*="price" i]', '[data-product-price]', '[data-price]'] },
+      { name: "reviews_zone", selectors: ['#reviews', '[id*="review" i]', '[class*="review" i]', '[data-reviews]'] },
+      { name: "variant_selector_zone", selectors: ['select[name*="option" i]', 'fieldset[name*="option" i]', '[data-variant-selector]', '[class*="variant" i]'] },
+      { name: "size_chart_zone", selectors: ['[data-size-chart]', '[href*="size-chart" i]', '[href*="size-guide" i]'] },
+      { name: "shipping_policy_zone", selectors: ['a[href*="shipping" i]', '[data-shipping-policy]', '[class*="shipping" i]'] },
+      { name: "return_policy_zone", selectors: ['a[href*="return" i]', '[data-return-policy]', '[class*="return" i]'] },
+      { name: "product_image_zone", selectors: ['[data-product-media]', '[class*="product__media" i]', '.product-media-container', 'img[src*="/products/"]'] },
+      { name: "product_title_zone", selectors: ['h1', '[class*="product-title" i]', '[data-product-title]'] },
+      { name: "chat_widget_zone", selectors: ['[id*="tidio" i]', '[class*="tidio" i]', '[data-tidio]'] }
+    ];
+  }
+
+  function getZoneNameFromElement(target) {
+    if (!target || !target.closest) return "unknown_zone";
+
+    var definitions = getZoneDefinitions();
+    for (var i = 0; i < definitions.length; i += 1) {
+      var definition = definitions[i];
+      for (var j = 0; j < definition.selectors.length; j += 1) {
+        try {
+          if (target.closest(definition.selectors[j])) {
+            return definition.name;
+          }
+        } catch (e) {}
+      }
+    }
+
+    if (getSizingChartTarget(target)) {
+      return "size_chart_zone";
+    }
+
+    return "unknown_zone";
+  }
+
+  function updateZoneHover(now, nextZone) {
+    if (!frameState) return;
+
+    var elapsed = Math.max(0, now - (frameState.lastZoneAt || now));
+    var currentZone = frameState.currentZone || "unknown_zone";
+    if (frameState.zoneHoverMs[currentZone] != null) {
+      frameState.zoneHoverMs[currentZone] += elapsed;
+    }
+
+    frameState.currentZone = nextZone || currentZone;
+    frameState.activeZone = nextZone || currentZone;
+    frameState.lastZoneAt = now;
+  }
+
+  function getPrimaryCtaCenter() {
+    var cta = findPrimaryCta();
+    if (!cta || !cta.getBoundingClientRect) return null;
+    var rect = cta.getBoundingClientRect();
+    return {
+      x: rect.left + (rect.width / 2),
+      y: rect.top + (rect.height / 2)
+    };
+  }
+
+  function getCtaDistance() {
+    if (!frameState || frameState.lastPointerX == null || frameState.lastPointerY == null) return 9999;
+    var center = getPrimaryCtaCenter();
+    if (!center) return 9999;
+    var dx = frameState.lastPointerX - center.x;
+    var dy = frameState.lastPointerY - center.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  function isDeadClickTarget(target) {
+    if (!target || !target.closest) return true;
+    if (target.closest('a, button, input, select, textarea, summary, label, [role="button"], [data-tidio]')) {
+      return false;
+    }
+    return true;
+  }
+
+  function trackFrameClick(event) {
+    if (!frameState) return;
+    var now = Date.now();
+    frameState.lastInteractionAt = now;
+    frameState.clickCount += 1;
+    if (isDeadClickTarget(event.target)) {
+      frameState.deadClickCount += 1;
+    }
+
+    var point = {
+      x: event.clientX || 0,
+      y: event.clientY || 0,
+      at: now
+    };
+    frameState.recentClicks = frameState.recentClicks.filter(function (item) {
+      return now - item.at < 900;
+    });
+    frameState.recentClicks.push(point);
+
+    if (frameState.recentClicks.length >= 3) {
+      var recent = frameState.recentClicks.slice(-3);
+      var maxDistance = 0;
+      for (var i = 0; i < recent.length; i += 1) {
+        for (var j = i + 1; j < recent.length; j += 1) {
+          var dx = recent[i].x - recent[j].x;
+          var dy = recent[i].y - recent[j].y;
+          var distance = Math.sqrt(dx * dx + dy * dy);
+          if (distance > maxDistance) maxDistance = distance;
+        }
+      }
+
+      if (maxDistance < 30) {
+        frameState.rageClickCount += 1;
+        frameState.recentClicks = [];
+      }
+    }
+  }
+
+  function updateFramePointer(event) {
+    if (!frameState) return;
+
+    var now = Date.now();
+    var x = event.clientX || 0;
+    var y = event.clientY || 0;
+    var velocity = 0;
+    var acceleration = 0;
+    if (frameState.lastPointerTs > 0 && now > frameState.lastPointerTs) {
+      var dx = x - frameState.lastPointerX;
+      var dy = y - frameState.lastPointerY;
+      var dt = now - frameState.lastPointerTs;
+      var distance = Math.sqrt(dx * dx + dy * dy);
+      velocity = distance / dt;
+      acceleration = (velocity - frameState.lastVelocity) / dt;
+      frameState.mouseDistance += distance;
+      frameState.mouseVelocitySum += velocity;
+      frameState.mouseVelocitySamples += 1;
+      frameState.mouseVelocityMax = Math.max(frameState.mouseVelocityMax, velocity);
+      frameState.mouseAccelerationSum += acceleration;
+      frameState.mouseAccelerationSamples += 1;
+    }
+
+    frameState.lastVelocity = velocity;
+    frameState.lastPointerX = x;
+    frameState.lastPointerY = y;
+    frameState.lastPointerTs = now;
+    frameState.lastInteractionAt = now;
+    frameState.latestScrollDepth = getDocumentScrollDepth();
+    updateZoneHover(now, getZoneNameFromElement(document.elementFromPoint(x, y)));
+  }
+
+  function updateFrameScroll() {
+    if (!frameState) return;
+
+    var now = Date.now();
+    var nextY = window.scrollY || 0;
+    var dt = Math.max(1, now - (frameState.lastScrollTs || now));
+    var delta = nextY - (frameState.lastScrollY || 0);
+    frameState.scrollVelocitySum += delta / dt;
+    frameState.scrollVelocitySamples += 1;
+    frameState.lastScrollY = nextY;
+    frameState.lastScrollTs = now;
+    frameState.lastInteractionAt = now;
+    frameState.latestScrollDepth = getDocumentScrollDepth();
+  }
+
+  function clamp01(value) {
+    return Math.max(0, Math.min(1, value));
+  }
+
+  function buildFrameScores(frame, ctaDistance, cursorIdleSeconds) {
+    var nearCta = ctaDistance <= 220;
+    var hoverCtaSeconds = (frame.zoneHoverMs.add_to_cart_zone || 0) / 1000;
+    var hoverPolicySeconds =
+      ((frame.zoneHoverMs.shipping_policy_zone || 0) + (frame.zoneHoverMs.return_policy_zone || 0)) / 1000;
+    var hoverPriceSeconds = (frame.zoneHoverMs.price_zone || 0) / 1000;
+    var hoverReviewsSeconds = (frame.zoneHoverMs.reviews_zone || 0) / 1000;
+    var scrollDepth = frame.latestScrollDepth || 0;
+    var mouseVelocityAvg = frame.mouseVelocitySamples > 0
+      ? frame.mouseVelocitySum / frame.mouseVelocitySamples
+      : 0;
+
+    var intentScore = clamp01(
+      (scrollDepth * 0.35) +
+      (Math.min(hoverCtaSeconds, 2) / 2 * 0.3) +
+      (nearCta ? 0.15 : 0) +
+      (isCartPage() ? 0.2 : 0)
+    );
+    var frictionScore = clamp01(
+      (frame.rageClickCount * 0.45) +
+      (frame.deadClickCount * 0.3) +
+      (hoverPolicySeconds * 0.16) +
+      (nearCta && cursorIdleSeconds >= 1.5 ? 0.2 : 0)
+    );
+    var hesitationScore = clamp01(
+      (hoverCtaSeconds >= 0.8 ? 0.35 : 0) +
+      (cursorIdleSeconds >= 1 ? 0.25 : 0) +
+      (nearCta ? 0.2 : 0) +
+      (mouseVelocityAvg <= 0.05 ? 0.15 : 0)
+    );
+    var policyAnxietyScore = clamp01(
+      (hoverPolicySeconds * 0.35) +
+      ((frame.activeZone === "shipping_policy_zone" || frame.activeZone === "return_policy_zone") ? 0.25 : 0) +
+      (isPolicyPage() ? 0.2 : 0)
+    );
+    var cartCommitmentScore = clamp01(
+      (Math.min(hoverCtaSeconds, 2) / 2 * 0.35) +
+      (nearCta ? 0.2 : 0) +
+      (isCartPage() ? 0.35 : 0)
+    );
+    var abandonmentRiskScore = clamp01(
+      (frictionScore * 0.45) +
+      (hesitationScore * 0.35) +
+      (policyAnxietyScore * 0.2) -
+      (cartCommitmentScore * 0.2)
+    );
+
+    return {
+      hoverCtaSeconds: hoverCtaSeconds,
+      hoverPriceSeconds: hoverPriceSeconds,
+      hoverPolicySeconds: hoverPolicySeconds,
+      hoverReviewsSeconds: hoverReviewsSeconds,
+      intentScore: intentScore,
+      frictionScore: frictionScore,
+      hesitationScore: hesitationScore,
+      policyAnxietyScore: policyAnxietyScore,
+      cartCommitmentScore: cartCommitmentScore,
+      abandonmentRiskScore: abandonmentRiskScore
+    };
+  }
+
+  function sendSessionFrame() {
+    if (!shouldTrackSessionFrames() || !frameState) return;
+
+    var now = Date.now();
+    updateZoneHover(now, frameState.currentZone || "unknown_zone");
+    var variant = getStoredVariant();
+    if (variant !== "control" && variant !== "variant") return;
+
+    var base = getBaseEventContext();
+    var cursorIdleSeconds = Math.max(0, (now - (frameState.lastInteractionAt || now)) / 1000);
+    var ctaDistance = getCtaDistance();
+    var scores = buildFrameScores(frameState, ctaDistance, cursorIdleSeconds);
+    var mouseVelocityAvg = frameState.mouseVelocitySamples > 0
+      ? frameState.mouseVelocitySum / frameState.mouseVelocitySamples
+      : 0;
+    var mouseAccelerationAvg = frameState.mouseAccelerationSamples > 0
+      ? frameState.mouseAccelerationSum / frameState.mouseAccelerationSamples
+      : 0;
+    var scrollVelocity = frameState.scrollVelocitySamples > 0
+      ? frameState.scrollVelocitySum / frameState.scrollVelocitySamples
+      : 0;
+    var tSeconds = Math.max(0, Math.round((now - frameState.startedAtMs) / 1000));
+
+    postJson("/api/events", {
+      anonymous_id: getVisitorId(),
+      session_id: getSessionId(),
+      event_name: "session_frame",
+      timestamp: Math.floor(now / 1000),
+      properties: {
+        shop_domain: CONFIG.shopDomain,
+        path: window.location.pathname,
+        referrer: base.referrer,
+        experiment_variant: variant,
+        device_type: base.device_type,
+        template_name: base.template_name,
+        currency: base.currency,
+        product_id: base.product_id,
+        product_handle: base.product_handle,
+        cart_value: base.cart_value,
+        client_event_id: createId("frame"),
+        source: "storefront_session_frame",
+        page_url: window.location.href,
+        page_type: getPageTypeLabel(),
+        journey_stage: getJourneyStageLabel(frameState),
+        active_zone: frameState.activeZone || "unknown_zone",
+        t_seconds: tSeconds,
+        mouse_velocity_avg: Number(mouseVelocityAvg.toFixed(4)),
+        mouse_velocity_max: Number(frameState.mouseVelocityMax.toFixed(4)),
+        mouse_acceleration_avg: Number(mouseAccelerationAvg.toFixed(4)),
+        mouse_distance: Number(frameState.mouseDistance.toFixed(2)),
+        scroll_depth: Number((frameState.latestScrollDepth || 0).toFixed(4)),
+        scroll_velocity: Number(scrollVelocity.toFixed(4)),
+        cursor_idle_seconds: Number(cursorIdleSeconds.toFixed(3)),
+        hover_cta_seconds: Number(scores.hoverCtaSeconds.toFixed(3)),
+        hover_price_seconds: Number(scores.hoverPriceSeconds.toFixed(3)),
+        hover_policy_seconds: Number(scores.hoverPolicySeconds.toFixed(3)),
+        hover_reviews_seconds: Number(scores.hoverReviewsSeconds.toFixed(3)),
+        cta_distance: Number(ctaDistance.toFixed(2)),
+        click_count: frameState.clickCount,
+        rage_click_count: frameState.rageClickCount,
+        dead_click_count: frameState.deadClickCount,
+        intent_score: Number(scores.intentScore.toFixed(4)),
+        friction_score: Number(scores.frictionScore.toFixed(4)),
+        hesitation_score: Number(scores.hesitationScore.toFixed(4)),
+        policy_anxiety_score: Number(scores.policyAnxietyScore.toFixed(4)),
+        cart_commitment_score: Number(scores.cartCommitmentScore.toFixed(4)),
+        abandonment_risk_score: Number(scores.abandonmentRiskScore.toFixed(4))
+      }
+    }).catch(function () {});
+
+    frameState = createFrameState();
+  }
+
+  function startSessionFrameTelemetry() {
+    if (frameTelemetryStarted) return;
+    frameTelemetryStarted = true;
+    if (!frameSessionStartedAtMs) {
+      frameSessionStartedAtMs = Date.now();
+    }
+    frameState = createFrameState(frameState);
+
+    document.addEventListener("mousemove", updateFramePointer, { passive: true });
+    window.addEventListener("scroll", updateFrameScroll, { passive: true });
+    document.addEventListener("click", trackFrameClick, true);
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "hidden") {
+        sendSessionFrame();
+      }
+    });
+    window.addEventListener("pagehide", sendSessionFrame);
+
+    frameTimer = window.setInterval(function () {
+      sendSessionFrame();
+    }, SESSION_FRAME_INTERVAL_MS);
+  }
+
   function isHomePage() {
     return CONFIG.pageType === "index" || window.location.pathname === "/";
   }
@@ -689,7 +1402,7 @@
     return isHomePage() || isProductPage() || isCollectionPage();
   }
 
-  function getInteractionConfig(eventType, reason) {
+  function getInteractionConfig(eventType, reason, messageId) {
     var resolvedEventType = eventType;
     if (!resolvedEventType) {
       if (isProductPage()) {
@@ -700,27 +1413,13 @@
         resolvedEventType = "page_view";
       }
     }
-
-    var messages = {
-      page_view: "Hi there. If you'd like a hand getting started, I'm here.",
-      product_view: "If you'd like a second opinion on this product, I can help.",
-      add_to_cart: "Nice pick. If you have any questions before checkout, I'm here.",
-      begin_checkout: "If anything feels unclear during checkout, I can help.",
-      friction_assistance: "If anything on this page feels unclear, I'm happy to help.",
-      cart_recovery: "If you'd like help deciding or have a quick question about your cart, I'm here.",
-      checkout_recovery: "If you have any last-minute questions before checkout, I can help.",
-      trust_reassurance: "Happy to help with shipping, returns, sizing, or product details.",
-      fast_conversion_nudge: "If you'd like a quick recommendation, I can help.",
-      reassurance_assist: "If you'd like a quick answer before you decide, I'm here.",
-      high_touch_consultation: "If you'd like a more tailored recommendation, I'd be happy to help.",
-      review_mode: "BehavioralPro review mode is active. Open chat to test the intervention.",
-      fallback: "If you'd like a hand while you shop, I'm here."
-    };
+    var resolvedMessageId = resolveInterventionMessageId(resolvedEventType, messageId);
 
     return {
       eventType: resolvedEventType,
+      messageId: resolvedMessageId,
       reason: reason || "behavioral_intercept",
-      message: messages[resolvedEventType] || messages.page_view
+      message: INTERVENTION_MESSAGE_MATRIX[resolvedMessageId] || INTERVENTION_MESSAGE_MATRIX.tidio_cohort_v1
     };
   }
 
@@ -1085,7 +1784,7 @@
       return;
     }
 
-    var interaction = getInteractionConfig(eventType, reason || "tidio_behavioral_intercept");
+    var interaction = getInteractionConfig(eventType, reason || "tidio_behavioral_intercept", messageId);
     var dedup = CONFIG.uiPrefix + ":" + interaction.eventType;
     if (shouldSuppressOncePerSession(dedup)) return;
     rememberEventSignature(dedup);
@@ -1094,8 +1793,8 @@
 
     try {
       if (window.tidioChatApi) {
-        if (messageId && typeof window.tidioChatApi.display === "function") {
-          window.tidioChatApi.display(messageId);
+        if (interaction.messageId && typeof window.tidioChatApi.display === "function") {
+          window.tidioChatApi.display(interaction.messageId);
           usedTidio = true;
         }
         if (typeof window.tidioChatApi.show === "function") {
@@ -1119,7 +1818,7 @@
       trackEvent("intervention_triggered", {
         dedupe_key: dedup,
         intervention_type: interaction.eventType,
-        message_name: messageId || ("tidio_" + interaction.eventType),
+        message_name: interaction.messageId,
         reason: interaction.reason,
         message_copy: interaction.message,
         delivery: "tidio"
@@ -1127,10 +1826,10 @@
       trackEvent("intervention_type", {
         dedupe_key: dedup + ":type",
         intervention_type: interaction.eventType,
-        message_name: messageId || ("tidio_" + interaction.eventType),
+        message_name: interaction.messageId,
         delivery: "tidio"
       });
-      log("Triggered UI for", interaction.eventType, "via Tidio", messageId || "no_message_id");
+      log("Triggered UI for", interaction.eventType, "via Tidio", interaction.messageId || "no_message_id");
     } catch (e) {
       tidioFailed = true;
       warn("Failed to trigger UI", e);
@@ -1144,6 +1843,10 @@
       return { decision: false };
     }
 
+    if (isCircuitBroken()) {
+      return buildSilentFallbackDecision();
+    }
+
     decisionRequestInFlight = true;
     var timeoutId = null;
 
@@ -1151,11 +1854,13 @@
       var controller = typeof window.AbortController === "function" ? new window.AbortController() : null;
       var timeoutPromise = new Promise(function (_, reject) {
         timeoutId = window.setTimeout(function () {
-          if (controller) {
-            controller.abort();
-          }
+          try {
+            if (controller) {
+              controller.abort();
+            }
+          } catch (abortError) {}
           reject(new Error("intervention_decision_timeout"));
-        }, 400);
+        }, DECISION_REQUEST_TIMEOUT_MS);
       });
 
       var response = await Promise.race([
@@ -1170,12 +1875,39 @@
         timeoutPromise
       ]);
 
-      if (!response.ok) {
-        throw new Error("intervention_decision_failed_status:" + response.status);
+      if (!response || response.status !== 200) {
+        var statusError = new Error("intervention_decision_failed_status:" + (response && typeof response.status === "number" ? response.status : "unknown"));
+        recordDecisionFailure(statusError);
+        lastDecisionStrategy = SILENT_FALLBACK_REASON;
+        return buildSilentFallbackDecision();
       }
 
       var json = await response.json();
+      if (
+        !json ||
+        typeof json !== "object" ||
+        typeof json.decision !== "boolean" ||
+        typeof json.strategy !== "string" ||
+        typeof json.shadow_mode !== "boolean"
+      ) {
+        recordDecisionFailure(new Error("intervention_decision_invalid_payload"));
+        lastDecisionStrategy = SILENT_FALLBACK_REASON;
+        return buildSilentFallbackDecision();
+      }
+
+      resetDecisionFailureCount();
       lastDecisionStrategy = json && json.strategy ? json.strategy : null;
+      var interventionType = json && json.intervention_type ? json.intervention_type : (eventType || "page_view");
+      var decisionReason =
+        json &&
+        json.metadata &&
+        typeof json.metadata === "object" &&
+        typeof json.metadata.reason === "string"
+          ? json.metadata.reason
+          : (json && json.strategy ? json.strategy : "backend_decision");
+      if (decisionReason === "cart_abandonment_detected" || interventionType === "cart_recovery") {
+        await snapshotActiveCart();
+      }
 
       if (json && json.shadow_mode) {
         log("Shadow intervention:", eventType || "unknown_event", lastDecisionStrategy || "no_strategy", json.message_id || "no_message_id");
@@ -1187,12 +1919,13 @@
         return { decision: false };
       }
 
-      var interventionType = json.intervention_type || eventType || "page_view";
       log("Decision approved:", interventionType, lastDecisionStrategy || "no_strategy", json.message_id || "no_message_id");
-      maybeTriggerBehavioralUi(interventionType, json.strategy || "backend_decision", json.message_id || null);
+      maybeTriggerBehavioralUi(interventionType, decisionReason, json.message_id || null);
       return json;
     } catch (err) {
-      return { decision: false };
+      recordDecisionFailure(err);
+      lastDecisionStrategy = SILENT_FALLBACK_REASON;
+      return buildSilentFallbackDecision();
     } finally {
       if (timeoutId) {
         window.clearTimeout(timeoutId);
@@ -1306,6 +2039,10 @@
     );
   }
 
+  function hasAddToCartFormAncestor(target) {
+    return !!(target && target.closest && target.closest('form[action*="/cart/add"]'));
+  }
+
   function isBeginCheckoutTarget(target) {
     if (!target || !target.closest) return false;
 
@@ -1332,6 +2069,10 @@
       text.indexOf("check out") !== -1 ||
       text.indexOf("secure checkout") !== -1
     );
+  }
+
+  function hasCheckoutFormAncestor(target) {
+    return !!(target && target.closest && target.closest('form[action*="/checkout"]'));
   }
 
   function isCartOpenTarget(target) {
@@ -1607,23 +2348,29 @@
 
         if (isAddToCartTarget(target)) {
           ctaInteracted = true;
-          var addSig = "add_to_cart_action:" + window.location.pathname;
-          if (!shouldSuppressRapidDuplicate(addSig)) {
-            rememberEventSignature(addSig);
-            trackEvent("add_to_cart", {
-              dedupe_key: addSig
-            });
+          if (!hasAddToCartFormAncestor(target)) {
+            var addSig = "add_to_cart_action:" + window.location.pathname;
+            if (!shouldSuppressRapidDuplicate(addSig)) {
+              rememberEventSignature(addSig);
+              trackEvent("add_to_cart", {
+                dedupe_key: addSig,
+                method: "click"
+              });
+            }
           }
         }
 
         if (isBeginCheckoutTarget(target)) {
           ctaInteracted = true;
-          var checkoutSig = "begin_checkout_action:" + window.location.pathname;
-          if (!shouldSuppressRapidDuplicate(checkoutSig)) {
-            rememberEventSignature(checkoutSig);
-            trackEvent("begin_checkout", {
-              dedupe_key: checkoutSig
-            });
+          if (!hasCheckoutFormAncestor(target)) {
+            var checkoutSig = "begin_checkout_action:" + window.location.pathname;
+            if (!shouldSuppressRapidDuplicate(checkoutSig)) {
+              rememberEventSignature(checkoutSig);
+              trackEvent("begin_checkout", {
+                dedupe_key: checkoutSig,
+                method: "click"
+              });
+            }
           }
         }
 
@@ -1871,6 +2618,7 @@
 
         CONFIG.active = config.interventions_enabled !== false && CONFIG.active !== false;
         CONFIG.tidioEnabled = config.tidio_enabled !== false;
+        CONFIG.sessionFrameTelemetryEnabled = config.session_frame_telemetry_enabled !== false;
         CONFIG.shadowMode = config.shadow_mode === true;
         CONFIG.cooldownSeconds = Number(config.cooldown_seconds || CONFIG.cooldownSeconds || 300);
         CONFIG.allowedInterventionTypes = Array.isArray(config.allowed_intervention_types)
@@ -1912,6 +2660,7 @@
         trackPageEvents();
         bindEventTracking();
         startPackedMotionTracking();
+        startSessionFrameTelemetry();
         bindScrollDepthTracking();
         bindExitIntentTracking();
         scheduleProductDwellTracking();

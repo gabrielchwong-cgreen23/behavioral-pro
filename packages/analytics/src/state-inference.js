@@ -1,3 +1,11 @@
+/*
+ * Passive reference logic only.
+ *
+ * This module is intentionally not part of the live intervention decision path.
+ * Production decisioning flows through `packages/analytics/src/intervention-decision.js`
+ * and remains rule-based there. These helpers are retained only as a stable
+ * snapshot-testing reference for the older shopper-state heuristic branches.
+ */
 const DEFAULT_DECISION = Object.freeze({
   shouldTrigger: false,
   shopperState: 'browsing',

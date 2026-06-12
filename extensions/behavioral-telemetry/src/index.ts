@@ -8,6 +8,14 @@ function createId(prefix: string) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function toPathname(pageUrl: string) {
+  try {
+    return new URL(pageUrl).pathname || '/';
+  } catch {
+    return '/';
+  }
+}
+
 register(({ analytics, browser }) => {
   let sessionId = createId('pixel_session');
   let visitorId = createId('pixel_visitor');
@@ -70,23 +78,26 @@ register(({ analytics, browser }) => {
       event?.context?.document?.referrerUrl ||
       null;
 
+    const clientTimestamp = new Date().toISOString();
+
     browser.fetch(`${BACKEND_BASE}/api/events`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        event_name: eventName,
-        shop_domain: shopDomain,
+        anonymous_id: visitorId,
         session_id: sessionId,
-        visitor_id: visitorId,
-        experiment_variant: 'control',
-        page_url: pageUrl,
-        referrer,
-        client_timestamp: new Date().toISOString(),
-        event_id: createId('pixel_evt'),
-        metadata: {
+        event_name: eventName,
+        timestamp: Math.floor(new Date(clientTimestamp).getTime() / 1000),
+        properties: {
+          path: toPathname(pageUrl),
+          shop_domain: shopDomain,
+          referrer,
+          experiment_variant: 'control',
           source: 'shopify_web_pixel',
+          page_url: pageUrl,
+          pixel_event_id: createId('pixel_evt'),
           shopify_event_name: event?.name || null,
           raw_event_id: event?.id || null
         }

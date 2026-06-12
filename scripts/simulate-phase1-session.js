@@ -48,23 +48,22 @@ async function main() {
 
   for (let index = 0; index < eventNames.length; index += 1) {
     const eventName = eventNames[index]
-    const timestamp = new Date(Date.now() + index * 1000).toISOString()
+    const timestamp = Math.floor((Date.now() + index * 1000) / 1000)
 
     const json = await postJson('/api/events', {
-      event_name: eventName,
-      shop_domain: shopDomain,
+      anonymous_id: visitorId,
       session_id: sessionId,
-      visitor_id: visitorId,
-      experiment_variant: experimentVariant,
-      page_url: pageUrl,
-      referrer,
-      client_timestamp: timestamp,
-      event_id: `sim_${index}_${Date.now()}`,
-      metadata: {
+      event_name: eventName,
+      timestamp,
+      properties: {
+        shop_domain: shopDomain,
+        path: new URL(pageUrl).pathname,
+        referrer,
         source: 'phase1_simulation',
         product_id: 'gid://shopify/Product/1',
         product_handle: 'widget',
-        ordinal: index + 1
+        ordinal: index + 1,
+        experiment_variant: experimentVariant
       }
     })
 

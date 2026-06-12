@@ -33,13 +33,21 @@ import {
   validatePublicEventPayload
 } from './packages/analytics/src/request-security.js'
 import {
+  BASELINE_DYNAMIC_MULTIPLIERS,
+  getDecisionMetadata,
   getInterventionDecision,
   getInterventionMessageId,
-  getInterventionStoreConfigFromRecord
+  getInterventionStoreConfigFromRecord,
+  normalizeDynamicMultipliers
 } from './packages/analytics/src/intervention-decision.js'
 import {
   buildSessionFeaturesBaseCte
 } from './packages/analytics/src/session-features-sql.js'
+import {
+  buildSessionFrameCounterDeltas,
+  buildSessionFrameSignalUpdates,
+  sanitizeSessionFrameMetadata
+} from './packages/analytics/src/session-frame.js'
 import { registerOwnerAnalyticsRoutes } from './packages/owner-analytics/src/index.js'
 
 const DEFAULT_PORT = 3001
@@ -353,6 +361,10 @@ async function lookupStoreRecord(supabase, shopDomain) {
 }
 
 function buildSessionStateCounterDeltas(eventName, metadata = {}) {
+  if (String(eventName || '').trim() === 'session_frame') {
+    return buildSessionFrameCounterDeltas(metadata)
+  }
+
   const purchaseValue = Number(
     metadata?.value ??
     metadata?.purchase_value ??
@@ -387,6 +399,14 @@ function buildSessionStateCounterDeltas(eventName, metadata = {}) {
   }
 }
 
+function buildSessionStateSignalUpdates(eventName, metadata = {}) {
+  if (String(eventName || '').trim() !== 'session_frame') {
+    return {}
+  }
+
+  return buildSessionFrameSignalUpdates(metadata)
+}
+
 async function upsertSessionStateCounters(
   supabase,
   {
@@ -398,7 +418,8 @@ async function upsertSessionStateCounters(
     pageUrl = null,
     referrer = null,
     seenAt = new Date().toISOString(),
-    counterDeltas = {}
+    counterDeltas = {},
+    signalUpdates = {}
   } = {}
 ) {
   const { data, error } = await supabase.rpc('upsert_session_state_counters', {
@@ -410,7 +431,8 @@ async function upsertSessionStateCounters(
     p_page_url: pageUrl || null,
     p_referrer: referrer || null,
     p_seen_at: seenAt,
-    p_counter_deltas: counterDeltas
+    p_counter_deltas: counterDeltas,
+    p_signal_updates: signalUpdates
   })
 
   if (error) {
@@ -430,11 +452,13 @@ const DEFAULT_STORE_CONFIG = {
   interventions_enabled: true,
   is_active: true,
   tidio_enabled: true,
+  session_frame_telemetry_enabled: true,
   shadow_mode: false,
   tidio_project_id: '63hgfq26munthk1pfvmvz25ryddkjgsf',
   aov_cohort: 'mid_tier',
   cooldown_seconds: 300,
   intervention_threshold: null,
+  dynamic_multipliers: { ...BASELINE_DYNAMIC_MULTIPLIERS },
   allowed_intervention_types: [
     'friction_assistance',
     'cart_recovery',
@@ -492,21 +516,43 @@ function normalizeStoreConfig(input = {}) {
       DEFAULT_STORE_CONFIG.is_active
     ),
     tidio_enabled: normalizeBooleanFlag(base.tidio_enabled, DEFAULT_STORE_CONFIG.tidio_enabled),
+    session_frame_telemetry_enabled: normalizeBooleanFlag(
+      base.session_frame_telemetry_enabled,
+      DEFAULT_STORE_CONFIG.session_frame_telemetry_enabled
+    ),
     shadow_mode: normalizeBooleanFlag(base.shadow_mode, DEFAULT_STORE_CONFIG.shadow_mode),
     tidio_project_id: String(base.tidio_project_id || DEFAULT_STORE_CONFIG.tidio_project_id).trim() || DEFAULT_STORE_CONFIG.tidio_project_id,
     aov_cohort: cohort,
     cooldown_seconds: normalizePositiveInteger(base.cooldown_seconds, DEFAULT_STORE_CONFIG.cooldown_seconds, { min: 30, max: 3600 }),
-    intervention_threshold: Number.isFinite(Number(base.intervention_threshold))
-      ? Number(base.intervention_threshold)
-      : null,
+    intervention_threshold:
+      base.intervention_threshold == null || base.intervention_threshold === ''
+        ? null
+        : Number.isFinite(Number(base.intervention_threshold))
+          ? Number(base.intervention_threshold)
+          : null,
+    dynamic_multipliers: normalizeDynamicMultipliers(
+      base.dynamic_multipliers,
+      DEFAULT_STORE_CONFIG.dynamic_multipliers
+    ),
     allowed_intervention_types: normalizeAllowedInterventionTypes(base.allowed_intervention_types)
   }
 }
 
 function mergeStoreConfig(existingConfig, patchConfig) {
+  const normalizedExisting = normalizeStoreConfig(existingConfig)
+  const patch = patchConfig && typeof patchConfig === 'object' ? patchConfig : {}
+  const mergedDynamicMultipliers =
+    patch.dynamic_multipliers && typeof patch.dynamic_multipliers === 'object'
+      ? {
+          ...normalizedExisting.dynamic_multipliers,
+          ...patch.dynamic_multipliers
+        }
+      : normalizedExisting.dynamic_multipliers
+
   return normalizeStoreConfig({
-    ...normalizeStoreConfig(existingConfig),
-    ...(patchConfig && typeof patchConfig === 'object' ? patchConfig : {})
+    ...normalizedExisting,
+    ...patch,
+    dynamic_multipliers: mergedDynamicMultipliers
   })
 }
 
@@ -523,6 +569,7 @@ function sanitizeStoreConfigForStorefront(config) {
   return {
     interventions_enabled: normalized.interventions_enabled,
     tidio_enabled: normalized.tidio_enabled,
+    session_frame_telemetry_enabled: normalized.session_frame_telemetry_enabled,
     tidio_project_id: normalized.tidio_project_id,
     shadow_mode: normalized.shadow_mode,
     cooldown_seconds: normalized.cooldown_seconds,
@@ -804,13 +851,17 @@ async function logShadowInterventionDecision({
   env = process.env,
   fetchImpl = globalThis.fetch
 }) {
+  const decisionMetadata = getDecisionMetadata(result, {
+    fallbackReason: 'unknown',
+    fallbackCalculatedThreshold: 0
+  })
   const metadata = {
     strategy: result?.strategy || 'unknown',
-    reason: result?.reason || 'unknown',
+    reason: decisionMetadata.reason,
     decision: Boolean(result?.decision),
     intervention_type: result?.intervention_type || 'none',
     message_id: result?.message_id || getInterventionMessageId(result?.intervention_type || 'none'),
-    calculated_threshold: Number(result?.calculated_threshold || 0),
+    calculated_threshold: decisionMetadata.calculated_threshold,
     session_score: Number(result?.session_score || 0)
   }
 
@@ -852,6 +903,10 @@ async function logInterventionDecisionPerformance({
   if (!supabase) {
     return null
   }
+  const decisionMetadata = getDecisionMetadata(result, {
+    fallbackReason: 'unknown',
+    fallbackCalculatedThreshold: 0
+  })
 
   const safeIngestStartedAtMs = Number(ingestStartedAtMs || 0)
   const safeDecisionEndedAtMs = Number(decisionEndedAtMs || Date.now())
@@ -889,7 +944,7 @@ async function logInterventionDecisionPerformance({
       : 200,
     strategy: String(result?.strategy || 'unknown'),
     intervention_type: String(result?.intervention_type || 'none'),
-    reason: String(result?.reason || result?.strategy || 'unknown'),
+    reason: decisionMetadata.reason,
     ingest_start_time: safeIngestStartedAtMs > 0
       ? new Date(safeIngestStartedAtMs).toISOString()
       : null,
@@ -905,7 +960,7 @@ async function logInterventionDecisionPerformance({
     metadata: {
       shadow_mode: Boolean(result?.shadow_mode),
       message_id: result?.message_id || getInterventionMessageId(result?.intervention_type || 'none'),
-      calculated_threshold: Number(result?.calculated_threshold || 0),
+      calculated_threshold: decisionMetadata.calculated_threshold,
       session_score: Number(result?.session_score || 0),
       decision_source: 'express'
     }
@@ -948,9 +1003,11 @@ function buildInterventionDecisionPerformanceResult({
     intervention_type: 'none',
     message_id: getInterventionMessageId('none'),
     shadow_mode: shadowMode,
-    calculated_threshold: 1,
     session_score: 0,
-    reason
+    metadata: {
+      reason,
+      calculated_threshold: 1
+    }
   }
 }
 
@@ -1168,6 +1225,171 @@ export async function buildSessionFeaturesHealthReport({
   }))
 
   return response
+}
+
+function mapTimelineMarkerName(eventName) {
+  switch (String(eventName || '').trim()) {
+    case 'product_view':
+      return 'product_view'
+    case 'policy_page_view':
+      return 'policy_click'
+    case 'add_to_cart':
+      return 'add_to_cart'
+    case 'begin_checkout':
+      return 'checkout_started'
+    case 'purchase':
+      return 'purchase'
+    case 'intervention_triggered':
+    case 'intervention_type':
+      return 'intervention_shown'
+    case 'tidio_widget_open':
+      return 'intervention_clicked'
+    case 'exit_intent':
+      return 'exit_intent'
+    default:
+      return null
+  }
+}
+
+function parseTimelineMetadata(value) {
+  if (!value || typeof value !== 'string') return {}
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function toTimelineSecond({ startMs, eventMs, metadata }) {
+  const metadataSeconds = Number(metadata?.t_seconds)
+  if (Number.isFinite(metadataSeconds) && metadataSeconds >= 0) {
+    return Math.round(metadataSeconds)
+  }
+
+  if (!Number.isFinite(startMs) || !Number.isFinite(eventMs)) {
+    return 0
+  }
+
+  return Math.max(0, Math.floor((eventMs - startMs) / 1000))
+}
+
+export async function getSessionTimeline({
+  shopDomain,
+  sessionId,
+  env = process.env,
+  fetchImpl = globalThis.fetch
+}) {
+  const result = await queryTinybirdSql({
+    env,
+    fetchImpl,
+    logLabel: 'SESSION TIMELINE',
+    sql: `
+      SELECT
+        event_id,
+        event_name,
+        event_ts,
+        metadata
+      FROM (
+        SELECT
+          event_id,
+          event_name,
+          coalesce(server_timestamp, client_timestamp) AS event_ts,
+          metadata
+        FROM raw_events
+        WHERE shop_domain = ${toTinybirdSqlString(shopDomain)}
+          AND session_id = ${toTinybirdSqlString(sessionId)}
+          AND coalesce(server_timestamp, client_timestamp) IS NOT NULL
+        ORDER BY event_id, coalesce(server_timestamp, client_timestamp) DESC
+        LIMIT 1 BY event_id
+      )
+      ORDER BY event_ts ASC
+      FORMAT JSON
+    `
+  })
+
+  const rows = Array.isArray(result.data) ? result.data : []
+  const parsedRows = rows.map((row) => {
+    const metadata = parseTimelineMetadata(row.metadata)
+    const eventMs = Date.parse(row.event_ts)
+    return {
+      event_name: row.event_name,
+      event_ms: Number.isFinite(eventMs) ? eventMs : null,
+      metadata
+    }
+  })
+
+  const firstEventMs = parsedRows.reduce((lowest, row) => {
+    if (!Number.isFinite(row.event_ms)) return lowest
+    if (!Number.isFinite(lowest)) return row.event_ms
+    return Math.min(lowest, row.event_ms)
+  }, Number.NaN)
+
+  const timelineMap = new Map()
+
+  for (const row of parsedRows) {
+    if (row.event_name !== 'session_frame') continue
+
+    let metadata
+    try {
+      metadata = sanitizeSessionFrameMetadata(row.metadata)
+    } catch {
+      continue
+    }
+    const tSeconds = toTimelineSecond({
+      startMs: firstEventMs,
+      eventMs: row.event_ms,
+      metadata
+    })
+
+    timelineMap.set(tSeconds, {
+      t_seconds: tSeconds,
+      intent_score: metadata.intent_score,
+      friction_score: metadata.friction_score,
+      hesitation_score: metadata.hesitation_score,
+      policy_anxiety_score: metadata.policy_anxiety_score,
+      cart_commitment_score: metadata.cart_commitment_score,
+      mouse_velocity_avg: metadata.mouse_velocity_avg,
+      scroll_depth: metadata.scroll_depth,
+      active_zone: metadata.active_zone,
+      journey_stage: metadata.journey_stage,
+      event_markers: []
+    })
+  }
+
+  for (const row of parsedRows) {
+    const marker = mapTimelineMarkerName(row.event_name)
+    if (!marker) continue
+
+    const tSeconds = toTimelineSecond({
+      startMs: firstEventMs,
+      eventMs: row.event_ms,
+      metadata: row.metadata
+    })
+
+    if (!timelineMap.has(tSeconds)) {
+      timelineMap.set(tSeconds, {
+        t_seconds: tSeconds,
+        intent_score: null,
+        friction_score: null,
+        hesitation_score: null,
+        policy_anxiety_score: null,
+        cart_commitment_score: null,
+        mouse_velocity_avg: null,
+        scroll_depth: null,
+        active_zone: 'unknown_zone',
+        journey_stage: 'unknown',
+        event_markers: []
+      })
+    }
+
+    const entry = timelineMap.get(tSeconds)
+    if (!entry.event_markers.includes(marker)) {
+      entry.event_markers.push(marker)
+    }
+  }
+
+  return Array.from(timelineMap.values()).sort((left, right) => left.t_seconds - right.t_seconds)
 }
 
 export { buildMetricsPayload }
@@ -1788,6 +2010,7 @@ export function createApp({
     '/api/metrics/:shop_domain',
     '/api/debug/:shop_domain',
     '/api/embedded-check',
+    '/api/sessions/:session_id/timeline',
     '/api/analytics/conversion-rates/:shop_domain',
     '/api/admin/session-features-health',
     '/api/intervention-decision'
@@ -1821,6 +2044,33 @@ export function createApp({
       console.log('SESSION TOKEN ERROR:', error.message)
       return sendInvalidSessionResponse(res, error.message)
     }
+  }
+
+  function requireSessionTimelineAccess(req, res, next) {
+    const ownerToken = getOwnerAccessToken(req)
+    if (ownerToken && ownerToken === env.ANALYTICS_OWNER_TOKEN) {
+      const shopDomain = normalizeShop(req.query.shop_domain || req.query.shop)
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      req.timelineAccess = {
+        mode: 'owner',
+        shopDomain
+      }
+      return next()
+    }
+
+    return requireShopifySessionToken(req, res, () => {
+      req.timelineAccess = {
+        mode: 'shopify',
+        shopDomain: req.shopifySession.shop
+      }
+      return next()
+    })
   }
 
   function requireSignedIngestOrSession(req, res, next) {
@@ -2328,6 +2578,9 @@ export function createApp({
 
       let eventRecord
       try {
+        const normalizedMetadata = event_name === 'session_frame'
+          ? sanitizeSessionFrameMetadata(properties)
+          : properties
         eventRecord = {
           store_id: resolvedStoreId,
           event_id,
@@ -2342,9 +2595,9 @@ export function createApp({
           server_timestamp,
           server_received_timestamp,
           metadata: {
-            ...properties,
+            ...normalizedMetadata,
             user_agent: req.headers['user-agent'] || null,
-            device_type: properties.device_type || getDeviceTypeFromUserAgent(req.headers['user-agent'])
+            device_type: normalizedMetadata.device_type || getDeviceTypeFromUserAgent(req.headers['user-agent'])
           }
         }
       } catch (validationError) {
@@ -2386,7 +2639,8 @@ export function createApp({
         pageUrl: page_url,
         referrer: validatedReferrer || req.get('referer') || null,
         seenAt: server_timestamp,
-        counterDeltas: buildSessionStateCounterDeltas(event_name, eventRecord.metadata)
+        counterDeltas: buildSessionStateCounterDeltas(event_name, eventRecord.metadata),
+        signalUpdates: buildSessionStateSignalUpdates(event_name, eventRecord.metadata)
       }).catch((error) => {
         console.log('SESSION STATE EVENT UPSERT ERROR:', error)
         return null
@@ -2461,13 +2715,12 @@ export function createApp({
         responseStatusCode: validation.status,
         ingestStartedAtMs
       })
-      return res.status(validation.status).json({
-        decision: false,
-        strategy: 'invalid_request',
-        intervention_type: 'none',
-        message_id: getInterventionMessageId('none'),
-        shadow_mode: false
-      })
+      return res
+        .status(validation.status)
+        .json(buildInterventionDecisionPerformanceResult({
+          strategy: 'invalid_request',
+          reason: 'invalid_request'
+        }))
     }
 
     const { shopDomain, sessionId, storeId: requestedStoreId } = validation.value
@@ -2497,13 +2750,7 @@ export function createApp({
       return res
         .status(429)
         .set('Retry-After', String(rateLimit.retryAfterSeconds))
-        .json({
-          decision: false,
-          strategy: 'rate_limited',
-          intervention_type: 'none',
-          message_id: getInterventionMessageId('none'),
-          shadow_mode: false
-        })
+        .json(result)
     }
 
     if (isBotLikeRequest(req) && !req.get('origin') && !req.get('referer')) {
@@ -2522,13 +2769,7 @@ export function createApp({
         responseStatusCode: 401,
         ingestStartedAtMs
       })
-      return res.status(401).json({
-        decision: false,
-        strategy: 'unauthorized',
-        intervention_type: 'none',
-        message_id: getInterventionMessageId('none'),
-        shadow_mode: false
-      })
+      return res.status(401).json(result)
     }
 
     try {
@@ -2624,9 +2865,11 @@ export function createApp({
           intervention_type: 'none',
           message_id: getInterventionMessageId('none'),
           shadow_mode: false,
-          calculated_threshold: 1,
           session_score: 0,
-          reason: 'error_fail_closed'
+          metadata: {
+            reason: 'error_fail_closed',
+            calculated_threshold: 1
+          }
         },
         env,
         fetchImpl
@@ -2658,13 +2901,10 @@ export function createApp({
 
       return res
         .set('Cache-Control', 'no-store')
-        .json({
-          decision: false,
+        .json(buildInterventionDecisionPerformanceResult({
           strategy: 'error_fail_closed',
-          intervention_type: 'none',
-          message_id: getInterventionMessageId('none'),
-          shadow_mode: false
-        })
+          reason: 'error_fail_closed'
+        }))
     }
   }
 
@@ -2674,6 +2914,58 @@ export function createApp({
 
   app.post('/api/intervention-decision', async (req, res) => {
     return handleInterventionDecision(req, res, req.body || {})
+  })
+
+  app.get('/api/sessions/:session_id/timeline', requireSessionTimelineAccess, async (req, res) => {
+    try {
+      const shopDomain = req.timelineAccess?.shopDomain
+      const sessionId = String(req.params.session_id || '').trim()
+
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      if (!sessionId) {
+        return res.status(400).json({
+          success: false,
+          error: 'session_id is required'
+        })
+      }
+
+      const rateLimit = interventionDecisionLimiter.check(buildRateLimitKey([
+        'timeline',
+        getClientIp(req),
+        shopDomain,
+        sessionId
+      ]))
+      if (!rateLimit.ok) {
+        return rejectRateLimited(res, rateLimit.retryAfterSeconds)
+      }
+
+      const timeline = await getSessionTimeline({
+        shopDomain,
+        sessionId,
+        env,
+        fetchImpl
+      })
+
+      return res
+        .set('Cache-Control', 'no-store')
+        .json({
+          success: true,
+          data: {
+            shop_domain: shopDomain,
+            session_id: sessionId,
+            timeline
+          }
+        })
+    } catch (error) {
+      console.log('SESSION TIMELINE ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
   })
 
   app.get('/api/embedded-check', requireShopifySessionToken, async (req, res) => {

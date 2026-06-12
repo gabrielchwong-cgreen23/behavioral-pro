@@ -36,7 +36,7 @@ SQL >
         AND notEmpty(ifNull(session_id, ''))
         AND coalesce(server_timestamp, client_timestamp) IS NOT NULL
     ),
-    deduped_events AS (
+    deduped_events_raw AS (
       SELECT
         argMax(store_id, tuple(notEmpty(ifNull(store_id, '')), event_ts)) AS store_id,
         argMax(shop_domain, tuple(notEmpty(ifNull(shop_domain, '')), event_ts)) AS shop_domain,
@@ -47,19 +47,40 @@ SQL >
         argMax(referrer, tuple(notEmpty(ifNull(referrer, '')), event_ts)) AS referrer,
         event_id,
         argMax(event_name, event_ts) AS event_name,
-        max(event_ts) AS latest_event_ts,
         max(client_timestamp) AS client_timestamp,
         max(server_timestamp) AS server_timestamp,
         argMax(metadata, event_ts) AS metadata,
         max(metadata_malformed) AS metadata_malformed,
         argMax(discount_status, tuple(notEmpty(ifNull(discount_status, '')), event_ts)) AS discount_status,
-        argMax(scroll_milestone, tuple(scroll_milestone IS NOT NULL, event_ts)) AS scroll_milestone
+        argMax(scroll_milestone, tuple(scroll_milestone IS NOT NULL, event_ts)) AS scroll_milestone,
+        max(event_ts) AS latest_event_ts
       FROM raw_base
       WHERE notEmpty(ifNull(event_id, ''))
       GROUP BY event_id
 
       UNION ALL
 
+      SELECT
+        store_id,
+        shop_domain,
+        session_id,
+        visitor_id,
+        experiment_variant,
+        page_url,
+        referrer,
+        event_id,
+        event_name,
+        client_timestamp,
+        server_timestamp,
+        metadata,
+        metadata_malformed,
+        discount_status,
+        scroll_milestone,
+        event_ts
+      FROM raw_base
+      WHERE empty(ifNull(event_id, ''))
+    ),
+    deduped_events AS (
       SELECT
         store_id,
         shop_domain,
@@ -77,8 +98,7 @@ SQL >
         metadata_malformed,
         discount_status,
         scroll_milestone
-      FROM raw_base
-      WHERE empty(ifNull(event_id, ''))
+      FROM deduped_events_raw
     ),
     session_features AS (
       SELECT

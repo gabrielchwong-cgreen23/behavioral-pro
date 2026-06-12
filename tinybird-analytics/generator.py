@@ -2,10 +2,17 @@ import requests
 import json
 import random
 import uuid
+import os
 from datetime import datetime, timedelta
 
-TINYBIRD_TOKEN="p.eyJ1IjogImZjZmQwMDQ0LTVhMDUtNDMzNi1iNGU2LTdiMDVjMzI5NDQ4MSIsICJpZCI6ICJhOTY1ZjhmYi1hZGI1LTQ2YzMtODA3ZS1iZTg1NzgyODZlODMiLCAiaG9zdCI6ICJnY3AtZXVyb3BlLXdlc3QyIn0.ogQknF5yJCo2NLRIZ2VBlVRbVLIFoWQFLckJIyZoRiM"
-TINYBIRD_URL = "https://api.europe-west2.gcp.tinybird.co/v0/events?name=storefront_events_example&branch=Cloud"
+TINYBIRD_TOKEN = os.environ.get("TINYBIRD_INGEST_TOKEN") or os.environ.get("TINYBIRD_TOKEN")
+TINYBIRD_URL = os.environ.get(
+    "TINYBIRD_GENERATOR_URL",
+    "https://api.europe-west2.gcp.tinybird.co/v0/events?name=storefront_events_example&branch=Cloud",
+)
+
+if not TINYBIRD_TOKEN:
+    raise RuntimeError("Missing TINYBIRD_INGEST_TOKEN or TINYBIRD_TOKEN")
 
 HEADERS = {
     "Authorization": f"Bearer {TINYBIRD_TOKEN}",

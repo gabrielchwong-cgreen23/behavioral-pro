@@ -139,3 +139,42 @@ test('Tinybird helpers separate ingest and query token usage', () => {
   assert.equal(getTinybirdIngestToken(env), 'ingest-only-token')
   assert.equal(getTinybirdQueryToken(env), 'query-only-token')
 })
+
+test('public event validation rejects session_frame payloads with sensitive fields', () => {
+  const result = validatePublicEventPayload(createValidEvent({
+    event_name: 'session_frame',
+    properties: {
+      shop_domain: 'alpha.myshopify.com',
+      path: '/products/widget',
+      page_type: 'product',
+      journey_stage: 'decision',
+      active_zone: 'add_to_cart_zone',
+      t_seconds: 2,
+      mouse_velocity_avg: 0.03,
+      mouse_velocity_max: 0.08,
+      mouse_acceleration_avg: 0.01,
+      mouse_distance: 12,
+      scroll_depth: 0.5,
+      scroll_velocity: 0.02,
+      cursor_idle_seconds: 0.4,
+      hover_cta_seconds: 1.1,
+      hover_price_seconds: 0.2,
+      hover_policy_seconds: 0.1,
+      hover_reviews_seconds: 0.4,
+      cta_distance: 90,
+      click_count: 1,
+      rage_click_count: 0,
+      dead_click_count: 0,
+      intent_score: 0.7,
+      friction_score: 0.2,
+      hesitation_score: 0.5,
+      policy_anxiety_score: 0.1,
+      cart_commitment_score: 0.6,
+      abandonment_risk_score: 0.3,
+      email: 'customer@example.com'
+    }
+  }))
+
+  assert.equal(result.status, 400)
+  assert.match(result.body.error, /not allowed/)
+})

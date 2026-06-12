@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { sanitizeSessionFrameMetadata } from './session-frame.js'
 
 const DEFAULT_WINDOW_MS = 60 * 1000
 const DEFAULT_MAX_REQUESTS = 60
@@ -151,7 +152,7 @@ export function validatePublicEventPayload(body, {
     return safeErrorPayload('Invalid event payload', 400)
   }
 
-  const properties = parsed.data.properties
+  let properties = parsed.data.properties
   if (!isPlainObject(properties)) {
     return safeErrorPayload('Invalid event payload', 400)
   }
@@ -180,6 +181,14 @@ export function validatePublicEventPayload(body, {
   const now = Date.now()
   if ((now - timestampMs) > MAX_PAST_EVENT_AGE_MS || (timestampMs - now) > MAX_FUTURE_SKEW_MS) {
     return safeErrorPayload('timestamp outside allowed range', 400)
+  }
+
+  if (parsed.data.event_name === 'session_frame') {
+    try {
+      properties = sanitizeSessionFrameMetadata(properties)
+    } catch (error) {
+      return safeErrorPayload(error.message || 'invalid session_frame payload', 400)
+    }
   }
 
   return {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import {
   getDefaultStateInferenceDecision,
   inferShopperStateDecision
-} from '../packages/analytics/src/index.js'
+} from '../packages/analytics/src/state-inference.js'
 
 test('state inference defaults to browsing with no trigger', () => {
   assert.deepEqual(inferShopperStateDecision({}), {

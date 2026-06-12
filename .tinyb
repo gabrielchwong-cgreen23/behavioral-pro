@@ -1,0 +1,14 @@
+{
+    "host": "https://api.europe-west2.gcp.tinybird.co",
+    "id": "fcfd0044-5a05-4336-b4e6-7b05c3294481",
+    "name": "gabrielchwong_workspace",
+    "scope": "user",
+    "token": "p.eyJ1IjogImZjZmQwMDQ0LTVhMDUtNDMzNi1iNGU2LTdiMDVjMzI5NDQ4MSIsICJpZCI6ICJhOTY1ZjhmYi1hZGI1LTQ2YzMtODA3ZS1iZTg1NzgyODZlODMiLCAiaG9zdCI6ICJnY3AtZXVyb3BlLXdlc3QyIn0.ogQknF5yJCo2NLRIZ2VBlVRbVLIFoWQFLckJIyZoRiM",
+    "tokens": {
+        "https://api.europe-west2.gcp.tinybird.co": "p.eyJ1IjogImZjZmQwMDQ0LTVhMDUtNDMzNi1iNGU2LTdiMDVjMzI5NDQ4MSIsICJpZCI6ICJhOTY1ZjhmYi1hZGI1LTQ2YzMtODA3ZS1iZTg1NzgyODZlODMiLCAiaG9zdCI6ICJnY3AtZXVyb3BlLXdlc3QyIn0.ogQknF5yJCo2NLRIZ2VBlVRbVLIFoWQFLckJIyZoRiM"
+    },
+    "user_email": "gabrielchwong@gmail.com",
+    "user_id": "c74c7b44-a9dd-4ba2-9235-c10d1b02e072",
+    "user_token": "p.eyJ1IjogImM3NGM3YjQ0LWE5ZGQtNGJhMi05MjM1LWMxMGQxYjAyZTA3MiIsICJpZCI6ICI1ZDA5OWU1Ni1kMTNkLTQ0ZDAtODZlMC1iNzAyNGFlOGRlMjgiLCAiaG9zdCI6ICJnY3AtZXVyb3BlLXdlc3QyIn0.PMNA0yPi20K9pfG4uOYS7zKYP1FPlbIvSBP-HgRLdMc",
+    "version": "4.5.7"
+}

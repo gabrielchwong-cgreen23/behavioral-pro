@@ -125,12 +125,16 @@ class MockSupabaseStore {
   constructor(seed = {}) {
     this.tables = {
       stores: clone(seed.stores || []),
+      performance_metrics: clone(seed.performance_metrics || []),
+      store_benchmarks: clone(seed.store_benchmarks || []),
       experiment_sessions: clone(seed.experiment_sessions || []),
       events: clone(seed.events || []),
       session_state: clone(seed.session_state || [])
     }
     this.nextIds = {
       stores: this.getNextId('stores'),
+      performance_metrics: this.getNextId('performance_metrics'),
+      store_benchmarks: this.getNextId('store_benchmarks'),
       experiment_sessions: this.getNextId('experiment_sessions'),
       events: this.getNextId('events'),
       session_state: this.getNextId('session_state')
@@ -187,7 +191,8 @@ class MockSupabaseStore {
       p_page_url,
       p_referrer,
       p_seen_at,
-      p_counter_deltas
+      p_counter_deltas,
+      p_signal_updates
     } = args
 
     const shopDomain = p_shop_domain
@@ -195,6 +200,9 @@ class MockSupabaseStore {
     const seenAt = p_seen_at || new Date().toISOString()
     const counters = p_counter_deltas && typeof p_counter_deltas === 'object'
       ? clone(p_counter_deltas)
+      : {}
+    const signals = p_signal_updates && typeof p_signal_updates === 'object'
+      ? clone(p_signal_updates)
       : {}
 
     const index = this.tables.session_state.findIndex(row =>
@@ -211,6 +219,7 @@ class MockSupabaseStore {
         page_url: p_page_url || null,
         referrer: p_referrer || null,
         counters,
+        signals,
         first_seen_at: seenAt,
         last_seen_at: seenAt,
         first_intervention_triggered_at:
@@ -224,9 +233,16 @@ class MockSupabaseStore {
     const mergedCounters = {
       ...(existing.counters || {})
     }
+    const mergedSignals = {
+      ...(existing.signals || {})
+    }
 
     for (const [key, value] of Object.entries(counters)) {
       mergedCounters[key] = Number(mergedCounters[key] || 0) + Number(value || 0)
+    }
+
+    for (const [key, value] of Object.entries(signals)) {
+      mergedSignals[key] = value
     }
 
     const next = {
@@ -237,6 +253,7 @@ class MockSupabaseStore {
       page_url: p_page_url || existing.page_url || null,
       referrer: p_referrer || existing.referrer || null,
       counters: mergedCounters,
+      signals: mergedSignals,
       first_seen_at: existing.first_seen_at || seenAt,
       last_seen_at: seenAt,
       first_intervention_triggered_at:

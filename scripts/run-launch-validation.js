@@ -301,8 +301,6 @@ async function runCooldownScenario() {
 }
 
 async function runLocalFallbackTests() {
-  let benchmarkQueries = 0
-
   const fallbackPositive = await getInterventionDecision({
     shopDomain: SHOP,
     sessionId: 'fallback_positive',
@@ -314,12 +312,32 @@ async function runLocalFallbackTests() {
       }
     },
     supabase: {
-      from() {
+      from(table) {
         return {
+          table,
           select() { return this },
-          eq() { return this },
+          eq(column, value) {
+            this[column] = value
+            return this
+          },
           async maybeSingle() {
-            return { data: null, error: { message: 'session_state unavailable' } }
+            if (this.table === 'session_state') {
+              return { data: null, error: { message: 'session_state unavailable' } }
+            }
+            if (this.table === 'store_benchmarks' && (this.store_id === 'store_1' || this.shop_domain === SHOP)) {
+              return {
+                data: {
+                  historical_session_count: 0,
+                  p75_rage_click_count: 0,
+                  p75_cta_idle_15s_count: 0,
+                  p75_policy_page_view_count: 0,
+                  reached_checkout_rate: 0,
+                  purchase_rate: 0
+                },
+                error: null
+              }
+            }
+            return { data: null, error: null }
           }
         }
       }
@@ -358,23 +376,6 @@ async function runLocalFallbackTests() {
         }
       }
 
-      if (sql.includes('historical_session_count')) {
-        benchmarkQueries += 1
-        return {
-          ok: true,
-          text: async () => JSON.stringify({
-            data: [{
-              historical_session_count: 0,
-              p75_rage_click_count: 0,
-              p75_cta_idle_15s_count: 0,
-              p75_policy_page_view_count: 0,
-              reached_checkout_rate: 0,
-              purchase_rate: 0
-            }]
-          })
-        }
-      }
-
       throw new Error(`Unexpected fallback fetch SQL: ${sql}`)
     }
   })
@@ -390,12 +391,32 @@ async function runLocalFallbackTests() {
       }
     },
     supabase: {
-      from() {
+      from(table) {
         return {
+          table,
           select() { return this },
-          eq() { return this },
+          eq(column, value) {
+            this[column] = value
+            return this
+          },
           async maybeSingle() {
-            return { data: null, error: { message: 'session_state unavailable' } }
+            if (this.table === 'session_state') {
+              return { data: null, error: { message: 'session_state unavailable' } }
+            }
+            if (this.table === 'store_benchmarks' && this.shop_domain === SHOP) {
+              return {
+                data: {
+                  historical_session_count: 0,
+                  p75_rage_click_count: 0,
+                  p75_cta_idle_15s_count: 0,
+                  p75_policy_page_view_count: 0,
+                  reached_checkout_rate: 0,
+                  purchase_rate: 0
+                },
+                error: null
+              }
+            }
+            return { data: null, error: null }
           }
         }
       }
@@ -427,7 +448,6 @@ async function runLocalFallbackTests() {
   }).catch((error) => ({ error: error.message }))
 
   return {
-    benchmarkQueries,
     fallbackPositive: fallbackPositive.result,
     noData
   }

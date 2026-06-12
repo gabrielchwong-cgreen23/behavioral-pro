@@ -8,23 +8,25 @@ embedded = true
 [webhooks]
 api_version = "2026-01"
 
-[[webhooks.subscriptions]]
-uri = "https://behavioral-pro-production.up.railway.app/webhooks/customers-data-request"
-compliance_topics = ["customers/data_request"]
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/customers-data-request"
+  compliance_topics = [ "customers/data_request" ]
 
-[[webhooks.subscriptions]]
-uri = "https://behavioral-pro-production.up.railway.app/webhooks/customers-redact"
-compliance_topics = ["customers/redact"]
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/customers-redact"
+  compliance_topics = [ "customers/redact" ]
 
-[[webhooks.subscriptions]]
-uri = "https://behavioral-pro-production.up.railway.app/webhooks/shop-redact"
-compliance_topics = ["shop/redact"]
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/shop-redact"
+  compliance_topics = [ "shop/redact" ]
 
 [access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "read_products"
-optional_scopes = []
+optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = ["https://behavioral-pro-production.up.railway.app/api/shopify/callback"]
-
+redirect_urls = [
+  "https://behavioral-pro-production.up.railway.app/api/shopify/callback"
+]

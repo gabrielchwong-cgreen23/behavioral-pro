@@ -4,10 +4,47 @@ import {
   buildMetricsPayload,
   buildSessionFeaturesHealthReport,
   createApp,
+  getSessionTimeline,
   getShopDomainFromRequestBody,
-  normalizeShop
+  normalizeShop,
+  scheduleInterventionDecisionPerformanceLog
 } from '../app.js'
 import { createMockSupabase } from './helpers/mock-supabase.js'
+
+async function withTestServer({ supabase, fetchImpl, env = {} }, callback) {
+  const app = createApp({
+    env: {
+      SHOPIFY_API_KEY: 'api-key',
+      SHOPIFY_API_SECRET: 'secret',
+      ANALYTICS_OWNER_TOKEN: 'owner-token',
+      TINYBIRD_API_KEY: 'tinybird-query-token',
+      TINYBIRD_API_URL: 'https://api.tinybird.test',
+      ...env
+    },
+    supabase,
+    fetchImpl
+  })
+
+  const server = await new Promise((resolve) => {
+    const instance = app.listen(0, '127.0.0.1', () => resolve(instance))
+  })
+
+  try {
+    const address = server.address()
+    await callback(`http://127.0.0.1:${address.port}`)
+  } finally {
+    if (!server.listening) {
+      return
+    }
+
+    await new Promise((resolve, reject) => {
+      server.close((error) => {
+        if (error) reject(error)
+        else resolve()
+      })
+    })
+  }
+}
 
 test('createApp fails fast with a clear Supabase env error', () => {
   assert.throws(
@@ -176,4 +213,175 @@ test('session features health report builds Tinybird-backed diagnostics', async 
   assert.deepEqual(json.fallback_sessions_by_shop_domain, [
     { shop_domain: 'fallback.myshopify.com', sessions: 1 }
   ])
+})
+
+test('intervention decision performance metrics logging is scheduled asynchronously', async () => {
+  let loggerStarted = false
+  let loggerFinished = false
+  let loggedPayload = null
+
+  scheduleInterventionDecisionPerformanceLog({
+    logger: async (payload) => {
+      loggerStarted = true
+      loggedPayload = payload
+      await new Promise(resolve => setTimeout(resolve, 75))
+      loggerFinished = true
+    },
+    payload: {
+      route_name: '/api/intervention-decision',
+      shopDomain: 'alpha.myshopify.com'
+    }
+  })
+
+  assert.equal(loggerStarted, false)
+  assert.equal(loggerFinished, false)
+
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(loggerStarted, true)
+  assert.equal(loggerFinished, false)
+  assert.deepEqual(loggedPayload, {
+    route_name: '/api/intervention-decision',
+    shopDomain: 'alpha.myshopify.com'
+  })
+
+  await new Promise(resolve => setTimeout(resolve, 90))
+  assert.equal(loggerFinished, true)
+})
+
+test('session timeline maps session_frame rows and event markers into graph-ready data', async () => {
+  const fetchImpl = async (_url, options = {}) => {
+    const body = new URLSearchParams(String(options.body || ''))
+    const sql = body.get('q') || ''
+
+    assert.match(sql, /SESSION TIMELINE|raw_events/)
+
+    return {
+      ok: true,
+      text: async () => JSON.stringify({
+        data: [
+          {
+            event_id: 'evt_1',
+            event_name: 'product_view',
+            event_ts: '2026-06-04 12:00:00.000',
+            metadata: '{}'
+          },
+          {
+            event_id: 'evt_2',
+            event_name: 'session_frame',
+            event_ts: '2026-06-04 12:00:02.000',
+            metadata: JSON.stringify({
+              page_type: 'product',
+              journey_stage: 'decision',
+              active_zone: 'add_to_cart_zone',
+              t_seconds: 2,
+              mouse_velocity_avg: 0.04,
+              mouse_velocity_max: 0.1,
+              mouse_acceleration_avg: 0.01,
+              mouse_distance: 42,
+              scroll_depth: 0.58,
+              scroll_velocity: 0.02,
+              cursor_idle_seconds: 0.2,
+              hover_cta_seconds: 1.1,
+              hover_price_seconds: 0.4,
+              hover_policy_seconds: 0.1,
+              hover_reviews_seconds: 0.3,
+              cta_distance: 88,
+              click_count: 1,
+              rage_click_count: 0,
+              dead_click_count: 0,
+              intent_score: 0.74,
+              friction_score: 0.21,
+              hesitation_score: 0.46,
+              policy_anxiety_score: 0.1,
+              cart_commitment_score: 0.62,
+              abandonment_risk_score: 0.19
+            })
+          },
+          {
+            event_id: 'evt_3',
+            event_name: 'add_to_cart',
+            event_ts: '2026-06-04 12:00:02.500',
+            metadata: '{}'
+          }
+        ]
+      })
+    }
+  }
+
+  const timeline = await getSessionTimeline({
+    shopDomain: 'alpha.myshopify.com',
+    sessionId: 'sess-timeline-1',
+    env: {
+      TINYBIRD_API_KEY: 'tinybird-query-token',
+      TINYBIRD_API_URL: 'https://api.tinybird.test'
+    },
+    fetchImpl
+  })
+
+  assert.equal(timeline.length, 2)
+  assert.equal(timeline[0].t_seconds, 0)
+  assert.deepEqual(timeline[0].event_markers, ['product_view'])
+  assert.equal(timeline[1].t_seconds, 2)
+  assert.equal(timeline[1].active_zone, 'add_to_cart_zone')
+  assert.deepEqual(timeline[1].event_markers.sort(), ['add_to_cart'])
+})
+
+test('session timeline endpoint returns owner-scoped graph data', async () => {
+  const fetchImpl = async () => ({
+    ok: true,
+    text: async () => JSON.stringify({
+      data: [{
+        event_id: 'evt_1',
+        event_name: 'session_frame',
+        event_ts: '2026-06-04 12:00:02.000',
+        metadata: JSON.stringify({
+          page_type: 'product',
+          journey_stage: 'decision',
+          active_zone: 'add_to_cart_zone',
+          t_seconds: 2,
+          mouse_velocity_avg: 0.04,
+          mouse_velocity_max: 0.1,
+          mouse_acceleration_avg: 0.01,
+          mouse_distance: 42,
+          scroll_depth: 0.58,
+          scroll_velocity: 0.02,
+          cursor_idle_seconds: 0.2,
+          hover_cta_seconds: 1.1,
+          hover_price_seconds: 0.4,
+          hover_policy_seconds: 0.1,
+          hover_reviews_seconds: 0.3,
+          cta_distance: 88,
+          click_count: 1,
+          rage_click_count: 0,
+          dead_click_count: 0,
+          intent_score: 0.74,
+          friction_score: 0.21,
+          hesitation_score: 0.46,
+          policy_anxiety_score: 0.1,
+          cart_commitment_score: 0.62,
+          abandonment_risk_score: 0.19
+        })
+      }]
+    })
+  })
+
+  await withTestServer({
+    supabase: createMockSupabase(),
+    fetchImpl
+  }, async (baseUrl) => {
+    const response = await fetch(
+      `${baseUrl}/api/sessions/sess-timeline-1/timeline?shop_domain=${encodeURIComponent('alpha.myshopify.com')}`,
+      {
+        headers: {
+          'x-analytics-token': 'owner-token'
+        }
+      }
+    )
+
+    const body = await response.json()
+    assert.equal(response.status, 200)
+    assert.equal(body.success, true)
+    assert.equal(body.data.session_id, 'sess-timeline-1')
+    assert.equal(body.data.timeline[0].t_seconds, 2)
+  })
 })

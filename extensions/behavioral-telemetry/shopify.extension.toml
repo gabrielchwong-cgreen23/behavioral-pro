@@ -1,0 +1,16 @@
+name = "behavioral-telemetry"
+type = "web_pixel_extension"
+uid = "194bbd28-b459-bcfe-33d9-9f610bb8c048bb01d30e"
+
+runtime_context = "strict"
+
+[settings]
+type = "object"
+
+[settings.fields.accountID]
+name = "Account ID"
+description = "Account ID"
+type = "single_line_text_field"
+validations =  [
+  { name = "min", value = "1" }
+]

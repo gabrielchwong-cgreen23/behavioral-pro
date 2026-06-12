@@ -1,4 +1,5 @@
 import crypto from 'crypto'
+import { sanitizeSessionFrameMetadata } from './session-frame.js'
 
 export const PHASE1_EVENT_NAMES = [
   'experiment_assignment',
@@ -20,6 +21,7 @@ export const PHASE1_EVENT_NAMES = [
   'review_section_dwell_10s',
   'cta_idle_15s',
   'rage_click',
+  'session_frame',
   'shadow_intervention_logged',
   'intervention_triggered',
   'intervention_type'
@@ -86,7 +88,7 @@ export function createPhase1EventId(prefix = 'evt') {
 }
 
 export function normalizePhase1EventPayload(input = {}) {
-  const metadata = normalizeMetadata(input.metadata ?? input.extra)
+  let metadata = normalizeMetadata(input.metadata ?? input.extra)
   const eventName = normalizeRequiredString(
     input.event_name ?? input.eventType ?? input.event_type,
     'event_name'
@@ -94,6 +96,10 @@ export function normalizePhase1EventPayload(input = {}) {
 
   if (!PHASE1_EVENT_NAME_SET.has(eventName)) {
     throw new Error(`event_name must be one of: ${PHASE1_EVENT_NAMES.join(', ')}`)
+  }
+
+  if (eventName === 'session_frame') {
+    metadata = sanitizeSessionFrameMetadata(metadata)
   }
 
   return {

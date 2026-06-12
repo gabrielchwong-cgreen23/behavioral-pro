@@ -1,5 +1,6 @@
 import {
   getAnalyticsOverview,
+  buildMetricsPayload,
   getSessionCROTable,
   getTriggerConversionRates,
   getRawEventLog
@@ -126,9 +127,14 @@ function buildOwnerAnalyticsPage() {
       border-color: transparent;
       font-weight: 600;
     }
-    .summary-grid, .rates-grid {
+    .summary-grid, .rates-grid, .lift-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 14px;
+    }
+    .comparison-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 14px;
     }
     .stat {
@@ -226,6 +232,7 @@ function buildOwnerAnalyticsPage() {
         <span class="muted" id="status-text">Loading stores...</span>
       </div>
       <div class="link-row">
+        <a class="link" id="exact-dashboard-link" href="#">Open exact store dashboard</a>
         <a class="link" id="raw-json-link" href="#">Open raw session JSON</a>
         <a class="link" id="raw-events-link" href="#">Open raw events JSON</a>
       </div>
@@ -234,6 +241,13 @@ function buildOwnerAnalyticsPage() {
     <div class="card">
       <div class="pill">Overview</div>
       <div class="summary-grid" id="summary-grid"></div>
+    </div>
+
+    <div class="card">
+      <div class="pill">Merchant Lift View</div>
+      <div class="muted" style="margin-bottom: 14px;">This mirrors the store-level lift math used in the merchant dashboard so you can evaluate value delivered per installed shop.</div>
+      <div class="lift-grid" id="lift-summary-grid"></div>
+      <div class="comparison-grid" id="lift-comparison-grid" style="margin-top: 14px;"></div>
     </div>
 
     <div class="card">
@@ -335,6 +349,48 @@ function buildOwnerAnalyticsPage() {
       ].join('')).join('')
     }
 
+    function renderLift(metrics) {
+      const summaryGrid = document.getElementById('lift-summary-grid');
+      const comparisonGrid = document.getElementById('lift-comparison-grid');
+      if (!summaryGrid || !comparisonGrid) return;
+
+      if (!metrics) {
+        summaryGrid.innerHTML = '<div class="muted">No lift data available for this store yet.</div>';
+        comparisonGrid.innerHTML = '';
+        return;
+      }
+
+      const control = metrics.control || {};
+      const variant = metrics.variant || {};
+      const cards = [
+        ['Lift %', formatPercent((metrics.lift_percent || 0) / 100)],
+        ['Incremental Revenue', formatMoney(metrics.incremental_revenue_estimate || 0)],
+        ['Exposure Rate', formatPercent(metrics.exposure_rate || 0)],
+        ['Exposure Lift %', formatPercent((metrics.exposure_lift_percent || 0) / 100)]
+      ];
+
+      summaryGrid.innerHTML = cards.map(([label, value]) => [
+        '<div class="stat">',
+        '<div class="label">' + label + '</div>',
+        '<div class="value">' + String(value) + '</div>',
+        '</div>'
+      ].join('')).join('');
+
+      comparisonGrid.innerHTML = [
+        ['Control', control],
+        ['Variant', variant]
+      ].map(([label, group]) => [
+        '<div class="stat">',
+        '<div class="label">' + label + '</div>',
+        '<div class="value">' + String(group.sessions || 0) + ' sessions</div>',
+        '<div class="muted" style="margin-top: 10px;">Revenue: ' + formatMoney(group.revenue || 0) + '</div>',
+        '<div class="muted">Purchases: ' + String(group.purchases || 0) + '</div>',
+        '<div class="muted">Conversion rate: ' + formatPercent(group.conversion_rate || 0) + '</div>',
+        '<div class="muted">Revenue / session: ' + formatMoney(group.revenue_per_session || 0) + '</div>',
+        '</div>'
+      ].join('')).join('');
+    }
+
     function renderRates(rates) {
       const grid = document.getElementById('rates-grid');
       if (!grid) return;
@@ -413,9 +469,13 @@ function buildOwnerAnalyticsPage() {
 
     function updateLinks() {
       const select = document.getElementById('store-select');
+      const exactDashboardLink = document.getElementById('exact-dashboard-link');
       const rawJsonLink = document.getElementById('raw-json-link');
       const rawEventsLink = document.getElementById('raw-events-link');
-      if (!select || !rawJsonLink || !rawEventsLink || !select.value) return;
+      if (!select || !exactDashboardLink || !rawJsonLink || !rawEventsLink || !select.value) return;
+
+      exactDashboardLink.href =
+        '/owner-dashboard?shop=' + encodeURIComponent(select.value);
 
       rawJsonLink.href =
         '/owner-analytics/raw/' + encodeURIComponent(select.value);
@@ -466,6 +526,7 @@ function buildOwnerAnalyticsPage() {
       const select = document.getElementById('store-select');
       if (!select || !select.value) {
         renderSummary({});
+        renderLift(null);
         renderRates([]);
         renderSessionTable([]);
         renderRawEvents([]);
@@ -475,13 +536,15 @@ function buildOwnerAnalyticsPage() {
       updateLinks();
       setStatus('Loading analytics...');
 
-      const [overview, sessions, events] = await Promise.all([
+      const [overview, metrics, sessions, events] = await Promise.all([
         fetchJson('/api/owner/analytics/overview/' + encodeURIComponent(select.value)),
+        fetchJson('/api/owner/metrics/' + encodeURIComponent(select.value)),
         fetchJson('/api/owner/session-cro/' + encodeURIComponent(select.value)),
         fetchJson('/api/owner/raw-events/' + encodeURIComponent(select.value))
       ]);
 
       renderSummary(overview.totals || {});
+      renderLift(metrics);
       renderRates(overview.conversion_rates || []);
       renderSessionTable(sessions.session_cro || []);
       renderRawEvents(events.raw_events || []);
@@ -574,6 +637,32 @@ export function registerOwnerAnalyticsRoutes({ app, supabase, ownerToken, analyt
       })
     } catch (error) {
       console.log('OWNER OVERVIEW ROUTE ERROR:', error)
+      return res.status(500).json({
+        success: false,
+        error: 'Internal server error'
+      })
+    }
+  })
+
+  app.get('/api/owner/metrics/:shop_domain', requireOwner, async (req, res) => {
+    try {
+      const shopDomain = req.params.shop_domain
+
+      if (!shopDomain) {
+        return res.status(400).json({
+          success: false,
+          error: 'shop_domain is required'
+        })
+      }
+
+      const overview = await getAnalyticsOverview({ shopDomain }, analyticsOptions)
+
+      return res.json({
+        success: true,
+        data: buildMetricsPayload(shopDomain, overview)
+      })
+    } catch (error) {
+      console.log('OWNER METRICS ROUTE ERROR:', error)
       return res.status(500).json({
         success: false,
         error: 'Internal server error'

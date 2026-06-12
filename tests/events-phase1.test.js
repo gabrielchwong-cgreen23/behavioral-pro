@@ -156,3 +156,48 @@ test('phase 1 payload validation rejects invalid event names and malformed metad
     /metadata must be an object/
   )
 })
+
+test('phase 1 payload validation accepts canonical session_frame telemetry', () => {
+  const payload = normalizePhase1EventPayload({
+    event_name: 'session_frame',
+    shop_domain: 'alpha.myshopify.com',
+    session_id: 'sess_frame',
+    visitor_id: 'visitor_frame',
+    experiment_variant: 'control',
+    page_url: 'https://alpha.myshopify.com/products/widget',
+    referrer: 'https://google.com/',
+    client_timestamp: '2026-05-19T12:00:01.000Z',
+    event_id: 'evt_session_frame',
+    metadata: {
+      page_type: 'product',
+      journey_stage: 'decision',
+      active_zone: 'add_to_cart_zone',
+      t_seconds: 4,
+      mouse_velocity_avg: 0.04,
+      mouse_velocity_max: 0.2,
+      mouse_acceleration_avg: 0.01,
+      mouse_distance: 44,
+      scroll_depth: 0.6,
+      scroll_velocity: 0.02,
+      cursor_idle_seconds: 0.4,
+      hover_cta_seconds: 1.2,
+      hover_price_seconds: 0.5,
+      hover_policy_seconds: 0.1,
+      hover_reviews_seconds: 0.3,
+      cta_distance: 88,
+      click_count: 1,
+      rage_click_count: 0,
+      dead_click_count: 0,
+      intent_score: 0.7,
+      friction_score: 0.2,
+      hesitation_score: 0.5,
+      policy_anxiety_score: 0.1,
+      cart_commitment_score: 0.65,
+      abandonment_risk_score: 0.25
+    }
+  })
+
+  assert.equal(payload.event_name, 'session_frame')
+  assert.equal(payload.metadata.active_zone, 'add_to_cart_zone')
+  assert.equal(payload.metadata.intent_score, 0.7)
+})

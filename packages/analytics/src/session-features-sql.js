@@ -40,13 +40,63 @@ export function buildSessionFeaturesBaseCte() {
             JSONExtractFloat(metadata, 'scroll_percent') / 100.0,
             NULL
           )
-        ) AS scroll_milestone
+        ) AS scroll_milestone,
+        if(
+          event_name = 'session_frame' AND notEmpty(ifNull(metadata, '')) AND isValidJSON(metadata),
+          JSONExtractFloat(metadata, 't_seconds'),
+          NULL
+        ) AS frame_t_seconds,
+        if(
+          event_name = 'session_frame' AND notEmpty(ifNull(metadata, '')) AND isValidJSON(metadata),
+          JSONExtractFloat(metadata, 'mouse_velocity_avg'),
+          NULL
+        ) AS frame_mouse_velocity_avg,
+        if(
+          event_name = 'session_frame' AND notEmpty(ifNull(metadata, '')) AND isValidJSON(metadata),
+          JSONExtractFloat(metadata, 'mouse_velocity_max'),
+          NULL
+        ) AS frame_mouse_velocity_max,
+        if(
+          event_name = 'session_frame' AND notEmpty(ifNull(metadata, '')) AND isValidJSON(metadata),
+          JSONExtractFloat(metadata, 'friction_score'),
+          NULL
+        ) AS frame_friction_score,
+        if(
+          event_name = 'session_frame' AND notEmpty(ifNull(metadata, '')) AND isValidJSON(metadata),
+          JSONExtractFloat(metadata, 'hesitation_score'),
+          NULL
+        ) AS frame_hesitation_score,
+        if(
+          event_name = 'session_frame' AND notEmpty(ifNull(metadata, '')) AND isValidJSON(metadata),
+          JSONExtractFloat(metadata, 'intent_score'),
+          NULL
+        ) AS frame_intent_score,
+        if(
+          event_name = 'session_frame' AND notEmpty(ifNull(metadata, '')) AND isValidJSON(metadata),
+          JSONExtractFloat(metadata, 'hover_cta_seconds'),
+          NULL
+        ) AS frame_hover_cta_seconds,
+        if(
+          event_name = 'session_frame' AND notEmpty(ifNull(metadata, '')) AND isValidJSON(metadata),
+          JSONExtractFloat(metadata, 'hover_price_seconds'),
+          NULL
+        ) AS frame_hover_price_seconds,
+        if(
+          event_name = 'session_frame' AND notEmpty(ifNull(metadata, '')) AND isValidJSON(metadata),
+          JSONExtractFloat(metadata, 'hover_policy_seconds'),
+          NULL
+        ) AS frame_hover_policy_seconds,
+        if(
+          event_name = 'session_frame' AND notEmpty(ifNull(metadata, '')) AND isValidJSON(metadata),
+          nullIf(JSONExtractString(metadata, 'journey_stage'), ''),
+          NULL
+        ) AS frame_journey_stage
       FROM raw_events
       WHERE notEmpty(ifNull(shop_domain, ''))
         AND notEmpty(ifNull(session_id, ''))
         AND coalesce(server_timestamp, client_timestamp) IS NOT NULL
     ),
-    deduped_events AS (
+    deduped_events_raw AS (
       SELECT
         argMax(store_id, tuple(notEmpty(ifNull(store_id, '')), event_ts)) AS store_id,
         argMax(shop_domain, tuple(notEmpty(ifNull(shop_domain, '')), event_ts)) AS shop_domain,
@@ -57,13 +107,23 @@ export function buildSessionFeaturesBaseCte() {
         argMax(referrer, tuple(notEmpty(ifNull(referrer, '')), event_ts)) AS referrer,
         event_id,
         argMax(event_name, event_ts) AS event_name,
-        max(event_ts) AS event_ts,
         max(client_timestamp) AS client_timestamp,
         max(server_timestamp) AS server_timestamp,
         argMax(metadata, event_ts) AS metadata,
         max(metadata_malformed) AS metadata_malformed,
         argMax(discount_status, tuple(notEmpty(ifNull(discount_status, '')), event_ts)) AS discount_status,
-        argMax(scroll_milestone, tuple(scroll_milestone IS NOT NULL, event_ts)) AS scroll_milestone
+        argMax(scroll_milestone, tuple(scroll_milestone IS NOT NULL, event_ts)) AS scroll_milestone,
+        argMax(frame_t_seconds, tuple(frame_t_seconds IS NOT NULL, event_ts)) AS frame_t_seconds,
+        argMax(frame_mouse_velocity_avg, tuple(frame_mouse_velocity_avg IS NOT NULL, event_ts)) AS frame_mouse_velocity_avg,
+        argMax(frame_mouse_velocity_max, tuple(frame_mouse_velocity_max IS NOT NULL, event_ts)) AS frame_mouse_velocity_max,
+        argMax(frame_friction_score, tuple(frame_friction_score IS NOT NULL, event_ts)) AS frame_friction_score,
+        argMax(frame_hesitation_score, tuple(frame_hesitation_score IS NOT NULL, event_ts)) AS frame_hesitation_score,
+        argMax(frame_intent_score, tuple(frame_intent_score IS NOT NULL, event_ts)) AS frame_intent_score,
+        argMax(frame_hover_cta_seconds, tuple(frame_hover_cta_seconds IS NOT NULL, event_ts)) AS frame_hover_cta_seconds,
+        argMax(frame_hover_price_seconds, tuple(frame_hover_price_seconds IS NOT NULL, event_ts)) AS frame_hover_price_seconds,
+        argMax(frame_hover_policy_seconds, tuple(frame_hover_policy_seconds IS NOT NULL, event_ts)) AS frame_hover_policy_seconds,
+        argMax(frame_journey_stage, tuple(notEmpty(ifNull(frame_journey_stage, '')), event_ts)) AS frame_journey_stage,
+        max(event_ts) AS latest_event_ts
       FROM raw_base
       WHERE notEmpty(ifNull(event_id, ''))
       GROUP BY event_id
@@ -80,15 +140,55 @@ export function buildSessionFeaturesBaseCte() {
         referrer,
         event_id,
         event_name,
-        event_ts,
         client_timestamp,
         server_timestamp,
         metadata,
         metadata_malformed,
         discount_status,
-        scroll_milestone
+        scroll_milestone,
+        frame_t_seconds,
+        frame_mouse_velocity_avg,
+        frame_mouse_velocity_max,
+        frame_friction_score,
+        frame_hesitation_score,
+        frame_intent_score,
+        frame_hover_cta_seconds,
+        frame_hover_price_seconds,
+        frame_hover_policy_seconds,
+        frame_journey_stage,
+        event_ts AS latest_event_ts
       FROM raw_base
       WHERE empty(ifNull(event_id, ''))
+    ),
+    deduped_events AS (
+      SELECT
+        store_id,
+        shop_domain,
+        session_id,
+        visitor_id,
+        experiment_variant,
+        page_url,
+        referrer,
+        event_id,
+        event_name,
+        latest_event_ts AS event_ts,
+        client_timestamp,
+        server_timestamp,
+        metadata,
+        metadata_malformed,
+        discount_status,
+        scroll_milestone,
+        frame_t_seconds,
+        frame_mouse_velocity_avg,
+        frame_mouse_velocity_max,
+        frame_friction_score,
+        frame_hesitation_score,
+        frame_intent_score,
+        frame_hover_cta_seconds,
+        frame_hover_price_seconds,
+        frame_hover_policy_seconds,
+        frame_journey_stage
+      FROM deduped_events_raw
     ),
     session_features AS (
       SELECT
@@ -133,6 +233,16 @@ export function buildSessionFeaturesBaseCte() {
         countIf(event_name = 'cta_idle_15s') AS cta_idle_15s_count,
         countIf(event_name = 'rage_click') AS rage_click_count,
         countIf(event_name = 'intervention_triggered') AS intervention_triggered_count,
+        avgIf(frame_mouse_velocity_avg, event_name = 'session_frame' AND frame_mouse_velocity_avg IS NOT NULL) AS average_mouse_velocity,
+        maxIf(frame_mouse_velocity_max, event_name = 'session_frame' AND frame_mouse_velocity_max IS NOT NULL) AS max_mouse_velocity,
+        maxIf(frame_friction_score, event_name = 'session_frame' AND frame_friction_score IS NOT NULL) AS max_friction_score,
+        maxIf(frame_hesitation_score, event_name = 'session_frame' AND frame_hesitation_score IS NOT NULL) AS max_hesitation_score,
+        maxIf(frame_intent_score, event_name = 'session_frame' AND frame_intent_score IS NOT NULL) AS max_intent_score,
+        argMax(frame_t_seconds, tuple(ifNull(frame_friction_score, -1), event_ts)) AS peak_friction_time_seconds,
+        sumIf(frame_hover_cta_seconds, event_name = 'session_frame' AND frame_hover_cta_seconds IS NOT NULL) AS hover_cta_total_seconds,
+        sumIf(frame_hover_price_seconds, event_name = 'session_frame' AND frame_hover_price_seconds IS NOT NULL) AS hover_price_total_seconds,
+        sumIf(frame_hover_policy_seconds, event_name = 'session_frame' AND frame_hover_policy_seconds IS NOT NULL) AS hover_policy_total_seconds,
+        argMax(frame_journey_stage, tuple(notEmpty(ifNull(frame_journey_stage, '')), event_ts)) AS final_stage_before_exit,
         sum(metadata_malformed) AS malformed_metadata_count
       FROM deduped_events
       GROUP BY shop_domain, session_id
@@ -201,6 +311,16 @@ export function buildSessionFeaturesSelectSql({
       cta_idle_15s_count,
       rage_click_count,
       intervention_triggered_count,
+      average_mouse_velocity,
+      max_mouse_velocity,
+      max_friction_score,
+      max_hesitation_score,
+      max_intent_score,
+      peak_friction_time_seconds,
+      hover_cta_total_seconds,
+      hover_price_total_seconds,
+      hover_policy_total_seconds,
+      final_stage_before_exit,
       begin_checkout_count > 0 AS reached_checkout,
       purchase_count > 0 AS purchased,
       intervention_triggered_count > 0 AS had_intervention,

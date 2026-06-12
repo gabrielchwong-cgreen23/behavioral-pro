@@ -6,9 +6,6 @@ embedded = true
 [build]
 automatically_update_urls_on_dev = true
 
-[access_scopes]
-scopes = "read_products"
-
 [auth]
 redirect_urls = [
   "https://behavioral-pro-production.up.railway.app/api/shopify/callback"
@@ -29,3 +26,5 @@ compliance_topics = ["customers/redact"]
 uri = "https://behavioral-pro-production.up.railway.app/webhooks/shop-redact"
 compliance_topics = ["shop/redact"]
 
+[access_scopes]
+scopes = "read_products"
