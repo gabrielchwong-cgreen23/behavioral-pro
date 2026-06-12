@@ -7,6 +7,10 @@ import {
   getInterventionMessageId
 } from '../../../../packages/analytics/src/intervention-decision.js'
 import {
+  getMdpInterventionDecision,
+  normalizeTrajectoryKey
+} from '../../../../packages/analytics/src/mdp-bandit.js'
+import {
   buildRateLimitKey,
   createInMemoryRateLimiter
 } from '../../../../packages/analytics/src/request-security.js'
@@ -33,7 +37,8 @@ type PerformanceQueueEntry = {
 const querySchema = z.object({
   store_id: z.string().min(1).max(128).optional(),
   shop_domain: z.string().includes('.myshopify.com'),
-  session_id: z.string().min(8).max(128)
+  session_id: z.string().min(8).max(128),
+  trajectory: z.string().max(128).optional()
 })
 const interventionDecisionLimiter = createInMemoryRateLimiter({
   windowMs: 60 * 1000,
@@ -295,7 +300,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const parsedQuery = querySchema.safeParse({
     store_id: request.nextUrl.searchParams.get('store_id') || undefined,
     shop_domain: request.nextUrl.searchParams.get('shop_domain'),
-    session_id: request.nextUrl.searchParams.get('session_id')
+    session_id: request.nextUrl.searchParams.get('session_id'),
+    trajectory: request.nextUrl.searchParams.get('trajectory') || undefined
   })
 
   if (!parsedQuery.success) {
@@ -321,7 +327,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const {
     store_id: requestedStoreId,
     shop_domain: shopDomain,
-    session_id: sessionId
+    session_id: sessionId,
+    trajectory
   } = parsedQuery.data
 
   const rateLimit = interventionDecisionLimiter.check(buildRateLimitKey([
@@ -404,15 +411,28 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     const storeRecord = supabase
       ? await lookupStoreRecord(supabase, shopDomain).catch(() => null)
       : null
-    const { result, resolvedStoreId } = await getInterventionDecision({
+    let decisionPayload = await getMdpInterventionDecision({
       shopDomain,
       sessionId,
+      trajectoryKey: normalizeTrajectoryKey(trajectory),
       requestedStoreId,
       storeRecord,
-      supabase,
-      env: process.env,
-      decisionTiming
+      supabase
     })
+
+    if (!decisionPayload?.result?.decision) {
+      decisionPayload = await getInterventionDecision({
+        shopDomain,
+        sessionId,
+        requestedStoreId,
+        storeRecord,
+        supabase,
+        env: process.env,
+        decisionTiming
+      })
+    }
+
+    const { result, resolvedStoreId } = decisionPayload
     const decisionEndedAtMs = Date.now()
 
     await enqueueInterventionDecisionPerformanceLog({

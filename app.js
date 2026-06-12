@@ -48,6 +48,14 @@ import {
   buildSessionFrameSignalUpdates,
   sanitizeSessionFrameMetadata
 } from './packages/analytics/src/session-frame.js'
+import {
+  buildTinybirdTrajectoryWatchdogSql,
+  detectTrajectoryAnomalies,
+  getMdpInterventionDecision,
+  normalizeTrajectoryKey,
+  reconcilePendingBanditFailures,
+  recordBanditReward
+} from './packages/analytics/src/mdp-bandit.js'
 import { registerOwnerAnalyticsRoutes } from './packages/owner-analytics/src/index.js'
 
 const DEFAULT_PORT = 3001
@@ -55,6 +63,10 @@ const SIGNATURE_HEADER = 'x-behavioralpro-signature'
 const TIMESTAMP_HEADER = 'x-behavioralpro-timestamp'
 const SIGNATURE_TTL_MS = 5 * 60 * 1000
 const EVENT_DEDUPE_TTL_MS = 15 * 60 * 1000
+const DEFAULT_TRAJECTORY_KEY = 'B'
+const CART_ATTRIBUTE_SESSION_KEY = 'behavioral_pro_session_id'
+const CART_ATTRIBUTE_VARIANT_KEY = 'behavioral_pro_variant_id'
+const CART_ATTRIBUTE_TRAJECTORY_KEY = 'behavioral_pro_trajectory'
 const recentEventIds = new Map()
 const eventIngestLimiter = createInMemoryRateLimiter({
   windowMs: 60 * 1000,
@@ -84,6 +96,73 @@ export function normalizeShop(shop) {
 
 export function getShopDomainFromRequestBody(body = {}) {
   return normalizeShop(body?.shop_domain || body?.properties?.shop_domain)
+}
+
+function getTrajectoryKeyFromInput(input = {}) {
+  return normalizeTrajectoryKey(
+    input?.trajectory ||
+    input?.trajectory_key ||
+    input?.session_trajectory ||
+    DEFAULT_TRAJECTORY_KEY
+  )
+}
+
+function normalizeNoteAttributes(input) {
+  if (!Array.isArray(input)) {
+    return {}
+  }
+
+  return input.reduce((attributes, entry) => {
+    const key = entry?.name || entry?.key
+    if (!key) return attributes
+    attributes[String(key)] = entry?.value == null ? '' : String(entry.value)
+    return attributes
+  }, {})
+}
+
+async function postTrajectoryOwnerAlert({
+  env,
+  fetchImpl = globalThis.fetch,
+  supabase,
+  shopDomain,
+  trajectoryKey,
+  consecutiveFailures
+}) {
+  if (typeof fetchImpl !== 'function') {
+    return { delivered: false, reason: 'missing_fetch' }
+  }
+
+  const storeRecord = await lookupStoreRecord(supabase, shopDomain).catch(() => null)
+  const webhookUrl = String(
+    storeRecord?.settings?.owner_alert_webhook_url ||
+    storeRecord?.owner_alert_webhook_url ||
+    env.BEHAVIORALPRO_OWNER_ALERT_WEBHOOK_URL ||
+    ''
+  ).trim()
+
+  if (!webhookUrl) {
+    return { delivered: false, reason: 'missing_webhook_url' }
+  }
+
+  const response = await fetchImpl(webhookUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      shop_domain: shopDomain,
+      trajectory_key: trajectoryKey,
+      consecutive_failures: consecutiveFailures,
+      zero_conversions: true,
+      detected_at: new Date().toISOString(),
+      source: 'behavioralpro_trajectory_watchdog'
+    })
+  })
+
+  return {
+    delivered: response.ok,
+    status: response.status
+  }
 }
 
 function escapeHtml(value) {
@@ -782,6 +861,57 @@ async function forwardEventToTinybird({
     ok: true,
     status: response.status,
     body: text
+  }
+}
+
+async function forwardTrajectorySessionToTinybird({
+  shopDomain,
+  sessionId,
+  trajectoryKey,
+  variantId,
+  converted,
+  metadata = {},
+  eventTimestamp,
+  env = process.env,
+  fetchImpl = globalThis.fetch
+}) {
+  if (typeof fetchImpl !== 'function') {
+    throw new Error('Global fetch is unavailable for Tinybird forwarding')
+  }
+
+  const tinybirdToken = getTinybirdIngestToken(env)
+  if (!tinybirdToken) {
+    throw new Error('Missing Tinybird ingest token')
+  }
+
+  const datasource = env.TINYBIRD_TRAJECTORY_SESSIONS_DATASOURCE || 'trajectory_sessions'
+  const branch = env.TINYBIRD_BRANCH ? `&branch=${encodeURIComponent(env.TINYBIRD_BRANCH)}` : ''
+  const ingestUrl = `${getTinybirdHost(env)}/v0/events?name=${encodeURIComponent(datasource)}${branch}`
+  const response = await fetchImpl(ingestUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${tinybirdToken}`,
+      'Content-Type': 'application/x-ndjson'
+    },
+    body: `${JSON.stringify({
+      shop_domain: shopDomain,
+      session_id: sessionId,
+      trajectory_key: normalizeTrajectoryKey(trajectoryKey),
+      variant_id: variantId || '',
+      converted: converted ? 1 : 0,
+      event_ts: eventTimestamp,
+      metadata: JSON.stringify(metadata || {})
+    })}\n`
+  })
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '')
+    throw new Error(`Tinybird trajectory ingest failed with status ${response.status}: ${text}`)
+  }
+
+  return {
+    ok: true,
+    status: response.status
   }
 }
 
@@ -2545,12 +2675,18 @@ export function createApp({
         auth_mode: req.ingestAuth?.mode
       }))
 
-      const [sessionResult, storeRecord] = await Promise.all([
+      const [sessionResult, mdpSessionResult, storeRecord] = await Promise.all([
         supabase
           .from('experiment_sessions')
           .select('*')
           .eq('shop_domain', shop_domain)
           .eq('session_id', session_id),
+        supabase
+          .from('storefront_intervention_sessions')
+          .select('*')
+          .eq('shop_domain', shop_domain)
+          .eq('session_id', session_id)
+          .maybeSingle(),
         lookupStoreRecord(supabase, shop_domain).catch((error) => {
           console.log('EVENT STORE LOOKUP ERROR:', error)
           return null
@@ -2558,13 +2694,14 @@ export function createApp({
       ])
 
       const { data: sessionRows, error: sessionError } = sessionResult
+      const { data: mdpAssignment, error: mdpAssignmentError } = mdpSessionResult
 
-      if (sessionError) {
+      if (sessionError || mdpAssignmentError) {
         console.log('SESSION LOOKUP ERROR:', sessionError)
         return sendSafeServerError(res)
       }
 
-      if (!sessionRows?.[0]) {
+      if (!sessionRows?.[0] && !mdpAssignment) {
         console.log('EVENT REJECTED: session not assigned')
         return res.status(400).json({
           success: false,
@@ -2588,7 +2725,11 @@ export function createApp({
           shop_domain,
           session_id,
           visitor_id: anonymous_id,
-          experiment_variant: req.body?.experiment_variant || sessionRows[0].variant,
+          experiment_variant:
+            req.body?.experiment_variant ||
+            sessionRows?.[0]?.variant ||
+            mdpAssignment?.variant_id ||
+            'mdp_unassigned',
           page_url,
           referrer: validatedReferrer || req.get('referer') || null,
           client_timestamp,
@@ -2630,12 +2771,35 @@ export function createApp({
         env,
         fetchImpl
       })
+      if (event_name === 'session_ended' && eventRecord.metadata?.trajectory_key) {
+        await forwardTrajectorySessionToTinybird({
+          shopDomain: shop_domain,
+          sessionId: session_id,
+          trajectoryKey: eventRecord.metadata.trajectory_key,
+          variantId: eventRecord.metadata.variant_id || sessionRows[0].variant || '',
+          converted: Number(eventRecord.metadata.converted || 0) > 0,
+          metadata: {
+            source: eventRecord.metadata.source || 'session_ended_event',
+            page_url
+          },
+          eventTimestamp: client_timestamp,
+          env,
+          fetchImpl
+        }).catch((error) => {
+          console.log('TRAJECTORY SESSION TINYBIRD FORWARD ERROR:', error)
+          return null
+        })
+      }
       await upsertSessionStateCounters(supabase, {
         shopDomain: shop_domain,
         sessionId: session_id,
         storeId: resolvedStoreId || '',
         visitorId: anonymous_id,
-        experimentVariant: req.body?.experiment_variant || sessionRows[0].variant,
+        experimentVariant:
+          req.body?.experiment_variant ||
+          sessionRows?.[0]?.variant ||
+          mdpAssignment?.variant_id ||
+          'mdp_unassigned',
         pageUrl: page_url,
         referrer: validatedReferrer || req.get('referer') || null,
         seenAt: server_timestamp,
@@ -2724,6 +2888,7 @@ export function createApp({
     }
 
     const { shopDomain, sessionId, storeId: requestedStoreId } = validation.value
+    const trajectoryKey = getTrajectoryKeyFromInput(input)
     const rateLimit = interventionDecisionLimiter.check(buildRateLimitKey([
       'intervention-decision',
       getClientIp(req),
@@ -2782,20 +2947,33 @@ export function createApp({
         return null
       })
 
+      let decisionPayload = await getMdpInterventionDecision({
+        shopDomain,
+        sessionId,
+        trajectoryKey,
+        requestedStoreId: requestedStoreId || '',
+        storeRecord,
+        supabase
+      })
+
+      if (!decisionPayload?.result?.decision) {
+        decisionPayload = await getInterventionDecision({
+          shopDomain,
+          sessionId,
+          requestedStoreId: requestedStoreId || '',
+          storeRecord,
+          supabase,
+          env,
+          fetchImpl,
+          decisionTiming
+        })
+      }
+
       const {
         session,
         result,
         resolvedStoreId
-      } = await getInterventionDecision({
-        shopDomain,
-        sessionId,
-        requestedStoreId: requestedStoreId || '',
-        storeRecord,
-        supabase,
-        env,
-        fetchImpl,
-        decisionTiming
-      })
+      } = decisionPayload
       const decisionEndedAtMs = Date.now()
 
       logShadowInterventionDecision({
@@ -3335,6 +3513,96 @@ export function createApp({
     }
 
     return res.redirect(`/dashboard?${qs.toString()}`)
+  })
+
+  app.post('/api/internal/trajectory-watchdog', requireOwnerAccess, async (_req, res) => {
+    try {
+      await reconcilePendingBanditFailures(supabase, {
+        olderThanMs: Number(env.BEHAVIORALPRO_PENDING_FAILURE_MS || 4 * 60 * 60 * 1000)
+      })
+
+      let alerts = []
+      try {
+        const tinybirdResult = await queryTinybirdSql({
+          env,
+          fetchImpl,
+          logLabel: 'TRAJECTORY WATCHDOG',
+          sql: buildTinybirdTrajectoryWatchdogSql({
+            windowMinutes: Number(env.BEHAVIORALPRO_TRAJECTORY_WATCHDOG_WINDOW_MINUTES || 15),
+            minimumSessions: Number(env.BEHAVIORALPRO_TRAJECTORY_WATCHDOG_MIN_SESSIONS || 100)
+          })
+        })
+        alerts = Array.isArray(tinybirdResult.data) ? tinybirdResult.data : []
+      } catch (error) {
+        console.log('TRAJECTORY WATCHDOG TINYBIRD FALLBACK:', error.message || error)
+        alerts = await detectTrajectoryAnomalies(supabase, {
+          minimumConsecutiveFailures: Number(
+            env.BEHAVIORALPRO_TRAJECTORY_WATCHDOG_MIN_SESSIONS || 100
+          )
+        })
+      }
+
+      const deliveries = []
+      for (const alert of alerts) {
+        deliveries.push(await postTrajectoryOwnerAlert({
+          env,
+          fetchImpl,
+          supabase,
+          shopDomain: alert.shop_domain,
+          trajectoryKey: normalizeTrajectoryKey(alert.trajectory_key),
+          consecutiveFailures: Number(alert.consecutive_failures || alert.failures || alert.sessions || 0)
+        }))
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          alerts,
+          deliveries
+        }
+      })
+    } catch (error) {
+      console.log('TRAJECTORY WATCHDOG ROUTE ERROR:', error)
+      return sendSafeServerError(res)
+    }
+  })
+
+  app.post('/webhooks/orders/create', async (req, res) => {
+    if (!verifyWebhookRequest(req)) {
+      return res.status(401).send('Invalid webhook signature')
+    }
+
+    try {
+      const shopDomain = normalizeShop(req.get('X-Shopify-Shop-Domain') || req.body?.shop_domain)
+      const attributes = normalizeNoteAttributes(req.body?.note_attributes)
+      const sessionId = String(attributes[CART_ATTRIBUTE_SESSION_KEY] || '').trim()
+      const variantId = String(attributes[CART_ATTRIBUTE_VARIANT_KEY] || '').trim()
+      const trajectoryKey = getTrajectoryKeyFromInput({
+        trajectory: attributes[CART_ATTRIBUTE_TRAJECTORY_KEY]
+      })
+
+      if (!shopDomain || !sessionId || !variantId) {
+        return res.status(200).send('ok')
+      }
+
+      const reward = await recordBanditReward(supabase, {
+        shopDomain,
+        sessionId,
+        variantId,
+        trajectoryKey,
+        orderId: String(req.body?.id || '').trim(),
+        wasSuccess: true,
+        rewardSource: 'shopify_orders_create'
+      })
+
+      return res.status(200).json({
+        success: true,
+        data: reward
+      })
+    } catch (error) {
+      console.log('WEBHOOK orders/create ERROR:', error)
+      return sendSafeServerError(res)
+    }
   })
 
   app.post('/webhooks/customers-data-request', (req, res) => {

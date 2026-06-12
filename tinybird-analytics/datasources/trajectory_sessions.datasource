@@ -1,0 +1,13 @@
+TOKEN trajectory_sessions_append APPEND
+
+SCHEMA >
+    `shop_domain` LowCardinality(String) `json:$.shop_domain`,
+    `session_id` String `json:$.session_id`,
+    `trajectory_key` String `json:$.trajectory_key`,
+    `variant_id` String `json:$.variant_id`,
+    `converted` UInt8 `json:$.converted`,
+    `event_ts` DateTime64(3) `json:$.event_ts`,
+    `metadata` String `json:$.metadata`
+
+ENGINE "MergeTree"
+ENGINE_SORTING_KEY "shop_domain, trajectory_key, event_ts, session_id"

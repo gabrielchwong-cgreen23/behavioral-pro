@@ -1,0 +1,16 @@
+NODE trajectory_zero_conversion_watchdog
+SQL >
+    SELECT
+        shop_domain,
+        trajectory_key,
+        count() AS sessions,
+        countIf(converted = 1) AS conversions,
+        countIf(converted = 0) AS failures
+    FROM trajectory_sessions
+    WHERE event_ts >= now() - INTERVAL 15 MINUTE
+    GROUP BY shop_domain, trajectory_key
+    HAVING sessions >= 100
+       AND conversions = 0
+    ORDER BY failures DESC, shop_domain ASC, trajectory_key ASC
+
+TYPE ENDPOINT

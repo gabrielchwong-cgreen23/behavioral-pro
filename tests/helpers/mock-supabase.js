@@ -129,7 +129,10 @@ class MockSupabaseStore {
       store_benchmarks: clone(seed.store_benchmarks || []),
       experiment_sessions: clone(seed.experiment_sessions || []),
       events: clone(seed.events || []),
-      session_state: clone(seed.session_state || [])
+      session_state: clone(seed.session_state || []),
+      storefront_intervention_variants: clone(seed.storefront_intervention_variants || []),
+      storefront_trajectory_bandit_state: clone(seed.storefront_trajectory_bandit_state || []),
+      storefront_intervention_sessions: clone(seed.storefront_intervention_sessions || [])
     }
     this.nextIds = {
       stores: this.getNextId('stores'),
@@ -137,7 +140,10 @@ class MockSupabaseStore {
       store_benchmarks: this.getNextId('store_benchmarks'),
       experiment_sessions: this.getNextId('experiment_sessions'),
       events: this.getNextId('events'),
-      session_state: this.getNextId('session_state')
+      session_state: this.getNextId('session_state'),
+      storefront_intervention_variants: this.getNextId('storefront_intervention_variants'),
+      storefront_trajectory_bandit_state: this.getNextId('storefront_trajectory_bandit_state'),
+      storefront_intervention_sessions: this.getNextId('storefront_intervention_sessions')
     }
   }
 
@@ -161,7 +167,13 @@ class MockSupabaseStore {
       return this.insert(table, row)
     }
 
-    const index = this.tables[table].findIndex(existing => existing[conflictColumn] === row[conflictColumn])
+    const conflictColumns = String(conflictColumn)
+      .split(',')
+      .map(value => value.trim())
+      .filter(Boolean)
+    const index = this.tables[table].findIndex(existing =>
+      conflictColumns.every(column => existing[column] === row[column])
+    )
     if (index === -1) {
       return this.insert(table, row)
     }

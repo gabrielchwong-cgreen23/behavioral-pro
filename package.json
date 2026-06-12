@@ -18,7 +18,8 @@
     "check:session-features": "node scripts/check-session-features.js",
     "validate:session-features": "node scripts/validate-session-features.js",
     "validate:live-intervention": "node scripts/validate-live-intervention.js",
-    "optimize:correlations": "node packages/analytics/src/workers/correlation-optimizer.js"
+    "optimize:correlations": "node packages/analytics/src/workers/correlation-optimizer.js",
+    "watchdog:trajectories": "node scripts/run-trajectory-watchdog.js"
  
   },
   "dependencies": {
