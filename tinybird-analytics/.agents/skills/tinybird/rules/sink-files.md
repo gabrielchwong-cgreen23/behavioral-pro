@@ -6,6 +6,7 @@
 - Sink pipes depend on a connection; reuse existing connections when possible.
 - Do not include EXPORT_SCHEDULE unless explicitly requested.
 - Use TYPE SINK and set EXPORT_CONNECTION_NAME.
+- Optional export fields such as `EXPORT_SCHEDULE` should only appear in examples when the request explicitly asks for scheduled exports.
 
 Example:
 
@@ -25,7 +26,6 @@ TYPE sink
 EXPORT_CONNECTION_NAME "my_connection"
 EXPORT_BUCKET_URI "s3://tinybird-sinks"
 EXPORT_FILE_TEMPLATE "daily_prices"
-EXPORT_SCHEDULE "*/5 * * * *"
 EXPORT_FORMAT "csv"
 EXPORT_COMPRESSION "gz"
 EXPORT_STRATEGY "truncate"

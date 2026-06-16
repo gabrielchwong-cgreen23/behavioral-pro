@@ -2,6 +2,7 @@ const DEFAULT_TRAJECTORY_KEY = 'B'
 const DEFAULT_COHORT_KEY = 'mdp_default'
 const DEFAULT_STATE_WINDOW = 48
 const DEFAULT_POSTERIOR_FLOOR = 0.001
+const CONTROL_ONLY_BENCHMARKING_WINDOW_MS = 48 * 60 * 60 * 1000
 const TERMINAL_REWARD_STATUSES = new Set(['success', 'failure'])
 const VALID_TRAJECTORY_CODES = new Set(['B', 'H', 'I', 'C', 'A', 'P', 'K', 'R'])
 
@@ -14,6 +15,21 @@ function normalizeOptionalString(value) {
   if (value == null) return null
   const normalized = String(value).trim()
   return normalized || null
+}
+
+function normalizeBoolean(value, fallback = false) {
+  if (value == null) return fallback
+  if (typeof value === 'boolean') return value
+  const normalized = String(value).trim().toLowerCase()
+  if (normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on') return true
+  if (normalized === 'false' || normalized === '0' || normalized === 'no' || normalized === 'off') return false
+  return fallback
+}
+
+function normalizeTimestampMs(value) {
+  if (!value) return null
+  const timestampMs = new Date(value).getTime()
+  return Number.isFinite(timestampMs) ? timestampMs : null
 }
 
 function normalizeStateCode(value) {
@@ -131,12 +147,37 @@ function normalizeVariantRow(row = {}) {
     message_id: normalizeOptionalString(row.message_id),
     payload: row.payload && typeof row.payload === 'object' ? row.payload : {},
     is_active: row.is_active !== false,
+    is_control: normalizeBoolean(row.is_control, false),
     priority: Math.trunc(toNumber(row.priority, 0)),
     prior_alpha: Math.max(DEFAULT_POSTERIOR_FLOOR, toNumber(row.prior_alpha, 1)),
     prior_beta: Math.max(DEFAULT_POSTERIOR_FLOOR, toNumber(row.prior_beta, 1)),
     alpha: Math.max(DEFAULT_POSTERIOR_FLOOR, toNumber(row.alpha, 1)),
     beta: Math.max(DEFAULT_POSTERIOR_FLOOR, toNumber(row.beta, 1))
   }
+}
+
+function isControlVariant(variant) {
+  return variant?.is_control === true || variant?.variant_key === 'control'
+}
+
+export function isControlOnlyBenchmarkingActive(storeRecord = {}) {
+  const storeConfig = storeRecord?.store_config || storeRecord?.settings || {}
+  const forceControlOnly = normalizeBoolean(
+    storeConfig?.mdp_force_control_only ??
+    storeRecord?.mdp_force_control_only,
+    false
+  )
+
+  if (forceControlOnly) {
+    return true
+  }
+
+  const installedAtMs = normalizeTimestampMs(storeRecord?.installed_at)
+  if (installedAtMs == null) {
+    return false
+  }
+
+  return (Date.now() - installedAtMs) < CONTROL_ONLY_BENCHMARKING_WINDOW_MS
 }
 
 function normalizePosteriorRow(row = {}) {
@@ -152,7 +193,8 @@ function normalizePosteriorRow(row = {}) {
 export async function fetchActiveVariants(supabase, {
   shopDomain,
   storeId = '',
-  cohortKey = DEFAULT_COHORT_KEY
+  cohortKey = DEFAULT_COHORT_KEY,
+  controlOnly = false
 }) {
   const { data, error } = await supabase
     .from('storefront_intervention_variants')
@@ -174,6 +216,10 @@ export async function fetchActiveVariants(supabase, {
         return false
       }
       return Boolean(variant.id)
+    })
+    .filter((variant) => {
+      if (!controlOnly) return true
+      return isControlVariant(variant)
     })
     .sort((left, right) => (
       right.priority - left.priority ||
@@ -277,7 +323,9 @@ export async function assignBanditSession(supabase, {
 function buildDecisionResult(variant, {
   sessionId,
   trajectoryKey,
-  cohortKey
+  cohortKey,
+  strategy = 'trajectory_thompson_sampling',
+  reason = 'mdp_variant_selected'
 }) {
   if (!variant?.id) {
     return {
@@ -296,7 +344,7 @@ function buildDecisionResult(variant, {
 
   return {
     decision: true,
-    strategy: 'trajectory_thompson_sampling',
+    strategy,
     shadow_mode: false,
     intervention_type: variant.intervention_type,
     message_id: variant.message_id || `mdp_${variant.variant_key}`,
@@ -306,7 +354,7 @@ function buildDecisionResult(variant, {
     trajectory_key: normalizeTrajectoryKey(trajectoryKey),
     payload: variant.payload,
     metadata: {
-      reason: 'mdp_variant_selected',
+      reason,
       calculated_threshold: Number(variant.sampledScore.toFixed(6)),
       cohort_key: cohortKey,
       variant_key: variant.variant_key,
@@ -326,6 +374,7 @@ export async function getMdpInterventionDecision({
 }) {
   const cohortKey = resolveMdpCohortKey(storeRecord, requestedStoreId)
   const normalizedTrajectoryKey = normalizeTrajectoryKey(trajectoryKey)
+  const controlOnlyBenchmarking = isControlOnlyBenchmarkingActive(storeRecord)
 
   if (!supabase) {
     return {
@@ -342,7 +391,8 @@ export async function getMdpInterventionDecision({
   const variants = await fetchActiveVariants(supabase, {
     shopDomain,
     storeId: requestedStoreId || storeRecord?.store_id || '',
-    cohortKey
+    cohortKey,
+    controlOnly: controlOnlyBenchmarking
   })
 
   if (variants.length === 0) {
@@ -357,19 +407,22 @@ export async function getMdpInterventionDecision({
     }
   }
 
-  const posteriorRows = await fetchTrajectoryBanditState(supabase, {
-    shopDomain,
-    cohortKey,
-    trajectoryKey: normalizedTrajectoryKey
-  })
-
-  const winner = selectVariantWithThompsonSampling({
-    variants,
-    posteriorRows,
-    shopDomain,
-    sessionId,
-    trajectoryKey: normalizedTrajectoryKey
-  })
+  const winner = controlOnlyBenchmarking
+    ? {
+        ...normalizeVariantRow(variants[0]),
+        sampledScore: 1
+      }
+    : selectVariantWithThompsonSampling({
+        variants,
+        posteriorRows: await fetchTrajectoryBanditState(supabase, {
+          shopDomain,
+          cohortKey,
+          trajectoryKey: normalizedTrajectoryKey
+        }),
+        shopDomain,
+        sessionId,
+        trajectoryKey: normalizedTrajectoryKey
+      })
 
   const assignment = await assignBanditSession(supabase, {
     shopDomain,
@@ -380,7 +433,9 @@ export async function getMdpInterventionDecision({
     variant: winner,
     metadata: {
       variant_key: winner?.variant_key || null,
-      selection_strategy: 'trajectory_thompson_sampling'
+      selection_strategy: controlOnlyBenchmarking
+        ? 'control_only_benchmarking'
+        : 'trajectory_thompson_sampling'
     }
   })
 
@@ -390,7 +445,13 @@ export async function getMdpInterventionDecision({
     result: buildDecisionResult(winner, {
       sessionId,
       trajectoryKey: normalizedTrajectoryKey,
-      cohortKey
+      cohortKey,
+      strategy: controlOnlyBenchmarking
+        ? 'control_only_benchmarking'
+        : 'trajectory_thompson_sampling',
+      reason: controlOnlyBenchmarking
+        ? 'control_only_benchmarking_active'
+        : 'mdp_variant_selected'
     })
   }
 }

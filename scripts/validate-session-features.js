@@ -10,8 +10,10 @@ import { buildSessionFeaturesSelectSql } from '../packages/analytics/src/session
 
 const BACKEND_BASE = process.env.BEHAVIORALPRO_BACKEND_BASE || 'http://127.0.0.1:3001'
 const SHOP_DOMAIN = process.env.BEHAVIORALPRO_SHOP_DOMAIN || 'phase2-validation.myshopify.com'
-const POLL_TIMEOUT_MS = Number(process.env.BEHAVIORALPRO_VALIDATION_TIMEOUT_MS || 90000)
-const POLL_INTERVAL_MS = Number(process.env.BEHAVIORALPRO_VALIDATION_POLL_MS || 4000)
+const parsedPollTimeoutMs = parseInt(process.env.BEHAVIORALPRO_VALIDATION_TIMEOUT_MS || '90000', 10)
+const parsedPollIntervalMs = parseInt(process.env.BEHAVIORALPRO_VALIDATION_POLL_MS || '4000', 10)
+const POLL_TIMEOUT_MS = Number.isNaN(parsedPollTimeoutMs) ? 90000 : parsedPollTimeoutMs
+const POLL_INTERVAL_MS = Number.isNaN(parsedPollIntervalMs) ? 4000 : parsedPollIntervalMs
 
 function requireTinybirdEnv() {
   if (!getTinybirdQueryToken(process.env)) {

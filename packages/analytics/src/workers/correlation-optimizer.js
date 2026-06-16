@@ -360,47 +360,51 @@ export async function runCorrelationOptimizer({
   for (const store of candidateStores) {
     const shopDomain = String(store.shop_domain || '').trim()
     const storeLabel = `${String(store.id || 'unknown_store_id')}::${shopDomain}`
-    const rows = await fetchStoreCorrelationRows({
-      shopDomain,
-      env,
-      fetchImpl
-    })
-    const optimized = optimizeDynamicMultipliersFromRows(rows, {
-      baseline: BASELINE_DYNAMIC_MULTIPLIERS,
-      minSessions,
-      logger,
-      storeLabel
-    })
-    const nextSettings = {
-      ...(store.settings && typeof store.settings === 'object' ? store.settings : {}),
-      dynamic_multipliers: optimized.dynamic_multipliers
-    }
+    try {
+      const rows = await fetchStoreCorrelationRows({
+        shopDomain,
+        env,
+        fetchImpl
+      })
+      const optimized = optimizeDynamicMultipliersFromRows(rows, {
+        baseline: BASELINE_DYNAMIC_MULTIPLIERS,
+        minSessions,
+        logger,
+        storeLabel
+      })
+      const nextSettings = {
+        ...(store.settings && typeof store.settings === 'object' ? store.settings : {}),
+        dynamic_multipliers: optimized.dynamic_multipliers
+      }
 
-    const { error: upsertError } = await supabaseClient
-      .from('stores')
-      .upsert([{
+      const { error: updateError } = await supabaseClient
+        .from('stores')
+        .update({ settings: nextSettings })
+        .eq('shop_domain', shopDomain)
+
+      if (updateError) {
+        throw new Error(`Failed to persist dynamic multipliers for ${shopDomain}: ${updateError.message || updateError}`)
+      }
+
+      results.push({
+        store_id: store.id || '',
         shop_domain: shopDomain,
-        settings: nextSettings
-      }], { onConflict: 'shop_domain' })
+        session_count: optimized.session_count,
+        used_baseline: optimized.used_baseline,
+        dynamic_multipliers: optimized.dynamic_multipliers,
+        correlations: optimized.correlations
+      })
 
-    if (upsertError) {
-      throw new Error(`Failed to persist dynamic multipliers for ${shopDomain}: ${upsertError.message || upsertError}`)
+      logWithLevel(logger, 'info', `CORRELATION OPTIMIZER STORE UPDATED: ${storeLabel}`, {
+        session_count: optimized.session_count,
+        used_baseline: optimized.used_baseline,
+        dynamic_multipliers: optimized.dynamic_multipliers
+      })
+    } catch (error) {
+      logWithLevel(logger, 'error', `CORRELATION OPTIMIZER STORE FAILED: ${storeLabel}`, {
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
-
-    results.push({
-      store_id: store.id || '',
-      shop_domain: shopDomain,
-      session_count: optimized.session_count,
-      used_baseline: optimized.used_baseline,
-      dynamic_multipliers: optimized.dynamic_multipliers,
-      correlations: optimized.correlations
-    })
-
-    logWithLevel(logger, 'info', `CORRELATION OPTIMIZER STORE UPDATED: ${storeLabel}`, {
-      session_count: optimized.session_count,
-      used_baseline: optimized.used_baseline,
-      dynamic_multipliers: optimized.dynamic_multipliers
-    })
   }
 
   return results

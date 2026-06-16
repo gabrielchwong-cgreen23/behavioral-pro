@@ -126,7 +126,15 @@ export function sanitizeSessionFrameMetadata(input = {}) {
   }
 
   for (const [field, config] of Object.entries(SESSION_FRAME_NUMBER_FIELDS)) {
-    if (input[field] == null && field !== 't_seconds') {
+    if (field === 't_seconds') {
+      if (input[field] == null) {
+        throw new Error('session_frame.t_seconds is required')
+      }
+      next[field] = clampNumber(input[field], config)
+      continue
+    }
+
+    if (input[field] == null) {
       next[field] = 0
       continue
     }

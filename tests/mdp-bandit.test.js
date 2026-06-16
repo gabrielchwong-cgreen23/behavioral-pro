@@ -119,6 +119,75 @@ test('getMdpInterventionDecision assigns a trajectory-aware variant session', as
   )
 })
 
+test('control-only benchmarking phase serves the control variant and still records trajectory rewards', async () => {
+  const supabase = createMockSupabase({
+    storefront_intervention_variants: [
+      {
+        id: 'variant_control',
+        shop_domain: 'alpha.myshopify.com',
+        cohort_key: 'mdp_default',
+        variant_key: 'control',
+        variant_label: 'Control',
+        is_control: true,
+        is_active: true,
+        alpha: 1,
+        beta: 1,
+        prior_alpha: 1,
+        prior_beta: 1,
+        priority: 0
+      },
+      {
+        id: 'variant_social_proof',
+        shop_domain: 'alpha.myshopify.com',
+        cohort_key: 'mdp_default',
+        variant_key: 'social_proof',
+        variant_label: 'Social proof',
+        is_active: true,
+        alpha: 20,
+        beta: 1,
+        prior_alpha: 1,
+        prior_beta: 1,
+        priority: 10
+      }
+    ]
+  })
+
+  const { result } = await getMdpInterventionDecision({
+    shopDomain: 'alpha.myshopify.com',
+    sessionId: 'sess_control_phase',
+    trajectoryKey: 'BHIC',
+    storeRecord: {
+      installed_at: new Date().toISOString(),
+      settings: {}
+    },
+    supabase
+  })
+
+  assert.equal(result.decision, true)
+  assert.equal(result.strategy, 'control_only_benchmarking')
+  assert.equal(result.variant_id, 'variant_control')
+
+  const reward = await recordBanditReward(supabase, {
+    shopDomain: 'alpha.myshopify.com',
+    sessionId: 'sess_control_phase',
+    variantId: 'variant_control',
+    trajectoryKey: 'BHIC',
+    wasSuccess: true,
+    rewardSource: 'test'
+  })
+
+  assert.equal(reward.applied, true)
+  assert.equal(supabase._store.tables.storefront_trajectory_bandit_state.length, 1)
+  assert.equal(
+    supabase._store.tables.storefront_trajectory_bandit_state[0].trajectory_key,
+    'BHIC'
+  )
+  assert.equal(
+    supabase._store.tables.storefront_trajectory_bandit_state[0].variant_id,
+    'variant_control'
+  )
+})
+
 test('recordBanditReward increments alpha on a successful conversion', async () => {
   const supabase = createMockSupabase({
     storefront_intervention_variants: [

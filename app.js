@@ -533,6 +533,7 @@ const DEFAULT_STORE_CONFIG = {
   tidio_enabled: true,
   session_frame_telemetry_enabled: true,
   shadow_mode: false,
+  mdp_force_control_only: false,
   tidio_project_id: '63hgfq26munthk1pfvmvz25ryddkjgsf',
   aov_cohort: 'mid_tier',
   cooldown_seconds: 300,
@@ -600,6 +601,10 @@ function normalizeStoreConfig(input = {}) {
       DEFAULT_STORE_CONFIG.session_frame_telemetry_enabled
     ),
     shadow_mode: normalizeBooleanFlag(base.shadow_mode, DEFAULT_STORE_CONFIG.shadow_mode),
+    mdp_force_control_only: normalizeBooleanFlag(
+      base.mdp_force_control_only,
+      DEFAULT_STORE_CONFIG.mdp_force_control_only
+    ),
     tidio_project_id: String(base.tidio_project_id || DEFAULT_STORE_CONFIG.tidio_project_id).trim() || DEFAULT_STORE_CONFIG.tidio_project_id,
     aov_cohort: cohort,
     cooldown_seconds: normalizePositiveInteger(base.cooldown_seconds, DEFAULT_STORE_CONFIG.cooldown_seconds, { min: 30, max: 3600 }),
@@ -651,6 +656,7 @@ function sanitizeStoreConfigForStorefront(config) {
     session_frame_telemetry_enabled: normalized.session_frame_telemetry_enabled,
     tidio_project_id: normalized.tidio_project_id,
     shadow_mode: normalized.shadow_mode,
+    mdp_force_control_only: normalized.mdp_force_control_only,
     cooldown_seconds: normalized.cooldown_seconds,
     allowed_intervention_types: normalized.allowed_intervention_types
   }

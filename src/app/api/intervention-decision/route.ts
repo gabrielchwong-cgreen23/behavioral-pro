@@ -40,10 +40,18 @@ const querySchema = z.object({
   session_id: z.string().min(8).max(128),
   trajectory: z.string().max(128).optional()
 })
+const MAX_PERFORMANCE_METRICS_QUEUE_SIZE = 250
 const interventionDecisionLimiter = createInMemoryRateLimiter({
   windowMs: 60 * 1000,
   maxRequests: 60
 })
+
+type InterventionDecisionRequestInput = {
+  store_id?: string,
+  shop_domain?: string,
+  session_id?: string,
+  trajectory?: string
+}
 
 function failClosedResponse(strategy: string, status = 200): NextResponse {
   return NextResponse.json({
@@ -243,6 +251,10 @@ async function enqueueInterventionDecisionPerformanceLog(
   payload: PerformanceLogPayload,
   { maxWaitMs = 25 }: { maxWaitMs?: number } = {}
 ): Promise<void> {
+  if (performanceMetricsQueue.length >= MAX_PERFORMANCE_METRICS_QUEUE_SIZE) {
+    performanceMetricsQueue.shift()
+  }
+
   performanceMetricsQueue.push({
     attempts: 0,
     payload
@@ -257,32 +269,66 @@ async function enqueueInterventionDecisionPerformanceLog(
   })
 }
 
-async function maybeProxyToPilotBackend(request: NextRequest): Promise<NextResponse | null> {
+async function maybeProxyToPilotBackend(
+  request: NextRequest,
+  requestInput: InterventionDecisionRequestInput
+): Promise<NextResponse | null> {
   const backendBase = String(process.env.BEHAVIORALPRO_PILOT_BACKEND_URL || '').trim()
   if (!backendBase) {
     return null
   }
 
   const url = new URL('/api/intervention-decision', backendBase)
-  request.nextUrl.searchParams.forEach((value, key) => {
-    url.searchParams.set(key, value)
-  })
+  const isPostRequest = request.method === 'POST'
+  if (!isPostRequest) {
+    request.nextUrl.searchParams.forEach((value, key) => {
+      url.searchParams.set(key, value)
+    })
+  }
 
-  const response = await fetch(url.toString(), {
-    method: 'GET',
-    headers: {
-      accept: 'application/json',
-      origin: getHeader(request, 'origin'),
-      referer: getHeader(request, 'referer'),
-      'user-agent': getHeader(request, 'user-agent'),
-      'x-forwarded-for': getClientIp(request)
-    },
-    cache: 'no-store'
-  })
+  const controller = new AbortController()
+  const timeoutMs = 600
+  const startedAtMs = Date.now()
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+
+  let response: Response
+
+  try {
+    response = await fetch(url.toString(), {
+      method: isPostRequest ? 'POST' : 'GET',
+      headers: {
+        accept: 'application/json',
+        ...(isPostRequest ? { 'content-type': 'application/json' } : {}),
+        origin: getHeader(request, 'origin'),
+        referer: getHeader(request, 'referer'),
+        'user-agent': getHeader(request, 'user-agent'),
+        'x-forwarded-for': getClientIp(request)
+      },
+      cache: 'no-store',
+      ...(isPostRequest ? { body: JSON.stringify(requestInput) } : {}),
+      signal: controller.signal
+    })
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      console.error(JSON.stringify({
+        event: 'PILOT_PROXY_TIMEOUT',
+        shop: String(requestInput.shop_domain || '').trim(),
+        timeoutThreshold: timeoutMs,
+        actualDurationMs: Math.max(0, Date.now() - startedAtMs),
+        severity: 'warning'
+      }))
+      return null
+    }
+
+    throw error
+  } finally {
+    clearTimeout(timeoutId)
+  }
 
   const bodyText = await response.text()
   const headers = new Headers()
   headers.set('Cache-Control', response.headers.get('cache-control') || 'no-store')
+  headers.set('Content-Type', response.headers.get('content-type') || 'application/json; charset=utf-8')
 
   const retryAfter = response.headers.get('retry-after')
   if (retryAfter) {
@@ -295,21 +341,41 @@ async function maybeProxyToPilotBackend(request: NextRequest): Promise<NextRespo
   })
 }
 
-export async function GET(request: NextRequest): Promise<NextResponse> {
-  const ingestStartedAtMs = Date.now()
-  const parsedQuery = querySchema.safeParse({
+async function parseDecisionRequestInput(request: NextRequest): Promise<InterventionDecisionRequestInput> {
+  if (request.method === 'POST') {
+    const contentType = getHeader(request, 'content-type').toLowerCase()
+    if (contentType.includes('application/json')) {
+      const body = await request.json().catch(() => null)
+      if (body && typeof body === 'object' && !Array.isArray(body)) {
+        return body as InterventionDecisionRequestInput
+      }
+    }
+  }
+
+  return {
     store_id: request.nextUrl.searchParams.get('store_id') || undefined,
-    shop_domain: request.nextUrl.searchParams.get('shop_domain'),
-    session_id: request.nextUrl.searchParams.get('session_id'),
+    shop_domain: request.nextUrl.searchParams.get('shop_domain') || undefined,
+    session_id: request.nextUrl.searchParams.get('session_id') || undefined,
     trajectory: request.nextUrl.searchParams.get('trajectory') || undefined
+  }
+}
+
+async function handleInterventionDecision(request: NextRequest): Promise<NextResponse> {
+  const ingestStartedAtMs = Date.now()
+  const requestInput = await parseDecisionRequestInput(request)
+  const parsedQuery = querySchema.safeParse({
+    store_id: requestInput.store_id,
+    shop_domain: requestInput.shop_domain,
+    session_id: requestInput.session_id,
+    trajectory: requestInput.trajectory
   })
 
   if (!parsedQuery.success) {
     await enqueueInterventionDecisionPerformanceLog({
       supabase: await createSupabaseAdminClient(),
-      shopDomain: String(request.nextUrl.searchParams.get('shop_domain') || '').trim(),
-      sessionId: String(request.nextUrl.searchParams.get('session_id') || '').trim(),
-      requestedStoreId: String(request.nextUrl.searchParams.get('store_id') || '').trim(),
+      shopDomain: String(requestInput.shop_domain || '').trim(),
+      sessionId: String(requestInput.session_id || '').trim(),
+      requestedStoreId: String(requestInput.store_id || '').trim(),
       resolvedStoreId: '',
       result: buildInterventionDecisionPerformanceResult('invalid_request'),
       outcomeStatus: 'aborted',
@@ -398,7 +464,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   }
 
   try {
-    const proxiedResponse = await maybeProxyToPilotBackend(request)
+    const proxiedResponse = await maybeProxyToPilotBackend(request, requestInput)
     if (proxiedResponse) {
       return proxiedResponse
     }
@@ -420,7 +486,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       supabase
     })
 
-    if (!decisionPayload?.result?.decision) {
+    if (!decisionPayload?.result) {
       decisionPayload = await getInterventionDecision({
         shopDomain,
         sessionId,
@@ -475,4 +541,12 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     })
     return failClosedResponse('error_fail_closed', 200)
   }
+}
+
+export async function GET(request: NextRequest): Promise<NextResponse> {
+  return handleInterventionDecision(request)
+}
+
+export async function POST(request: NextRequest): Promise<NextResponse> {
+  return handleInterventionDecision(request)
 }

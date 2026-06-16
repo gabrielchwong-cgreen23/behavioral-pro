@@ -130,7 +130,8 @@ begin
     ),
     updated_at = timezone('utc', now())
   from public.storefront_intervention_variants variant
-  where variant.id = state.variant_id;
+  where variant.id = state.variant_id
+    and variant.is_active = true;
 
   get diagnostics v_trajectories_updated = row_count;
 
@@ -151,6 +152,8 @@ as $$
 declare
   session_row record;
   processed bigint := 0;
+  variant_prior_alpha numeric := 1.000000;
+  variant_prior_beta numeric := 1.000000;
 begin
   for session_row in
     select *
@@ -158,6 +161,7 @@ begin
     where reward_status = 'pending'
       and assigned_at <= timezone('utc', now()) - coalesce(p_cutoff, interval '4 hours')
     order by assigned_at asc
+    for update skip locked
   loop
     update public.storefront_intervention_sessions
     set
@@ -176,6 +180,15 @@ begin
         beta = round(beta + 1, 6),
         failures_count = failures_count + 1,
         updated_at = timezone('utc', now())
+      where id = session_row.variant_id;
+
+      select
+        coalesce(prior_alpha, 1.000000),
+        coalesce(prior_beta, 1.000000)
+      into
+        variant_prior_alpha,
+        variant_prior_beta
+      from public.storefront_intervention_variants
       where id = session_row.variant_id;
 
       insert into public.storefront_trajectory_bandit_state (
@@ -199,8 +212,8 @@ begin
         session_row.cohort_key,
         session_row.trajectory_key,
         session_row.variant_id,
-        1,
-        2,
+        variant_prior_alpha,
+        round(variant_prior_beta + 1, 6),
         0,
         1,
         session_row.assigned_at,

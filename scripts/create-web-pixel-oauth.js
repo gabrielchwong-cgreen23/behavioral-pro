@@ -6,8 +6,8 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const SHOP = "behavior-test-store.myshopify.com";
-const CLIENT_ID = "ee7791f70e17fcbfe03f52ade51b520a";
+const SHOP = process.env.SHOPIFY_SHOP || "";
+const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || "";
 const CLIENT_SECRET =
   process.env.SHOPIFY_CLIENT_SECRET ||
   process.env.SHOPIFY_API_SECRET ||
@@ -32,6 +32,18 @@ mutation {
 `;
 
 function ensureClientSecret() {
+  if (!SHOP) {
+    throw new Error(
+      "Set SHOPIFY_SHOP in your environment before running this script.",
+    );
+  }
+
+  if (!CLIENT_ID) {
+    throw new Error(
+      "Set SHOPIFY_CLIENT_ID in your environment before running this script.",
+    );
+  }
+
   if (
     !CLIENT_SECRET ||
     CLIENT_SECRET === "REPLACE_WITH_YOUR_CLIENT_SECRET"
@@ -40,6 +52,15 @@ function ensureClientSecret() {
       "Set SHOPIFY_CLIENT_SECRET or SHOPIFY_API_SECRET in your environment before running this script.",
     );
   }
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function getAuthorizationCodeFromArgs() {
@@ -61,16 +82,19 @@ function buildInstallUrl(state) {
 }
 
 function respondWithHtml(response, statusCode, title, message) {
+  const safeTitle = escapeHtml(title);
+  const safeMessage = escapeHtml(message);
+
   response.writeHead(statusCode, { "Content-Type": "text/html; charset=utf-8" });
   response.end(`<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>${title}</title>
+    <title>${safeTitle}</title>
   </head>
   <body style="font-family: sans-serif; padding: 2rem;">
-    <h1>${title}</h1>
-    <p>${message}</p>
+    <h1>${safeTitle}</h1>
+    <p>${safeMessage}</p>
   </body>
 </html>`);
 }

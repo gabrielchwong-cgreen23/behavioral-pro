@@ -10,6 +10,13 @@ interface DecisionResponse {
   }
 }
 
+type InterventionDecisionRequest = {
+  store_id: string
+  shop_domain: string
+  session_id: string
+  trajectory: string
+}
+
 type SavedCartItem = {
   id: number
   quantity: number
@@ -577,17 +584,20 @@ async function fetchDecision(
   let timeoutId = 0
 
   try {
-    const url = new URL(getBackendUrl('/api/intervention-decision'))
-    url.searchParams.set('store_id', storeId)
-    url.searchParams.set('shop_domain', shopDomain)
-    url.searchParams.set('session_id', sessionId)
-
+    const requestBody: InterventionDecisionRequest = {
+      store_id: storeId,
+      shop_domain: shopDomain,
+      session_id: sessionId,
+      trajectory: window.sessionStorage.getItem('behavioral_pro_trajectory') || 'B'
+    }
     const response = await Promise.race([
-      fetch(url.toString(), {
-        method: 'GET',
+      fetch(getBackendUrl('/api/intervention-decision'), {
+        method: 'POST',
         headers: {
-          Accept: 'application/json'
+          Accept: 'application/json',
+          'Content-Type': 'application/json'
         },
+        body: JSON.stringify(requestBody),
         credentials: 'omit',
         signal: controller?.signal
       }),

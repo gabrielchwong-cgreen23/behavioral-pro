@@ -8,11 +8,6 @@ const BACKEND_BASE = String(
 ).replace(/\/+$/, '')
 const SHOP_DOMAIN = process.env.BEHAVIORALPRO_SHOP_DOMAIN || 'behavior-test-store.myshopify.com'
 
-function requireEnv(name, value) {
-  if (value) return value
-  throw new Error(`Missing required env var: ${name}`)
-}
-
 async function postJson(url, body) {
   const response = await fetch(url, {
     method: 'POST',
@@ -116,8 +111,6 @@ async function fetchStorefrontConfig() {
 }
 
 async function main() {
-  requireEnv('BEHAVIORALPRO_BACKEND_BASE or BACKEND_BASE', BACKEND_BASE)
-
   const session = buildSessionPayloads()
   const pageUrl = `https://${SHOP_DOMAIN}${session.pagePath}`
 

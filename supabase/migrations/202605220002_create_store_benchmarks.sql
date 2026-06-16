@@ -9,10 +9,26 @@ create table if not exists public.store_benchmarks (
   reached_checkout_rate double precision not null default 0,
   purchase_rate double precision not null default 0,
   source text not null default 'manual',
-  created_at timestamptz not null default timezone('utc', now()),
-  updated_at timestamptz not null default timezone('utc', now()),
+  created_at timestamptz not null default timezone('utc'::text, now()),
+  updated_at timestamptz not null default timezone('utc'::text, now()),
   unique (shop_domain)
 );
 
 create index if not exists store_benchmarks_store_id_idx
   on public.store_benchmarks (store_id);
+
+create or replace function public.update_updated_at_column()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at := timezone('utc'::text, now());
+  return new;
+end;
+$$;
+
+drop trigger if exists store_benchmarks_updated_at
+  on public.store_benchmarks;
+create trigger store_benchmarks_updated_at
+before update on public.store_benchmarks
+for each row execute function public.update_updated_at_column();

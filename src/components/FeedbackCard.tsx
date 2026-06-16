@@ -61,6 +61,30 @@ function inferShopDomain(explicitShopDomain?: string, params?: URLSearchParams |
   return String(fromWindow || '').trim()
 }
 
+function isFeedbackResponse(value: unknown): value is FeedbackResponse {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+
+  const candidate = value as { ok?: unknown, userErrors?: unknown }
+  return (
+    typeof candidate.ok === 'boolean' &&
+    Array.isArray(candidate.userErrors) &&
+    candidate.userErrors.every((entry) => (
+      entry &&
+      typeof entry === 'object' &&
+      typeof (entry as { message?: unknown }).message === 'string' &&
+      (
+        (entry as { field?: unknown }).field === undefined ||
+        (
+          Array.isArray((entry as { field?: unknown }).field) &&
+          (entry as { field: unknown[] }).field.every((item) => typeof item === 'string')
+        )
+      )
+    ))
+  )
+}
+
 export function FeedbackCard({ shopDomain }: FeedbackCardProps) {
   const pathname = usePathname()
   const searchParams = useSearchParams()
@@ -79,14 +103,21 @@ export function FeedbackCard({ shopDomain }: FeedbackCardProps) {
 
   const currentRoute = useMemo(() => {
     const query = searchParams?.toString()
-    return query ? `${pathname}?${query}` : pathname || '/'
+    const safePathname = pathname || '/'
+    return query ? `${safePathname}?${query}` : safePathname
   }, [pathname, searchParams])
 
   async function handleSubmit() {
     const trimmedDescription = description.trim()
+    const normalizedShopDomain = resolvedShopDomain.trim()
 
     if (!trimmedDescription) {
       setInlineError('Please share a little detail so we can help.')
+      return
+    }
+
+    if (!normalizedShopDomain) {
+      setInlineError('We could not determine which shop this feedback belongs to.')
       return
     }
 
@@ -94,7 +125,7 @@ export function FeedbackCard({ shopDomain }: FeedbackCardProps) {
     setInlineError(null)
 
     const payload: FeedbackPayload = {
-      shopDomain: resolvedShopDomain,
+      shopDomain: normalizedShopDomain,
       route: currentRoute,
       submittedAt: new Date().toISOString(),
       type: feedbackType,
@@ -110,7 +141,12 @@ export function FeedbackCard({ shopDomain }: FeedbackCardProps) {
         body: JSON.stringify(payload)
       })
 
-      const result = (await response.json()) as FeedbackResponse
+      const result = await response.json().catch(() => null)
+
+      if (!isFeedbackResponse(result)) {
+        setInlineError('We could not verify the feedback response. Please try again.')
+        return
+      }
 
       if (!response.ok || result.userErrors?.length) {
         const firstError = result.userErrors?.[0]?.message || 'We could not save your feedback.'

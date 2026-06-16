@@ -156,7 +156,7 @@
   var INTERVENTION_MESSAGE_MATRIX = {
     tidio_checkout_recovery_v1: "If you're running into any technical issues or have a quick question about shipping times, let me know right here—I'm happy to look into it for you!",
     tidio_trust_reassurance_v1: "you can ask any policy questions here, we'll get you exactly what you need",
-    tidio_friction_assistance_v1: "If theres anything you're having trouble with, I can manually process your request here",
+    tidio_friction_assistance_v1: "If there's anything you're having trouble with, I can manually process your request here",
     tidio_cohort_v1: "Let me know if you have any questions about anything you're looking at",
     tidio_cart_recovery_v1: "If you need anything else, please let me know. Otherwise, I've saved your initial items so you won't lose them!"
   };
@@ -2515,7 +2515,7 @@
     document.addEventListener("mouseout", function (event) {
       try {
         if (interactionDisplayed) return;
-        if (!event || event.relatedTarget || event.toElement) return;
+        if (!event || event.relatedTarget) return;
         if (typeof event.clientY !== "number" || event.clientY > 8) return;
 
         var sig = "exit_intent:" + window.location.pathname;

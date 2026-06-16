@@ -34,7 +34,7 @@
     }
 
     function setCookie(name, value) {
-      document.cookie = `${name}=${encodeURIComponent(value)}; path=/; SameSite=Lax`;
+      document.cookie = `${name}=${encodeURIComponent(value)}; path=/; Secure; SameSite=Lax`;
     }
 
     function ensureSessionId() {
@@ -143,7 +143,7 @@
           slot.textContent = String(decision.payload.message);
         }
         if (decision.payload.html) {
-          slot.innerHTML = String(decision.payload.html);
+          slot.textContent = String(decision.payload.html);
         }
       });
     }

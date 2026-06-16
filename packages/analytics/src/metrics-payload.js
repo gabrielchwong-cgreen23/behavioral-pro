@@ -10,7 +10,10 @@ export function buildMetricsPayload(shopDomain, overview) {
 
   function summarize(sessions) {
     const purchases = sessions.filter((session) => session.converted).length
-    const revenue = sessions.reduce((sum, session) => sum + Number(session.revenue || 0), 0)
+    const revenue = sessions.reduce((sum, session) => {
+      const parsedRevenue = Number(session.revenue || 0)
+      return sum + (Number.isNaN(parsedRevenue) ? 0 : parsedRevenue)
+    }, 0)
 
     return {
       sessions: sessions.length,

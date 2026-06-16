@@ -29,6 +29,13 @@ async function postJson(path, body) {
 }
 
 async function main() {
+  let pagePath
+  try {
+    pagePath = new URL(pageUrl).pathname
+  } catch {
+    throw new Error(`Invalid BEHAVIORALPRO_PAGE_URL: ${pageUrl}`)
+  }
+
   const assigned = await postJson('/api/assign-variant', {
     shop_domain: shopDomain,
     session_id: sessionId,
@@ -57,7 +64,7 @@ async function main() {
       timestamp,
       properties: {
         shop_domain: shopDomain,
-        path: new URL(pageUrl).pathname,
+        path: pagePath,
         referrer,
         source: 'phase1_simulation',
         product_id: 'gid://shopify/Product/1',

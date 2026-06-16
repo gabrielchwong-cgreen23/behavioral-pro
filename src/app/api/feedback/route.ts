@@ -1,8 +1,40 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { z } from 'zod'
 
+function normalizeShopDomainInput(value: unknown): string | null {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+
+  try {
+    const parsed = new URL(raw.includes('://') ? raw : `https://${raw}`)
+    const hostname = parsed.hostname.trim().toLowerCase()
+    return hostname || null
+  } catch {
+    return raw.toLowerCase()
+  }
+}
+
 const feedbackSchema = z.object({
-  shopDomain: z.string().trim().includes('.myshopify.com'),
+  shopDomain: z.string().trim().transform((value, context) => {
+    const normalized = normalizeShopDomainInput(value)
+    if (!normalized) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'shopDomain is required'
+      })
+      return z.NEVER
+    }
+
+    if (!normalized.endsWith('.myshopify.com')) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'shopDomain must be a valid .myshopify.com hostname'
+      })
+      return z.NEVER
+    }
+
+    return normalized
+  }),
   route: z.string().trim().min(1).max(2048),
   submittedAt: z.string().datetime(),
   type: z.enum(['Bug Report', 'Feature Recommendation']),
